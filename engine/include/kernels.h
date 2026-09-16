@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,6 +114,18 @@ void vitna_gemv_int2(
     size_t rows,
     size_t cols
 );
+
+/**
+ * Hardware SIMD capabilities detection.
+ */
+typedef struct {
+    bool has_avx2;
+    bool has_avx512;
+    bool has_neon;
+    bool has_fma;
+} vitna_simd_capabilities_t;
+
+vitna_simd_capabilities_t vitna_detect_simd_capabilities(void);
 
 #ifdef __cplusplus
 }

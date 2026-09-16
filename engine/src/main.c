@@ -57,7 +57,14 @@ static int cmd_info(const char* model_path) {
 
 static int cmd_bench(const char* model_path, int iterations) {
     (void)model_path;
+    vitna_simd_capabilities_t caps = vitna_detect_simd_capabilities();
     printf("Running vitna-anchor streaming benchmark (%d iterations)...\n", iterations);
+    printf("Hardware acceleration: [AVX2: %s] [AVX512: %s] [ARM NEON: %s] [FMA: %s]\n",
+        caps.has_avx2 ? "active" : "no",
+        caps.has_avx512 ? "active" : "no",
+        caps.has_neon ? "active" : "no",
+        caps.has_fma ? "active" : "no"
+    );
     double t0 = vitna_time_ms();
 
     /* Benchmark synthetic routing & GEMV int4 operations */
