@@ -85,6 +85,33 @@ export function parseSafeTensorsHeader(buffer) {
 }
 
 /**
+ * Parse SafeTensors sharded index manifest (model.safetensors.index.json).
+ * @param {string | Buffer} content
+ * @returns {{ totalSize: number, weightMap: Record<string, string>, shards: string[] }}
+ */
+export function parseSafeTensorsIndex(content) {
+  const jsonStr = typeof content === "string" ? content : content.toString("utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (err) {
+    throw new Error(`Failed to parse SafeTensors index manifest: ${err.message}`);
+  }
+
+  const weightMap = parsed.weight_map || {};
+  const totalSize = parsed.metadata?.total_size ? Number(parsed.metadata.total_size) : 0;
+
+  const shardSet = new Set(Object.values(weightMap));
+  const shards = Array.from(shardSet).sort();
+
+  return {
+    totalSize,
+    weightMap,
+    shards,
+  };
+}
+
+/**
  * Inspect SafeTensors file header without reading entire file into memory.
  * @param {string} filePath
  * @returns {{ headerLen: number, metadata: Record<string, any>, tensors: Record<string, any>, rawDataBase: number, fileSize: number }}
@@ -128,10 +155,6 @@ export function inspectSafeTensorsFile(filePath) {
  * @returns {{ isExpert: boolean, layerIdx: number, expertIdx: number, subName: string }}
  */
 export function parseMoEExpertRole(tensorName) {
-  // Common patterns:
-  // model.layers.12.mlp.experts.3.up_proj.weight
-  // model.layers.5.block_sparse_moe.experts.1.w1.weight
-  // layers.0.feed_forward.experts.2.w2.weight
   const match = tensorName.match(/(?:layers?\.(\d+)).*?experts?\.(\d+)\.(.+)/i);
   if (match) {
     return {
@@ -150,27 +173,16 @@ export function parseMoEExpertRole(tensorName) {
 }
 
 /**
- * Slice and repack tensor weights into 4096-byte DMA aligned slabs.
- * All tensor offsets are guaranteed to satisfy (offset % 4096 === 0).
- *
+ * Slice and repack tensor weights from a single safetensors file into 4096-byte DMA aligned slabs.
  * @param {string} sourcePath Path to source safetensors file.
  * @param {string} outputDir Target output directory.
  * @param {{
  *   dryRun?: boolean,
- *   separateExperts?: boolean,
  *   onProgress?: (progress: { current: number, total: number, tensorName: string }) => void
  * }} options
- * @returns {{
- *   manifestPath: string,
- *   alignedFilePath: string,
- *   tensorCount: number,
- *   totalBytesWritten: number,
- *   airgapHash: string,
- *   records: Array<any>
- * }}
  */
 export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
-  const { dryRun = false, separateExperts = false, onProgress } = options;
+  const { dryRun = false, onProgress } = options;
 
   if (!existsSync(sourcePath)) {
     throw new Error(`Source model file not found: ${sourcePath}`);
@@ -187,8 +199,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
   const alignedFilePath = join(outputDir, `${baseName}.dma.anchor`);
   const manifestPath = join(outputDir, `${baseName}.anchor.index.json`);
 
-  // Build the layout plan
-  let currentOffset = SECTOR_SIZE; // Reserve first 4KB sector for index header
+  let currentOffset = SECTOR_SIZE;
   const records = [];
   const hasher = createHash("sha256");
 
@@ -199,7 +210,6 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     const rawEnd = desc.data_offsets[1];
     const rawSize = rawEnd - rawBegin;
 
-    // Strict 4KB DMA boundary alignment
     const alignedOffset = alignUp(currentOffset, SECTOR_SIZE);
     const paddingBefore = alignedOffset - currentOffset;
     const alignedSize = alignUp(rawSize, SECTOR_SIZE);
@@ -208,6 +218,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
 
     records.push({
       name,
+      shardIdx: 0,
       dtype: desc.dtype,
       shape: desc.shape,
       sourceOffset: info.rawDataBase + rawBegin,
@@ -235,16 +246,14 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     };
   }
 
-  // Execute the physical DMA re-packaging
   const srcFd = openSync(sourcePath, "r");
   const dstFd = openSync(alignedFilePath, "w");
 
   try {
-    // Write 4KB zeroed header block placeholder
     const headerPad = Buffer.alloc(SECTOR_SIZE, 0);
     writeSync(dstFd, headerPad, 0, SECTOR_SIZE, 0);
 
-    const copyChunkSize = 1024 * 1024; // 1 MB copy buffer
+    const copyChunkSize = 1024 * 1024;
     const copyBuf = Buffer.alloc(copyChunkSize);
 
     for (let i = 0; i < records.length; i++) {
@@ -254,13 +263,11 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
         onProgress({ current: i + 1, total: records.length, tensorName: rec.name });
       }
 
-      // Write padding zeroes if needed
       if (rec.paddingBefore > 0) {
         const padBuf = Buffer.alloc(rec.paddingBefore, 0);
         writeSync(dstFd, padBuf, 0, rec.paddingBefore, rec.targetOffset - rec.paddingBefore);
       }
 
-      // Copy tensor payload
       let bytesToCopy = rec.rawSize;
       let srcPos = rec.sourceOffset;
       let dstPos = rec.targetOffset;
@@ -293,6 +300,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     createdAt: new Date().toISOString(),
     tensors: records.map((r) => ({
       name: r.name,
+      shardIdx: 0,
       dtype: r.dtype,
       shape: r.shape,
       offset: r.targetOffset,
@@ -318,7 +326,196 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
 }
 
 /**
+ * Slice and repack tensor weights from multi-shard safetensors files into 4096-byte DMA aligned slabs.
+ * Matches the C11 engine multi-shard expert store contract (shard_idx).
+ *
+ * @param {string[]} shardPaths Array of paths to source safetensors shard files.
+ * @param {string} outputDir Target output directory.
+ * @param {{
+ *   modelName?: string,
+ *   dryRun?: boolean,
+ *   onProgress?: (progress: { shardIdx: number, totalShards: number, current: number, total: number, tensorName: string }) => void
+ * }} options
+ */
+export function sliceShardedDmaSlabs(shardPaths, outputDir, options = {}) {
+  const { modelName = "sharded_model", dryRun = false, onProgress } = options;
+
+  if (!existsSync(outputDir) && !dryRun) {
+    mkdirSync(outputDir, { recursive: true });
+  }
+
+  const manifestPath = join(outputDir, `${modelName}.anchor.index.json`);
+  const shardSummaries = [];
+  const allRecords = [];
+  let totalBytesAllShards = 0;
+
+  for (let shardIdx = 0; shardIdx < shardPaths.length; shardIdx++) {
+    const shardPath = shardPaths[shardIdx];
+    if (!existsSync(shardPath)) {
+      throw new Error(`Shard file not found: ${shardPath}`);
+    }
+
+    const info = inspectSafeTensorsFile(shardPath);
+    const tensorNames = Object.keys(info.tensors);
+    const shardBaseName = basename(shardPath, ".safetensors");
+    const alignedShardFile = join(outputDir, `${shardBaseName}.dma.anchor`);
+
+    let currentOffset = SECTOR_SIZE;
+    const shardRecords = [];
+    const hasher = createHash("sha256");
+
+    for (let i = 0; i < tensorNames.length; i++) {
+      const name = tensorNames[i];
+      const desc = info.tensors[name];
+      const rawBegin = desc.data_offsets[0];
+      const rawEnd = desc.data_offsets[1];
+      const rawSize = rawEnd - rawBegin;
+
+      const alignedOffset = alignUp(currentOffset, SECTOR_SIZE);
+      const paddingBefore = alignedOffset - currentOffset;
+      const alignedSize = alignUp(rawSize, SECTOR_SIZE);
+      const moeRole = parseMoEExpertRole(name);
+
+      const record = {
+        name,
+        shardIdx,
+        dtype: desc.dtype,
+        shape: desc.shape,
+        sourceOffset: info.rawDataBase + rawBegin,
+        rawSize,
+        targetOffset: alignedOffset,
+        alignedSize,
+        paddingBefore,
+        isExpert: moeRole.isExpert,
+        layerIdx: moeRole.layerIdx,
+        expertIdx: moeRole.expertIdx,
+        aligned_4k: true,
+      };
+
+      shardRecords.push(record);
+      allRecords.push(record);
+      currentOffset = alignedOffset + rawSize;
+    }
+
+    totalBytesAllShards += currentOffset;
+
+    if (!dryRun) {
+      const srcFd = openSync(shardPath, "r");
+      const dstFd = openSync(alignedShardFile, "w");
+
+      try {
+        const headerPad = Buffer.alloc(SECTOR_SIZE, 0);
+        writeSync(dstFd, headerPad, 0, SECTOR_SIZE, 0);
+
+        const copyChunkSize = 1024 * 1024;
+        const copyBuf = Buffer.alloc(copyChunkSize);
+
+        for (let i = 0; i < shardRecords.length; i++) {
+          const rec = shardRecords[i];
+
+          if (onProgress) {
+            onProgress({
+              shardIdx,
+              totalShards: shardPaths.length,
+              current: i + 1,
+              total: shardRecords.length,
+              tensorName: rec.name,
+            });
+          }
+
+          if (rec.paddingBefore > 0) {
+            const padBuf = Buffer.alloc(rec.paddingBefore, 0);
+            writeSync(dstFd, padBuf, 0, rec.paddingBefore, rec.targetOffset - rec.paddingBefore);
+          }
+
+          let bytesToCopy = rec.rawSize;
+          let srcPos = rec.sourceOffset;
+          let dstPos = rec.targetOffset;
+
+          while (bytesToCopy > 0) {
+            const toRead = Math.min(copyChunkSize, bytesToCopy);
+            readSync(srcFd, copyBuf, 0, toRead, srcPos);
+            writeSync(dstFd, copyBuf, 0, toRead, dstPos);
+
+            hasher.update(copyBuf.subarray(0, toRead));
+            srcPos += toRead;
+            dstPos += toRead;
+            bytesToCopy -= toRead;
+          }
+        }
+      } finally {
+        closeSync(srcFd);
+        closeSync(dstFd);
+      }
+
+      shardSummaries.push({
+        shardIdx,
+        fileName: basename(alignedShardFile),
+        sourceShard: basename(shardPath),
+        tensorCount: shardRecords.length,
+        totalBytesWritten: currentOffset,
+        airgapSha256: hasher.digest("hex"),
+      });
+    } else {
+      shardSummaries.push({
+        shardIdx,
+        fileName: `${shardBaseName}.dma.anchor`,
+        sourceShard: basename(shardPath),
+        tensorCount: shardRecords.length,
+        totalBytesWritten: currentOffset,
+        airgapSha256: "DRY_RUN_ATTESTATION_PENDING",
+      });
+    }
+  }
+
+  if (dryRun) {
+    return {
+      manifestPath,
+      totalShards: shardPaths.length,
+      shards: shardSummaries,
+      tensorCount: allRecords.length,
+      totalBytesWritten: totalBytesAllShards,
+      records: allRecords,
+    };
+  }
+
+  const manifest = {
+    format: "vitna-anchor-sharded-dma-v1",
+    model: modelName,
+    totalShards: shardPaths.length,
+    sectorSize: SECTOR_SIZE,
+    shards: shardSummaries,
+    createdAt: new Date().toISOString(),
+    tensors: allRecords.map((r) => ({
+      name: r.name,
+      shardIdx: r.shardIdx,
+      dtype: r.dtype,
+      shape: r.shape,
+      offset: r.targetOffset,
+      sizeBytes: r.rawSize,
+      alignedSize: r.alignedSize,
+      isExpert: r.isExpert,
+      layerIdx: r.layerIdx,
+      expertIdx: r.expertIdx,
+      aligned_4k: true,
+    })),
+  };
+
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+  return {
+    manifestPath,
+    totalShards: shardPaths.length,
+    shards: shardSummaries,
+    tensorCount: allRecords.length,
+    totalBytesWritten: totalBytesAllShards,
+    records: allRecords,
+  };
+}
+
+/**
  * Verify that all tensor boundaries in an anchor manifest satisfy 4KB alignment.
+ * Supports both single-shard and multi-shard manifests.
  * @param {string} manifestPath
  * @returns {{ valid: boolean, errors: string[], tensorCount: number }}
  */
@@ -331,12 +528,17 @@ export function verifyDmaAlignment(manifestPath) {
   const manifest = JSON.parse(content);
   const errors = [];
 
+  const totalShards = manifest.totalShards || 1;
+
   for (const t of manifest.tensors) {
     if (t.offset % SECTOR_SIZE !== 0) {
       errors.push(`Tensor "${t.name}" offset ${t.offset} is not aligned to ${SECTOR_SIZE} bytes boundary`);
     }
     if (t.aligned_4k !== true) {
       errors.push(`Tensor "${t.name}" missing aligned_4k flag`);
+    }
+    if (typeof t.shardIdx !== "number" || t.shardIdx < 0 || t.shardIdx >= totalShards) {
+      errors.push(`Tensor "${t.name}" invalid shardIdx ${t.shardIdx}`);
     }
   }
 
@@ -345,6 +547,33 @@ export function verifyDmaAlignment(manifestPath) {
     errors,
     tensorCount: manifest.tensors.length,
   };
+}
+
+/**
+ * Check if a remote HTTP/HTTPS resource exists via HEAD or quick GET.
+ * @param {string} url
+ * @returns {Promise<boolean>}
+ */
+export function probeRemoteUrl(url) {
+  return new Promise((resolve) => {
+    const parsedUrl = new URL(url);
+    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
+
+    const req = client(
+      url,
+      { method: "HEAD", headers: { "User-Agent": "vitna-anchor/0.1.0" } },
+      (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 400) {
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      }
+    );
+
+    req.on("error", () => resolve(false));
+    req.end();
+  });
 }
 
 /**
@@ -426,6 +655,8 @@ export function downloadFile(url, destPath, options = {}) {
 
 /**
  * Main coordinator: pull model from HuggingFace Hub or local path and slice 4KB DMA slabs.
+ * Handles both single-file checkpoints and multi-shard index manifests.
+ *
  * @param {string} target Model ID (e.g. "Qwen/Qwen2.5-Coder-7B-Instruct") or local path.
  * @param {{
  *   outDir?: string,
@@ -439,9 +670,49 @@ export async function runModelPull(target, options = {}) {
   console.log("\n" + ANSI.bold + "VITNA ANCHOR · MODEL INGESTION & DMA SLAB SLICER" + ANSI.reset);
   console.log(ANSI.dim + "Zero-Copy NVMe DMA Alignment · Direct I/O Optimization\n" + ANSI.reset);
 
-  const isLocalFile = existsSync(target);
+  const isLocal = existsSync(target);
 
-  if (isLocalFile) {
+  if (isLocal) {
+    const stat = statSync(target);
+
+    // 1. Local index manifest (model.safetensors.index.json)
+    if (stat.isFile() && target.endsWith(".index.json")) {
+      const dir = dirname(target);
+      const indexContent = readFileSync(target, "utf8");
+      const indexInfo = parseSafeTensorsIndex(indexContent);
+      const shardPaths = indexInfo.shards.map((s) => join(dir, s));
+
+      console.log(`  Source Type       : ${ANSI.green}Local Sharded Checkpoint Index${ANSI.reset}`);
+      console.log(`  Input Manifest    : ${ANSI.bold}${target}${ANSI.reset}`);
+      console.log(`  Detected Shards   : ${ANSI.bold}${shardPaths.length} shard files${ANSI.reset}`);
+      console.log(`  Output Directory  : ${ANSI.bold}${outDir}${ANSI.reset}\n`);
+
+      const result = sliceShardedDmaSlabs(shardPaths, outDir, {
+        modelName: basename(dir) || "sharded_model",
+        dryRun,
+        onProgress: ({ shardIdx, totalShards, current, total, tensorName }) => {
+          const pct = ((current / total) * 100).toFixed(0);
+          process.stdout.write(`\r  [Shard ${shardIdx + 1}/${totalShards}] [${pct}%] Slicing 4KB DMA slab: ${ANSI.dim}${tensorName.slice(0, 35)}${ANSI.reset}     `);
+        },
+      });
+
+      console.log("\n");
+      console.log(`  Status            : ${ANSI.green}COMPLETED (Multi-Shard 4KB DMA Aligned)${ANSI.reset}`);
+      console.log(`  Total Shards      : ${ANSI.bold}${result.totalShards}${ANSI.reset}`);
+      console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
+      console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}\n`);
+      return result;
+    }
+
+    // 2. Local directory containing model.safetensors.index.json
+    if (stat.isDirectory()) {
+      const idxFile = join(target, "model.safetensors.index.json");
+      if (existsSync(idxFile)) {
+        return runModelPull(idxFile, options);
+      }
+    }
+
+    // 3. Local single-file safetensors
     console.log(`  Source Type       : ${ANSI.green}Local File Checkpoint${ANSI.reset}`);
     console.log(`  Input Path        : ${ANSI.bold}${target}${ANSI.reset}`);
     console.log(`  Output Directory  : ${ANSI.bold}${outDir}${ANSI.reset}\n`);
@@ -469,8 +740,74 @@ export async function runModelPull(target, options = {}) {
   console.log(`  Repository ID     : ${ANSI.bold}${repoId}${ANSI.reset}`);
   console.log(`  Output Directory  : ${ANSI.bold}${outDir}${ANSI.reset}\n`);
 
-  const manifestUrl = `https://huggingface.co/${repoId}/resolve/main/model.safetensors.index.json`;
+  const indexManifestUrl = `https://huggingface.co/${repoId}/raw/main/model.safetensors.index.json`;
   const singleSafetensorUrl = `https://huggingface.co/${repoId}/resolve/main/model.safetensors`;
+
+  // Probe if model is sharded or single-file
+  const hasIndex = await probeRemoteUrl(indexManifestUrl);
+
+  if (hasIndex) {
+    console.log(`  Architecture Type : ${ANSI.bold}Sharded Frontier Checkpoint (model.safetensors.index.json)${ANSI.reset}`);
+
+    if (dryRun) {
+      console.log(`  Dry Run Plan      : ${ANSI.amber}Simulating Multi-Shard Hub Resolution & 4KB Layout${ANSI.reset}`);
+      console.log(`  Remote Index URL  : ${indexManifestUrl}`);
+      console.log(`  Target Directory  : ${outDir}`);
+      console.log(`  DMA Sector Size   : 4096 bytes (O_DIRECT unbuffered ready)\n`);
+      return {
+        repoId,
+        sharded: true,
+        dryRun: true,
+        status: "ready",
+        sectorSize: SECTOR_SIZE,
+      };
+    }
+
+    mkdirSync(outDir, { recursive: true });
+    const localIndexFile = join(outDir, "model.safetensors.index.json");
+    await downloadFile(indexManifestUrl, localIndexFile);
+
+    const indexContent = readFileSync(localIndexFile, "utf8");
+    const indexInfo = parseSafeTensorsIndex(indexContent);
+    console.log(`  Detected Shards   : ${ANSI.bold}${indexInfo.shards.length} shards${ANSI.reset} (~${(indexInfo.totalSize / (1024 ** 3)).toFixed(1)} GB total)`);
+
+    const localShardPaths = [];
+    for (let i = 0; i < indexInfo.shards.length; i++) {
+      const shardName = indexInfo.shards[i];
+      const shardUrl = `https://huggingface.co/${repoId}/resolve/main/${shardName}`;
+      const localShardPath = join(outDir, shardName);
+      localShardPaths.push(localShardPath);
+
+      console.log(`  Downloading shard [${i + 1}/${indexInfo.shards.length}]: ${shardName}...`);
+      await downloadFile(shardUrl, localShardPath, {
+        onProgress: (down, tot) => {
+          const mb = (down / (1024 * 1024)).toFixed(1);
+          const totMb = tot > 0 ? (tot / (1024 * 1024)).toFixed(1) + " MB" : "streaming";
+          process.stdout.write(`\r    Streamed ${ANSI.green}${mb} MB${ANSI.reset} of ${totMb}...    `);
+        },
+      });
+      console.log("\n");
+    }
+
+    console.log("  All shards downloaded. Repacking into multi-shard 4KB DMA slabs...\n");
+    const result = sliceShardedDmaSlabs(localShardPaths, outDir, {
+      modelName: basename(repoId),
+      onProgress: ({ shardIdx, totalShards, current, total, tensorName }) => {
+        const pct = ((current / total) * 100).toFixed(0);
+        process.stdout.write(`\r  [Shard ${shardIdx + 1}/${totalShards}] [${pct}%] Slicing 4KB DMA slab: ${ANSI.dim}${tensorName.slice(0, 35)}${ANSI.reset}     `);
+      },
+    });
+
+    console.log("\n");
+    console.log(`  Status            : ${ANSI.green}COMPLETED (Multi-Shard 4KB DMA Aligned)${ANSI.reset}`);
+    console.log(`  Total Shards      : ${ANSI.bold}${result.totalShards}${ANSI.reset}`);
+    console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
+    console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}\n`);
+    return result;
+  }
+
+  // Single-file fallback
+  console.log(`  Architecture Type : ${ANSI.bold}Monolithic Single-File Checkpoint (model.safetensors)${ANSI.reset}`);
 
   if (dryRun) {
     console.log(`  Dry Run Plan      : ${ANSI.amber}Simulating Hub resolution & 4KB alignment layout${ANSI.reset}`);
@@ -479,6 +816,7 @@ export async function runModelPull(target, options = {}) {
     console.log(`  DMA Sector Size   : 4096 bytes (O_DIRECT unbuffered ready)\n`);
     return {
       repoId,
+      sharded: false,
       dryRun: true,
       status: "ready",
       sectorSize: SECTOR_SIZE,
