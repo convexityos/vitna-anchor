@@ -24,7 +24,10 @@
     "tune": "node runtime/anchor-run.mjs tune",
     "route": "node runtime/anchor-run.mjs route",
     "draft": "node runtime/anchor-run.mjs draft",
-    "bench": "node runtime/anchor-run.mjs bench"
+    "bench": "node runtime/anchor-run.mjs bench",
+    "stripe": "node runtime/anchor-run.mjs stripe",
+    "schema": "node runtime/anchor-run.mjs schema",
+    "registry": "node runtime/anchor-run.mjs registry"
   },
   "repository": {
     "type": "git",

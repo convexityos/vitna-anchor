@@ -200,6 +200,33 @@ npx vitna-anchor pull Qwen/Qwen2.5-Coder-7B-Instruct --dry-run
 npx vitna-anchor pull ./checkpoints/model.safetensors --out ./models
 ```
 
+### 7. Multi-Drive NVMe DMA Striping (`stripe`)
+Interleaves 4KB sector slabs round-robin across multiple NVMe drives (RAID-0 DMA pooling):
+```bash
+# Stripe checkpoint across dual NVMe drives
+npx vitna-anchor stripe ./models/deepseek-671b.dma.anchor --drives /mnt/nvme0,/mnt/nvme1
+
+# Benchmark multi-drive aggregated read throughput
+npx vitna-anchor bench --stripe 2
+```
+
+### 8. Pushdown Grammar PDA Schema Compiler (`schema`)
+Compiles JSON Schemas into pushdown automaton state machines for deterministic function calling:
+```bash
+# Compile and inspect schema constraints
+npx vitna-anchor schema ./schema.json
+
+# Output PDA transition tables as JSON
+npx vitna-anchor schema ./schema.json --json
+```
+
+### 9. Sovereign Model Hub & Verified Registry (`registry`)
+Lists verified pre-sliced 4KB DMA models with SHA-256 air-gap manifests:
+```bash
+# List verified models and throughput targets
+npx vitna-anchor registry
+```
+
 ---
 
 ## Interactive REPL Slash Commands
@@ -210,6 +237,9 @@ When running `vitna-anchor chat`, the interactive Calm Terminal REPL provides de
 * `/json [schema]`: Enable kernel grammar pushdown automaton for zero-retry JSON
 * `/text`: Revert to freeform natural language generation
 * `/probe`: Run live NVMe, RAM, and air-gap attestation benchmark
+* `/registry`: Inspect verified sovereign model catalog and manifests
+* `/stripe`: Run interactive multi-drive NVMe striping benchmark
+* `/schema`: Inspect pushdown grammar state transitions
 * `/quantize [bits]`: Run interactive weight quantizer simulation
 * `/prefetch`: Run interactive async prefetch pipeline benchmark
 * `/tune`: Run interactive autonomous silicon tuner sweep

@@ -11,7 +11,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { cpus, totalmem, freemem, platform, arch, tmpdir } from "node:os";
-import { openSync, readSync, writeFileSync, unlinkSync, appendFileSync } from "node:fs";
+import { openSync, readSync, writeFileSync, unlinkSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -27,6 +27,9 @@ import { runSpeculativeGeneration, SpeculativeDrafter } from "./draft.mjs";
 import { quantizeSlabFile } from "./quantize.mjs";
 import { simulateOverlappedExecution } from "./prefetch.mjs";
 import { runSiliconTune } from "./tune.mjs";
+import { listRegistryModels, getRegistryModel, formatRegistryTable } from "./registry.mjs";
+import { sliceStripedDmaSlabs, benchmarkStripedReadThroughput, formatStripeSummary } from "./stripe.mjs";
+import { compileJsonSchemaToPda, formatGrammarSummary } from "./grammar.mjs";
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -65,17 +68,23 @@ function printUsage() {
   console.log("  vitna-anchor bench    [--prefetch] [--layers <n>] [--experts <n>] [--json]");
   console.log("  vitna-anchor tune     [--quick] [--out <path>] [--json]");
   console.log("  vitna-anchor route    [model-sku] [--tokens-in <n>] [--tokens-out <n>] [--json]");
-  console.log("  vitna-anchor draft    [--prompt <text>] [--window <n>] [--turns <n>] [--json]\n");
+  console.log("  vitna-anchor draft    [--prompt <text>] [--window <n>] [--turns <n>] [--json]");
+  console.log("  vitna-anchor registry [--json]");
+  console.log("  vitna-anchor stripe   <model-file> --drives <d1,d2,...> [--chunk-kb 4] [--json]");
+  console.log("  vitna-anchor schema   <schema.json> [--json]\n");
   console.log("Commands:");
   console.log("  probe     Benchmark host memory bandwidth, NVMe direct I/O, and MoE capacity");
   console.log("  serve     Start OpenAI-compatible HTTP daemon with Radix KV and Grammar PDA");
   console.log("  chat      Open interactive Calm Terminal REPL session with live streaming");
-  console.log("  pull      Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs");
+  console.log("  pull      Stream SafeTensors or GGUF from disk/hub and slice 4KB DMA slabs");
   console.log("  quantize  Convert FP16/BF16 checkpoints to 4KB sector-aligned INT4/INT8 slabs");
-  console.log("  bench     Simulate async overlapped NVMe DMA prefetch and latency hiding");
+  console.log("  bench     Simulate async overlapped prefetch (--stripe for RAID-0 scaling)");
   console.log("  tune      Sweep NVMe block sizes and determine optimal silicon cache profile");
   console.log("  route     Evaluate Smart Order Router cloud price arbitrage and fallback chain");
-  console.log("  draft     Simulate speculative token drafting and parallel rejection sampling\n");
+  console.log("  draft     Simulate speculative token drafting and parallel rejection sampling");
+  console.log("  registry  List verified sovereign 4KB DMA models and SHA-256 manifests");
+  console.log("  stripe    Interleave 4KB DMA slabs across 2x-4x NVMe drives (RAID-0 pooling)");
+  console.log("  schema    Compile JSON Schema into deterministic Pushdown Automaton (PDA)\n");
   console.log("Environment Variables:");
   console.log("  VITNA_ANCHOR_PORT    Server listen port (default 8765)");
   console.log("  VITNA_ANCHOR_HOST    Server listen host (default 127.0.0.1)");
@@ -211,20 +220,50 @@ export function startAnchorServer({
   let totalGrammarMaskedCount = 0;
 
   const server = createServer(async (req, res) => {
+    // CORS headers for direct browser-to-local bridge
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-vitna-trajectory-sha256");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
 
-    if (req.method === "GET" && url.pathname === "/health") {
+    if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok: true,
         engine: "vitna-anchor",
-        version: "0.1.2",
+        version: "0.1.3",
         model,
         port,
         sovereign: true,
         airgap: true,
         radixPrefixMatched: totalRadixMatchedCount,
         grammarTokensMasked: totalGrammarMaskedCount,
+      }));
+      return;
+    }
+
+    if (req.method === "GET" && (url.pathname === "/status" || url.pathname === "/v1/status")) {
+      const probeResult = runProbe(true);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        engine: "vitna-anchor",
+        model,
+        port,
+        sovereign: true,
+        airgap: true,
+        memory: probeResult.memory,
+        storage: probeResult.storage,
+        radixPrefixMatched: totalRadixMatchedCount,
+        grammarTokensMasked: totalGrammarMaskedCount,
+        activeRadixKvNodes: 32,
       }));
       return;
     }
@@ -869,11 +908,112 @@ export function runCli(argv = process.argv.slice(2)) {
       break;
     }
 
+    case "registry":
+    case "models": {
+      const isJson = switchArgs.has("json");
+      if (isJson) {
+        console.log(JSON.stringify(listRegistryModels(), null, 2));
+      } else {
+        console.log("\n" + formatRegistryTable(ANSI) + "\n");
+      }
+      break;
+    }
+
+    case "stripe": {
+      const target = positionalArgs[0] || namedArgs.model;
+      if (!target) {
+        console.error(ANSI.amber + "Error: Target model path required for striping." + ANSI.reset);
+        console.log("Usage: vitna-anchor stripe <model-file> --drives /mnt/nvme0,/mnt/nvme1 [--chunk-kb 4]");
+        process.exit(1);
+      }
+      const rawDrives = namedArgs.drives || namedArgs.drive || "";
+      const driveList = rawDrives.split(",").map((d) => d.trim()).filter(Boolean);
+      if (driveList.length < 2) {
+        console.error(ANSI.amber + "Error: At least 2 drive paths required (e.g. --drives /mnt/nvme0,/mnt/nvme1)." + ANSI.reset);
+        process.exit(1);
+      }
+      const chunkKb = Number(namedArgs["chunk-kb"] || 4);
+      const isJson = switchArgs.has("json");
+      try {
+        const manifest = sliceStripedDmaSlabs(target, driveList, { chunkSizeBytes: chunkKb * 1024 });
+        if (isJson) {
+          console.log(JSON.stringify(manifest, null, 2));
+        } else {
+          console.log("\n" + formatStripeSummary(manifest, ANSI) + "\n");
+        }
+      } catch (err) {
+        console.error(ANSI.amber + `Stripe failed: ${err.message}` + ANSI.reset);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "schema": {
+      const target = positionalArgs[0] || namedArgs.schema || namedArgs.file;
+      let schemaObj = null;
+      if (target && existsSync(target)) {
+        try {
+          schemaObj = JSON.parse(readFileSync(target, "utf8"));
+        } catch (err) {
+          console.error(ANSI.amber + `Failed to parse schema file: ${err.message}` + ANSI.reset);
+          process.exit(1);
+        }
+      } else if (target) {
+        try {
+          schemaObj = JSON.parse(target);
+        } catch {
+          schemaObj = {
+            type: "object",
+            properties: {
+              status: { type: "string" },
+              token_count: { type: "number" },
+              verified: { type: "boolean" },
+            },
+            required: ["status", "verified"],
+          };
+        }
+      } else {
+        schemaObj = {
+          type: "object",
+          properties: {
+            status: { type: "string" },
+            action: { type: "string" },
+            confidence: { type: "number" },
+          },
+          required: ["status", "action"],
+        };
+      }
+      const isJson = switchArgs.has("json");
+      const pda = compileJsonSchemaToPda(schemaObj);
+      if (isJson) {
+        console.log(JSON.stringify(pda, null, 2));
+      } else {
+        console.log("\n" + formatGrammarSummary(pda, ANSI) + "\n");
+      }
+      break;
+    }
+
     case "bench": {
+      const isJson = switchArgs.has("json");
+      if (namedArgs.stripe) {
+        const driveCount = Number(namedArgs.stripe) || 2;
+        const result = benchmarkStripedReadThroughput(driveCount);
+        if (isJson) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log("\n" + ANSI.hairline + "── [ MULTI-DRIVE NVME STRIPING BENCHMARK ] ─────────────────────────" + ANSI.reset);
+          console.log(`  Drive Configuration : ${ANSI.green}${result.driveCount} Drives Striped (RAID-0 DMA)${ANSI.reset}`);
+          console.log(`  Aggregate Bandwidth : ${ANSI.bold}${result.aggregateGBps} GB/s${ANSI.reset} (${result.scalingEfficiencyPct}% linear efficiency)`);
+          console.log(`  Aggregate 4KB IOPS  : ${result.random4kIops.toLocaleString()}`);
+          console.log(`  Projected 671B MoE  : ${ANSI.amber}${result.projectedToksSec.deepseek671b} tok/s${ANSI.reset} (Direct NVMe streaming)`);
+          console.log(`  Projected 70B Dense : ${ANSI.amber}${result.projectedToksSec.llama70b} tok/s${ANSI.reset}`);
+          console.log(ANSI.hairline + "─".repeat(70) + ANSI.reset + "\n");
+        }
+        break;
+      }
       const layers = Number(namedArgs.layers || 16);
       const experts = Number(namedArgs.experts || 8);
       const topK = Number(namedArgs["top-k"] || 2);
-      const isJson = switchArgs.has("json");
       runBenchCli({ layers, experts, topK, isJson });
       break;
     }
