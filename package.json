@@ -1,0 +1,44 @@
+{
+  "name": "vitna-anchor",
+  "version": "0.1.0",
+  "description": "Sovereign MoE inference engine, direct NVMe DMA streaming, speculative drafting, and Smart Order Router",
+  "type": "module",
+  "bin": {
+    "vitna-anchor": "./bin/vitna-anchor.mjs",
+    "anchor": "./bin/vitna-anchor.mjs"
+  },
+  "files": [
+    "bin/",
+    "runtime/",
+    "engine/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/anchor-cli.test.mjs tests/arbitrage-router.test.mjs tests/speculative-drafting.test.mjs",
+    "probe": "node runtime/anchor-run.mjs probe",
+    "chat": "node runtime/anchor-run.mjs chat",
+    "serve": "node runtime/anchor-run.mjs serve"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/convexityos/vitna-anchor.git"
+  },
+  "homepage": "https://vitna.ai/anchor",
+  "keywords": [
+    "inference",
+    "moe",
+    "speculative-decoding",
+    "sovereign",
+    "llm",
+    "nvme",
+    "openai-compatible",
+    "local-ai",
+    "arbitrage"
+  ],
+  "author": "Convexity <engineering@convexity.com>",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

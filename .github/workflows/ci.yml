@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-node:
+    name: Node Test Suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [18.x, 20.x, 22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run Test Suite
+        run: npm test
+
+  build-engine:
+    name: Build C11 Engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Engine with Make (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cd engine
+          make
+      - name: Build Engine with CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B engine/build -S engine
+          cmake --build engine/build --config Release
