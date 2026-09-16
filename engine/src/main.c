@@ -56,6 +56,7 @@ static int cmd_info(const char* model_path) {
 }
 
 static int cmd_bench(const char* model_path, int iterations) {
+    (void)model_path;
     printf("Running vitna-anchor streaming benchmark (%d iterations)...\n", iterations);
     double t0 = vitna_time_ms();
 

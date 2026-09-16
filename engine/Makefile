@@ -14,7 +14,7 @@ else
     CP = cp -f
 endif
 
-SRCS = src/main.c src/safetensors.c src/expert_store.c src/router.c src/kernels.c src/kv_cache.c src/radix_kv.c src/grammar.c src/speculative.c src/generate.c src/server.c
+SRCS = src/main.c src/safetensors.c src/expert_store.c src/router.c src/kernels.c src/kv_cache.c src/radix_kv.c src/grammar.c src/speculative.c src/generate.c src/server.c src/crypto.c src/async_io.c
 
 all: $(TARGET) $(ALIAS)
 
