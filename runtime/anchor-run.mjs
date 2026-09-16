@@ -21,6 +21,7 @@ import { createPriorityQueue, PRIORITY } from "./queue.mjs";
 import { compactMessages } from "./compaction.mjs";
 import { createStructuralStopGuard } from "./guard.mjs";
 import { ledgerRow } from "./ledger.mjs";
+import { runModelPull } from "./ingest.mjs";
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -53,11 +54,13 @@ function printUsage() {
   console.log("Usage:");
   console.log("  vitna-anchor probe [--json]");
   console.log("  vitna-anchor serve [--port <port>] [--host <ip>] [--model <name>]");
-  console.log("  vitna-anchor chat  [--port <port>] [--host <ip>] [--model <name>]\n");
+  console.log("  vitna-anchor chat  [--port <port>] [--host <ip>] [--model <name>]");
+  console.log("  vitna-anchor pull  <model-id-or-path> [--out <dir>] [--dry-run]\n");
   console.log("Commands:");
   console.log("  probe   Benchmark host memory bandwidth, NVMe direct I/O, and MoE capacity");
   console.log("  serve   Start OpenAI-compatible HTTP daemon with Radix KV and Grammar PDA");
-  console.log("  chat    Open interactive Calm Terminal REPL session with live streaming\n");
+  console.log("  chat    Open interactive Calm Terminal REPL session with live streaming");
+  console.log("  pull    Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs\n");
   console.log("Environment Variables:");
   console.log("  VITNA_ANCHOR_PORT    Server listen port (default 8765)");
   console.log("  VITNA_ANCHOR_HOST    Server listen host (default 127.0.0.1)");
@@ -508,6 +511,7 @@ export function runCli(argv = process.argv.slice(2)) {
 
   const namedArgs = {};
   const switchArgs = new Set();
+  const positionalArgs = [];
 
   for (let i = 1; i < rawArgs.length; i++) {
     const arg = rawArgs[i];
@@ -518,6 +522,8 @@ export function runCli(argv = process.argv.slice(2)) {
       } else {
         switchArgs.add(key);
       }
+    } else {
+      positionalArgs.push(arg);
     }
   }
 
@@ -529,6 +535,18 @@ export function runCli(argv = process.argv.slice(2)) {
     case "probe": {
       const isJson = switchArgs.has("json");
       runProbe(isJson);
+      break;
+    }
+
+    case "pull": {
+      const target = positionalArgs[0] || namedArgs.model || defaultModel;
+      const outDir = namedArgs.out || "./models";
+      const dryRun = switchArgs.has("dry-run");
+
+      runModelPull(target, { outDir, dryRun }).catch((err) => {
+        console.error(ANSI.amber + `Pull failed: ${err.message}` + ANSI.reset);
+        process.exit(1);
+      });
       break;
     }
 
