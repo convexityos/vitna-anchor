@@ -24,6 +24,9 @@ import { ledgerRow } from "./ledger.mjs";
 import { runModelPull } from "./ingest.mjs";
 import { evaluateSmartOrderRoute, resolveModelFamily } from "./arbitrage.mjs";
 import { runSpeculativeGeneration, SpeculativeDrafter } from "./draft.mjs";
+import { quantizeSlabFile } from "./quantize.mjs";
+import { simulateOverlappedExecution } from "./prefetch.mjs";
+import { runSiliconTune } from "./tune.mjs";
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -54,19 +57,25 @@ function printUsage() {
   console.log("\n" + ANSI.bold + "VITNA ANCHOR · SOVEREIGN INFERENCE CLI" + ANSI.reset);
   console.log(ANSI.dim + "Hardware-Direct MoE Engine · Zero Cloud Egress · C11 Core\n" + ANSI.reset);
   console.log("Usage:");
-  console.log("  vitna-anchor probe [--json]");
-  console.log("  vitna-anchor serve [--port <port>] [--host <ip>] [--model <name>]");
-  console.log("  vitna-anchor chat  [--port <port>] [--host <ip>] [--model <name>]");
-  console.log("  vitna-anchor pull  <model-id-or-path> [--out <dir>] [--dry-run]");
-  console.log("  vitna-anchor route [model-sku] [--tokens-in <n>] [--tokens-out <n>] [--json]");
-  console.log("  vitna-anchor draft [--prompt <text>] [--window <n>] [--turns <n>] [--json]\n");
+  console.log("  vitna-anchor probe    [--json]");
+  console.log("  vitna-anchor serve    [--port <port>] [--host <ip>] [--model <name>]");
+  console.log("  vitna-anchor chat     [--port <port>] [--host <ip>] [--model <name>]");
+  console.log("  vitna-anchor pull     <model-id-or-path> [--out <dir>] [--dry-run]");
+  console.log("  vitna-anchor quantize <model-slab> [--bits 4|8] [--out <dir>] [--json]");
+  console.log("  vitna-anchor bench    [--prefetch] [--layers <n>] [--experts <n>] [--json]");
+  console.log("  vitna-anchor tune     [--quick] [--out <path>] [--json]");
+  console.log("  vitna-anchor route    [model-sku] [--tokens-in <n>] [--tokens-out <n>] [--json]");
+  console.log("  vitna-anchor draft    [--prompt <text>] [--window <n>] [--turns <n>] [--json]\n");
   console.log("Commands:");
-  console.log("  probe   Benchmark host memory bandwidth, NVMe direct I/O, and MoE capacity");
-  console.log("  serve   Start OpenAI-compatible HTTP daemon with Radix KV and Grammar PDA");
-  console.log("  chat    Open interactive Calm Terminal REPL session with live streaming");
-  console.log("  pull    Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs");
-  console.log("  route   Evaluate Smart Order Router cloud price arbitrage and fallback chain");
-  console.log("  draft   Simulate speculative token drafting and parallel rejection sampling\n");
+  console.log("  probe     Benchmark host memory bandwidth, NVMe direct I/O, and MoE capacity");
+  console.log("  serve     Start OpenAI-compatible HTTP daemon with Radix KV and Grammar PDA");
+  console.log("  chat      Open interactive Calm Terminal REPL session with live streaming");
+  console.log("  pull      Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs");
+  console.log("  quantize  Convert FP16/BF16 checkpoints to 4KB sector-aligned INT4/INT8 slabs");
+  console.log("  bench     Simulate async overlapped NVMe DMA prefetch and latency hiding");
+  console.log("  tune      Sweep NVMe block sizes and determine optimal silicon cache profile");
+  console.log("  route     Evaluate Smart Order Router cloud price arbitrage and fallback chain");
+  console.log("  draft     Simulate speculative token drafting and parallel rejection sampling\n");
   console.log("Environment Variables:");
   console.log("  VITNA_ANCHOR_PORT    Server listen port (default 8765)");
   console.log("  VITNA_ANCHOR_HOST    Server listen host (default 127.0.0.1)");
@@ -591,6 +600,151 @@ export function runDraftCli(prompt, options = {}) {
   return result;
 }
 
+/**
+ * Execute 4KB DMA weight quantization on SafeTensors checkpoint or DMA slab.
+ * @param {string} inputPath
+ * @param {{ bits?: number, out?: string, isJson?: boolean }} options
+ */
+export function runQuantizeCli(inputPath, options = {}) {
+  const target = inputPath;
+  if (!target) {
+    console.error(ANSI.amber + "Error: Target checkpoint path required. Usage: vitna-anchor quantize <model-file> [--bits 4|8]" + ANSI.reset);
+    process.exit(1);
+  }
+
+  const bits = Number(options.bits || 4);
+  const outDir = options.out || "./models";
+  const isJson = Boolean(options.isJson);
+
+  if (!isJson) {
+    console.log("\n" + rule("DYNAMIC 4KB DMA WEIGHT QUANTIZER"));
+    console.log(`  Input File        : ${ANSI.bold}${target}${ANSI.reset}`);
+    console.log(`  Target Precision  : ${ANSI.green}INT${bits} (Block-wise symmetric scaling)${ANSI.reset}`);
+    console.log(`  Sector Alignment  : 4096 bytes (O_DIRECT / FILE_FLAG_NO_BUFFERING ready)`);
+    console.log(`  Output Directory  : ${ANSI.dim}${outDir}${ANSI.reset}\n`);
+  }
+
+  const result = quantizeSlabFile(target, outDir, {
+    bits,
+    onProgress: isJson ? undefined : ({ current, total, tensorName, ratio }) => {
+      const pct = ((current / total) * 100).toFixed(0);
+      process.stdout.write(`\r  [${pct}%] Quantizing to INT${bits}: ${ANSI.dim}${tensorName.slice(0, 35)}${ANSI.reset} (${ratio}x)   `);
+    },
+  });
+
+  if (isJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  console.log("\n");
+  console.log(`  Status            : ${ANSI.green}COMPLETED (4KB Aligned INT${bits})${ANSI.reset}`);
+  console.log(`  Total Tensors     : ${ANSI.bold}${result.totalTensors}${ANSI.reset}`);
+  console.log(`  Original Size     : ${(result.originalTotalBytes / (1024 * 1024)).toFixed(1)} MB`);
+  console.log(`  Quantized Size    : ${ANSI.bold}${(result.quantizedTotalBytes / (1024 * 1024)).toFixed(1)} MB${ANSI.reset}`);
+  console.log(`  Compression Ratio : ${ANSI.green}${ANSI.bold}${result.netCompressionRatio}x reduction${ANSI.reset}`);
+  console.log(`  Avg Reconstruction: ${result.avgSnrDb} dB SNR`);
+  console.log(`  Quantized Slab    : ${ANSI.bold}${result.quantizedSlabPath}${ANSI.reset}`);
+  console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}`);
+  console.log(`  Air-Gap SHA-256   : ${result.airgapHash.slice(0, 32)}...\n`);
+  console.log(rule() + "\n");
+  return result;
+}
+
+/**
+ * Execute async overlapped NVMe DMA prefetch benchmark.
+ * @param {{ layers?: number, experts?: number, topK?: number, isJson?: boolean }} options
+ */
+export function runBenchCli(options = {}) {
+  const layers = Number(options.layers || 16);
+  const experts = Number(options.experts || 8);
+  const topK = Number(options.topK || 2);
+  const isJson = Boolean(options.isJson);
+
+  const result = simulateOverlappedExecution({
+    layers,
+    expertsPerLayer: experts,
+    topK,
+  });
+
+  if (isJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  console.log("\n" + rule("ASYNC OVERLAPPED NVME DMA PREFETCH BENCHMARK"));
+  console.log(`  MoE Architecture  : ${layers} layers, ${experts} experts/layer (Top-${topK} routing)`);
+  console.log(`  NVMe Interface    : Direct I/O unbuffered DMA sector streaming (QD=8)`);
+  console.log(`  Attention Window  : 1.2ms compute overlap pipeline\n`);
+
+  console.log("  Layer Execution Timeline (Sample):");
+  for (let i = 0; i < Math.min(4, result.perLayerStats.length); i++) {
+    const st = result.perLayerStats[i];
+    const hidden = (st.syncLayerMs - st.overlappedLayerMs).toFixed(2);
+    console.log(`    [Layer ${pad(st.layer, 2)}] Sync: ${st.syncLayerMs}ms | Overlapped: ${ANSI.green}${st.overlappedLayerMs}ms${ANSI.reset} (Hidden: ${hidden}ms, Stall: ${st.stallMs}ms)`);
+  }
+  if (result.perLayerStats.length > 4) {
+    console.log(`    ... and ${result.perLayerStats.length - 4} more layers`);
+  }
+  console.log("");
+
+  console.log("  Benchmark Results:");
+  console.log(`    Sync Latency/Tok   : ${result.syncTotalMs} ms (${result.syncToksPerSec} toks/sec)`);
+  console.log(`    Overlapped Latency : ${ANSI.green}${result.overlappedTotalMs} ms${ANSI.reset} (${ANSI.bold}${ANSI.green}${result.overlappedToksPerSec} toks/sec${ANSI.reset})`);
+  console.log(`    NVMe Hidden Ratio  : ${ANSI.green}${result.latencyHiddenPct}% of page-in I/O hidden${ANSI.reset}`);
+  console.log(`    Effective Speedup  : ${ANSI.bold}${ANSI.green}${result.effectiveSpeedup}x${ANSI.reset} over synchronous baseline\n`);
+  console.log(rule() + "\n");
+  return result;
+}
+
+/**
+ * Execute host silicon sweep and determine optimal slab and cache layouts.
+ * @param {{ quick?: boolean, out?: string, isJson?: boolean }} options
+ */
+export function runTuneCli(options = {}) {
+  const quick = Boolean(options.quick);
+  const outFile = options.out;
+  const isJson = Boolean(options.isJson);
+
+  if (!isJson) {
+    console.log("\n" + rule("AUTONOMOUS HOST SILICON TUNER"));
+    console.log("  Probing storage sector boundaries, memory bandwidth, and queue depths...\n");
+  }
+
+  const profile = runSiliconTune({ quick, outFile });
+
+  if (isJson) {
+    console.log(JSON.stringify(profile, null, 2));
+    return profile;
+  }
+
+  console.log(`  Host Processor    : ${ANSI.bold}${profile.system.cpuModel}${ANSI.reset} (${profile.system.logicalCores} threads)`);
+  console.log(`  RAM Topology      : ${profile.system.totalRamGb} GB total / ${ANSI.green}${profile.system.freeRamGb} GB free${ANSI.reset}`);
+  console.log(`  Memory Bandwidth  : ${ANSI.bold}${profile.memoryBandwidthGBps} GB/s${ANSI.reset}`);
+  console.log(`  Random 4KB Reads  : ${ANSI.bold}${profile.random4kIops.toLocaleString()} IOPS${ANSI.reset}\n`);
+
+  console.log("  Block Size Throughput Sweep:");
+  for (const sw of profile.storageSweep) {
+    console.log(`    [${pad(sw.blockSizeLabel, 6)}] ${pad(sw.throughputMBps + " MB/s", 12)}`);
+  }
+  console.log("");
+
+  const rec = profile.tuningRecommendations;
+  console.log("  Optimal Tuning Recommendations:");
+  console.log(`    Sector Alignment    : ${rec.optimalSectorAlignment} bytes (Exact 4KB boundary)`);
+  console.log(`    Optimal Chunk Size  : ${rec.optimalDmaChunkSize / 1024} KB`);
+  console.log(`    Prefetch Queue Depth: ${rec.recommendedPrefetchDepth} requests`);
+  console.log(`    RAM Cache Budget    : ${ANSI.green}${rec.recommendedRamBudgetMb.toLocaleString()} MB${ANSI.reset}`);
+  console.log(`    Quantization Tier   : ${ANSI.bold}${ANSI.green}${rec.recommendedQuantTier}${ANSI.reset}`);
+  console.log(`    Worker Concurrency  : ${rec.maxConcurrentWorkers} worker threads\n`);
+
+  if (profile.profilePath) {
+    console.log(`  Tuning profile saved to: ${ANSI.bold}${profile.profilePath}${ANSI.reset}\n`);
+  }
+  console.log(rule() + "\n");
+  return profile;
+}
+
 // CLI Flag and Command Processing
 export function runCli(argv = process.argv.slice(2)) {
   const env = process.env;
@@ -702,6 +856,32 @@ export function runCli(argv = process.argv.slice(2)) {
       const turns = Number(namedArgs.turns || 5);
       const isJson = switchArgs.has("json");
       runDraftCli(prompt, { targetModel, draftModel, window, turns, isJson });
+      break;
+    }
+
+    case "quantize": {
+      const target = positionalArgs[0] || namedArgs.model;
+      const bits = Number(namedArgs.bits || 4);
+      const outDir = namedArgs.out || "./models";
+      const isJson = switchArgs.has("json");
+      runQuantizeCli(target, { bits, out: outDir, isJson });
+      break;
+    }
+
+    case "bench": {
+      const layers = Number(namedArgs.layers || 16);
+      const experts = Number(namedArgs.experts || 8);
+      const topK = Number(namedArgs["top-k"] || 2);
+      const isJson = switchArgs.has("json");
+      runBenchCli({ layers, experts, topK, isJson });
+      break;
+    }
+
+    case "tune": {
+      const quick = switchArgs.has("quick");
+      const outFile = namedArgs.out;
+      const isJson = switchArgs.has("json");
+      runTuneCli({ quick, out: outFile, isJson });
       break;
     }
 
