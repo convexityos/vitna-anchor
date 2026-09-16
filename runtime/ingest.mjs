@@ -173,6 +173,372 @@ export function parseMoEExpertRole(tensorName) {
 }
 
 /**
+ * GGML type size and block metadata.
+ */
+export const GGML_TYPE_META = {
+  0: { name: "F32", blockSize: 1, typeSize: 4 },
+  1: { name: "F16", blockSize: 1, typeSize: 2 },
+  2: { name: "Q4_0", blockSize: 32, typeSize: 18 },
+  3: { name: "Q4_1", blockSize: 32, typeSize: 20 },
+  7: { name: "Q8_0", blockSize: 32, typeSize: 34 },
+  8: { name: "Q8_1", blockSize: 32, typeSize: 36 },
+  12: { name: "Q4_K", blockSize: 256, typeSize: 144 },
+  13: { name: "Q5_K", blockSize: 256, typeSize: 176 },
+  14: { name: "Q6_K", blockSize: 256, typeSize: 210 },
+  15: { name: "Q8_K", blockSize: 256, typeSize: 292 },
+  16: { name: "BF16", blockSize: 1, typeSize: 2 },
+  17: { name: "INT8", blockSize: 1, typeSize: 1 },
+  18: { name: "INT16", blockSize: 1, typeSize: 2 },
+  19: { name: "INT32", blockSize: 1, typeSize: 4 },
+  20: { name: "INT64", blockSize: 1, typeSize: 8 },
+  21: { name: "FLOAT64", blockSize: 1, typeSize: 8 },
+};
+
+/**
+ * Calculate raw tensor size in bytes for a given GGML type and shape.
+ * @param {number} ggmlType
+ * @param {number[]} shape
+ * @returns {number}
+ */
+export function calculateGgufTensorSize(ggmlType, shape) {
+  const numElements = shape.reduce((acc, dim) => acc * dim, 1);
+  const meta = GGML_TYPE_META[ggmlType];
+  if (!meta) {
+    return numElements * 2;
+  }
+  const blocks = Math.ceil(numElements / meta.blockSize);
+  return blocks * meta.typeSize;
+}
+
+/**
+ * Parse GGUF header, key-value metadata, and tensor descriptors from a Buffer.
+ * @param {Buffer} buffer
+ * @returns {{
+ *   version: number,
+ *   tensorCount: number,
+ *   metadata: Record<string, any>,
+ *   tensors: Record<string, { shape: number[], dtype: string, ggmlType: number, data_offset: number, rawSize: number }>,
+ *   headerLen: number,
+ *   rawDataBase: number
+ * }}
+ */
+export function parseGgufHeader(buffer) {
+  if (buffer.length < 24) {
+    throw new Error("Buffer too short to contain GGUF header (minimum 24 bytes)");
+  }
+
+  const magic = buffer.toString("utf8", 0, 4);
+  if (magic !== "GGUF") {
+    throw new Error(`Invalid GGUF magic header: expected "GGUF", received "${magic}"`);
+  }
+
+  const version = buffer.readUInt32LE(4);
+  if (version !== 2 && version !== 3) {
+    throw new Error(`Unsupported GGUF version: ${version} (expected 2 or 3)`);
+  }
+
+  const tensorCount = Number(buffer.readBigUInt64LE(8));
+  const metadataCount = Number(buffer.readBigUInt64LE(16));
+
+  let pos = 24;
+
+  function readString() {
+    if (pos + 8 > buffer.length) throw new Error("Unexpected EOF reading GGUF string length");
+    const len = Number(buffer.readBigUInt64LE(pos));
+    pos += 8;
+    if (pos + len > buffer.length) throw new Error("Unexpected EOF reading GGUF string content");
+    const str = buffer.toString("utf8", pos, pos + len);
+    pos += len;
+    return str;
+  }
+
+  function readVal(valType) {
+    switch (valType) {
+      case 0: {
+        const v = buffer.readUInt8(pos); pos += 1; return v;
+      }
+      case 1: {
+        const v = buffer.readInt8(pos); pos += 1; return v;
+      }
+      case 2: {
+        const v = buffer.readUInt16LE(pos); pos += 2; return v;
+      }
+      case 3: {
+        const v = buffer.readInt16LE(pos); pos += 2; return v;
+      }
+      case 4: {
+        const v = buffer.readUInt32LE(pos); pos += 4; return v;
+      }
+      case 5: {
+        const v = buffer.readInt32LE(pos); pos += 4; return v;
+      }
+      case 6: {
+        const v = buffer.readFloatLE(pos); pos += 4; return v;
+      }
+      case 7: {
+        const v = buffer.readUInt8(pos) !== 0; pos += 1; return v;
+      }
+      case 8: {
+        return readString();
+      }
+      case 9: {
+        const itemType = buffer.readUInt32LE(pos); pos += 4;
+        const count = Number(buffer.readBigUInt64LE(pos)); pos += 8;
+        const arr = [];
+        for (let j = 0; j < count; j++) {
+          arr.push(readVal(itemType));
+        }
+        return arr;
+      }
+      case 10: {
+        const v = Number(buffer.readBigUInt64LE(pos)); pos += 8; return v;
+      }
+      case 11: {
+        const v = Number(buffer.readBigInt64LE(pos)); pos += 8; return v;
+      }
+      case 12: {
+        const v = buffer.readDoubleLE(pos); pos += 8; return v;
+      }
+      default:
+        throw new Error(`Unsupported GGUF value type: ${valType}`);
+    }
+  }
+
+  const metadata = {};
+  for (let i = 0; i < metadataCount; i++) {
+    const key = readString();
+    const valType = buffer.readUInt32LE(pos); pos += 4;
+    const val = readVal(valType);
+    metadata[key] = val;
+  }
+
+  const tensors = {};
+  for (let i = 0; i < tensorCount; i++) {
+    const name = readString();
+    const nDims = buffer.readUInt32LE(pos); pos += 4;
+    const dims = [];
+    for (let d = 0; d < nDims; d++) {
+      dims.push(Number(buffer.readBigUInt64LE(pos)));
+      pos += 8;
+    }
+    const type = buffer.readUInt32LE(pos); pos += 4;
+    const offset = Number(buffer.readBigUInt64LE(pos)); pos += 8;
+    const rawSize = calculateGgufTensorSize(type, dims);
+    const typeName = GGML_TYPE_META[type]?.name || `TYPE_${type}`;
+    tensors[name] = {
+      shape: dims,
+      dtype: typeName,
+      ggmlType: type,
+      data_offset: offset,
+      rawSize,
+    };
+  }
+
+  const alignment = Number(metadata["general.alignment"] || 32);
+  const rawDataBase = alignUp(pos, alignment);
+
+  return {
+    version,
+    tensorCount,
+    metadata,
+    tensors,
+    headerLen: pos,
+    rawDataBase,
+  };
+}
+
+/**
+ * Inspect GGUF file header and tensor directory.
+ * @param {string} filePath
+ * @returns {{
+ *   version: number,
+ *   tensorCount: number,
+ *   metadata: Record<string, any>,
+ *   tensors: Record<string, any>,
+ *   headerLen: number,
+ *   rawDataBase: number,
+ *   fileSize: number
+ * }}
+ */
+export function inspectGgufFile(filePath) {
+  const stat = statSync(filePath);
+  const fd = openSync(filePath, "r");
+  try {
+    const readSize = Math.min(stat.size, 16 * 1024 * 1024);
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, 0);
+    const parsed = parseGgufHeader(buf);
+    return {
+      ...parsed,
+      fileSize: stat.size,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Slice and repack tensor weights from a GGUF file into 4096-byte DMA aligned slabs.
+ * @param {string} sourcePath Path to source GGUF file.
+ * @param {string} outputDir Target output directory.
+ * @param {{
+ *   dryRun?: boolean,
+ *   onProgress?: (progress: { current: number, total: number, tensorName: string }) => void
+ * }} options
+ */
+export function sliceGgufDmaSlabs(sourcePath, outputDir, options = {}) {
+  const { dryRun = false, onProgress } = options;
+
+  if (!existsSync(sourcePath)) {
+    throw new Error(`Source GGUF file not found: ${sourcePath}`);
+  }
+
+  const info = inspectGgufFile(sourcePath);
+  const tensorNames = Object.keys(info.tensors);
+
+  if (!existsSync(outputDir) && !dryRun) {
+    mkdirSync(outputDir, { recursive: true });
+  }
+
+  const baseName = basename(sourcePath).replace(/\.gguf$/i, "");
+  const alignedFilePath = join(outputDir, `${baseName}.dma.anchor`);
+  const manifestPath = join(outputDir, `${baseName}.anchor.index.json`);
+
+  let currentOffset = SECTOR_SIZE;
+  const records = [];
+  const hasher = createHash("sha256");
+
+  const sortedNames = tensorNames.slice().sort((a, b) => info.tensors[a].data_offset - info.tensors[b].data_offset);
+
+  for (let i = 0; i < sortedNames.length; i++) {
+    const name = sortedNames[i];
+    const desc = info.tensors[name];
+
+    let rawSize = desc.rawSize;
+    if (i + 1 < sortedNames.length) {
+      const nextOffset = info.tensors[sortedNames[i + 1]].data_offset;
+      if (nextOffset > desc.data_offset) {
+        rawSize = nextOffset - desc.data_offset;
+      }
+    }
+
+    const alignedOffset = alignUp(currentOffset, SECTOR_SIZE);
+    const paddingBefore = alignedOffset - currentOffset;
+    const alignedSize = alignUp(rawSize, SECTOR_SIZE);
+
+    const moeRole = parseMoEExpertRole(name);
+
+    records.push({
+      name,
+      shardIdx: 0,
+      dtype: desc.dtype,
+      shape: desc.shape,
+      sourceOffset: info.rawDataBase + desc.data_offset,
+      rawSize,
+      targetOffset: alignedOffset,
+      alignedSize,
+      paddingBefore,
+      isExpert: moeRole.isExpert,
+      layerIdx: moeRole.layerIdx,
+      expertIdx: moeRole.expertIdx,
+      aligned_4k: true,
+    });
+
+    currentOffset = alignedOffset + rawSize;
+  }
+
+  if (dryRun) {
+    return {
+      manifestPath,
+      alignedFilePath,
+      tensorCount: records.length,
+      totalBytesWritten: currentOffset,
+      airgapHash: "DRY_RUN_ATTESTATION_PENDING",
+      records,
+    };
+  }
+
+  const srcFd = openSync(sourcePath, "r");
+  const dstFd = openSync(alignedFilePath, "w");
+
+  try {
+    const headerPad = Buffer.alloc(SECTOR_SIZE, 0);
+    writeSync(dstFd, headerPad, 0, SECTOR_SIZE, 0);
+
+    const copyChunkSize = 1024 * 1024;
+    const copyBuf = Buffer.alloc(copyChunkSize);
+
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+
+      if (onProgress) {
+        onProgress({ current: i + 1, total: records.length, tensorName: rec.name });
+      }
+
+      if (rec.paddingBefore > 0) {
+        const padBuf = Buffer.alloc(rec.paddingBefore, 0);
+        writeSync(dstFd, padBuf, 0, rec.paddingBefore, rec.targetOffset - rec.paddingBefore);
+      }
+
+      let bytesToCopy = rec.rawSize;
+      let srcPos = rec.sourceOffset;
+      let dstPos = rec.targetOffset;
+
+      while (bytesToCopy > 0) {
+        const toRead = Math.min(copyChunkSize, bytesToCopy);
+        readSync(srcFd, copyBuf, 0, toRead, srcPos);
+        writeSync(dstFd, copyBuf, 0, toRead, dstPos);
+
+        hasher.update(copyBuf.subarray(0, toRead));
+        srcPos += toRead;
+        dstPos += toRead;
+        bytesToCopy -= toRead;
+      }
+    }
+  } finally {
+    closeSync(srcFd);
+    closeSync(dstFd);
+  }
+
+  const airgapHash = hasher.digest("hex");
+
+  const manifest = {
+    format: "vitna-anchor-dma-v1",
+    sourceFormat: "gguf",
+    model: baseName,
+    sourceFile: basename(sourcePath),
+    totalTensors: records.length,
+    sectorSize: SECTOR_SIZE,
+    airgapSha256: airgapHash,
+    createdAt: new Date().toISOString(),
+    tensors: records.map((r) => ({
+      name: r.name,
+      shardIdx: 0,
+      dtype: r.dtype,
+      shape: r.shape,
+      offset: r.targetOffset,
+      sizeBytes: r.rawSize,
+      alignedSize: r.alignedSize,
+      isExpert: r.isExpert,
+      layerIdx: r.layerIdx,
+      expertIdx: r.expertIdx,
+      aligned_4k: true,
+    })),
+  };
+
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+  return {
+    manifestPath,
+    alignedFilePath,
+    tensorCount: records.length,
+    totalBytesWritten: currentOffset,
+    airgapHash,
+    records,
+  };
+}
+
+/**
  * Slice and repack tensor weights from a single safetensors file into 4096-byte DMA aligned slabs.
  * @param {string} sourcePath Path to source safetensors file.
  * @param {string} outputDir Target output directory.
@@ -712,7 +1078,30 @@ export async function runModelPull(target, options = {}) {
       }
     }
 
-    // 3. Local single-file safetensors
+    // 3. Local GGUF checkpoint file
+    if (target.toLowerCase().endsWith(".gguf") || options.format === "gguf") {
+      console.log(`  Source Type       : ${ANSI.green}Local GGUF Checkpoint${ANSI.reset}`);
+      console.log(`  Input Path        : ${ANSI.bold}${target}${ANSI.reset}`);
+      console.log(`  Output Directory  : ${ANSI.bold}${outDir}${ANSI.reset}\n`);
+
+      const result = sliceGgufDmaSlabs(target, outDir, {
+        dryRun,
+        onProgress: ({ current, total, tensorName }) => {
+          const pct = ((current / total) * 100).toFixed(0);
+          process.stdout.write(`\r  [${pct}%] Slicing 4KB DMA slab: ${ANSI.dim}${tensorName.slice(0, 45)}${ANSI.reset}     `);
+        },
+      });
+
+      console.log("\n");
+      console.log(`  Status            : ${ANSI.green}COMPLETED (GGUF 4KB DMA Aligned)${ANSI.reset}`);
+      console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
+      console.log(`  Aligned Output    : ${ANSI.bold}${result.alignedFilePath}${ANSI.reset}`);
+      console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}`);
+      console.log(`  Air-Gap SHA-256   : ${ANSI.amber}${result.airgapHash.slice(0, 32)}...${ANSI.reset}\n`);
+      return result;
+    }
+
+    // 4. Local single-file safetensors
     console.log(`  Source Type       : ${ANSI.green}Local File Checkpoint${ANSI.reset}`);
     console.log(`  Input Path        : ${ANSI.bold}${target}${ANSI.reset}`);
     console.log(`  Output Directory  : ${ANSI.bold}${outDir}${ANSI.reset}\n`);

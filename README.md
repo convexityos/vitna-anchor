@@ -139,6 +139,69 @@ Or using PowerShell build script:
 
 ---
 
+---
+
+## CLI Subcommands Reference
+
+### 1. Model Quantization (`quantize`)
+Compresses tensor slabs to block-wise INT4 or INT8 with 4096-byte DMA sector alignment:
+```bash
+# Quantize tensor weights to packed INT4 with 4KB sector padding
+npx vitna-anchor quantize ./models/model.dma.anchor --bits 4 --out ./models/quantized
+
+# Quantize to INT8 with JSON telemetry output
+npx vitna-anchor quantize ./models/model.dma.anchor --bits 8 --json
+```
+
+### 2. Async Overlapped Pre-fetching Benchmark (`bench --prefetch`)
+Simulates asynchronous NVMe expert layer pre-fetching and calculates hidden latency:
+```bash
+# Run prefetch benchmark across 32 MoE layers with 7.45 GB/s line rate
+npx vitna-anchor bench --prefetch --layers 32 --bandwidth 7.45
+
+# Output machine-readable JSON metrics
+npx vitna-anchor bench --prefetch --json
+```
+
+### 3. Autonomous Silicon Tuner (`tune`)
+Discovers hardware topology and sweeps I/O queues to recommend optimal cache and sector configurations:
+```bash
+# Run hardware sweep and print recommendations
+npx vitna-anchor tune
+
+# Write persistent hardware profile to file
+npx vitna-anchor tune --out ./anchor-profile.json
+```
+
+### 4. Speculative MoE Drafting (`draft`)
+Runs speculative candidate generation ($K=4$) with parallel rejection sampling verification:
+```bash
+# Run speculative drafting simulation
+npx vitna-anchor draft --prompt "Explain zero-copy NVMe DMA" --window 4
+
+# Output telemetry in JSON format
+npx vitna-anchor draft --json
+```
+
+### 5. Smart Order Router Arbitrage (`route`)
+Evaluates lowest-cost provider across DeepInfra, Together, Fireworks, Groq, and OpenRouter:
+```bash
+# Inspect price dispersion and arbitrage plan for a model SKU
+npx vitna-anchor route meta-llama/llama-3.3-70b-instruct
+```
+
+### 6. Model Ingestion & Checkpoint Slicing (`pull`)
+Ingests SafeTensors or GGUF checkpoints, repacking weights into 4KB DMA aligned slabs:
+```bash
+# Pull model from Hugging Face Hub (dry run)
+npx vitna-anchor pull Qwen/Qwen2.5-Coder-7B-Instruct --dry-run
+
+# Ingest local checkpoint file into DMA slabs
+npx vitna-anchor pull ./checkpoints/model.safetensors --out ./models
+```
+
+---
+
 ## Interactive REPL Slash Commands
 
 When running `vitna-anchor chat`, the interactive Calm Terminal REPL provides developer controls:
@@ -147,7 +210,12 @@ When running `vitna-anchor chat`, the interactive Calm Terminal REPL provides de
 * `/json [schema]`: Enable kernel grammar pushdown automaton for zero-retry JSON
 * `/text`: Revert to freeform natural language generation
 * `/probe`: Run live NVMe, RAM, and air-gap attestation benchmark
-* `/arbitrage`: Inspect live cloud price dispersion and cheapest-first routing
+* `/quantize [bits]`: Run interactive weight quantizer simulation
+* `/prefetch`: Run interactive async prefetch pipeline benchmark
+* `/tune`: Run interactive autonomous silicon tuner sweep
+* `/draft [prompt]`: Run interactive speculative candidate generation simulation
+* `/route [sku]`: Inspect cloud price arbitrage and cheapest-first execution plan
+* `/connect [url]`: Test and connect to a local or remote Anchor daemon
 * `/stats`: Show session tokens, cache hits, and 0 bytes egress verification
 * `/cache`: Inspect in-memory Radix KV cache efficiency
 * `/clear`: Clear conversation context while retaining system prompt
@@ -167,6 +235,10 @@ Test coverage includes:
 * `tests/anchor-cli.test.mjs`: Hardware probe benchmark, OpenAI daemon streaming SSE, prompt caching, grammar enforcement
 * `tests/arbitrage-router.test.mjs`: Model alias mapping, provider price calculations, lowest-cost selection
 * `tests/speculative-drafting.test.mjs`: Lookahead proposals, rejection sampling verification, speedup multiplier
+* `tests/model-ingestion.test.mjs`: Sharded index parsing, 4KB DMA slab repacking, air-gap attestation
+* `tests/quantization.test.mjs`: Block-wise INT4 and INT8 quantization, SNR calculation, 4KB sector padding
+* `tests/prefetch.test.mjs`: Asynchronous prefetch queue, hidden latency computation, pipeline speedup
+* `tests/tune.test.mjs`: Silicon tuner hardware sweep, queue depth recommendation, profile generation
 
 ---
 

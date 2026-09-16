@@ -795,8 +795,9 @@ export function runCli(argv = process.argv.slice(2)) {
       const target = positionalArgs[0] || namedArgs.model || defaultModel;
       const outDir = namedArgs.out || "./models";
       const dryRun = switchArgs.has("dry-run");
+      const format = namedArgs.format;
 
-      runModelPull(target, { outDir, dryRun }).catch((err) => {
+      runModelPull(target, { outDir, dryRun, format }).catch((err) => {
         console.error(ANSI.amber + `Pull failed: ${err.message}` + ANSI.reset);
         process.exit(1);
       });

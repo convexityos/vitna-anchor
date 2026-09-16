@@ -38,8 +38,16 @@ jobs:
         run: |
           cd engine
           make
+      - name: Test Native Engine Benchmark (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          ./engine/vitna-anchor bench --iterations 5
       - name: Build Engine with CMake (Windows)
         if: runner.os == 'Windows'
         run: |
           cmake -B engine/build -S engine
           cmake --build engine/build --config Release
+      - name: Test Native Engine Benchmark (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .\engine\build\Release\vitna-anchor.exe bench --iterations 5

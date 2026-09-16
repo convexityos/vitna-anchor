@@ -15,11 +15,16 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/anchor-cli.test.mjs tests/arbitrage-router.test.mjs tests/speculative-drafting.test.mjs tests/model-ingestion.test.mjs",
+    "test": "node --test tests/*.test.mjs",
     "probe": "node runtime/anchor-run.mjs probe",
     "chat": "node runtime/anchor-run.mjs chat",
     "serve": "node runtime/anchor-run.mjs serve",
-    "pull": "node runtime/anchor-run.mjs pull"
+    "pull": "node runtime/anchor-run.mjs pull",
+    "quantize": "node runtime/anchor-run.mjs quantize",
+    "tune": "node runtime/anchor-run.mjs tune",
+    "route": "node runtime/anchor-run.mjs route",
+    "draft": "node runtime/anchor-run.mjs draft",
+    "bench": "node runtime/anchor-run.mjs bench"
   },
   "repository": {
     "type": "git",
