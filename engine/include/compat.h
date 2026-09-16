@@ -23,6 +23,8 @@
   #endif
   #include <windows.h>
   #include <io.h>
+  #include <stdlib.h>
+  #include <malloc.h>
 #else
   #define VITNA_OS_POSIX 1
   #define _GNU_SOURCE
@@ -222,6 +224,8 @@ static inline bool vitna_file_open_read(const char* path, bool direct_io, vitna_
     int flags = O_RDONLY;
   #ifdef O_DIRECT
     if (direct_io) flags |= O_DIRECT;
+  #else
+    (void)direct_io;
   #endif
     out->fd = open(path, flags);
     return out->fd >= 0;

@@ -140,13 +140,18 @@ bool vitna_generate_run(
         } else {
             /* Predictive router lookahead for downstream layers */
             if (config->router_lookahead) {
+                vitna_routing_choice_t choices[1];
+                choices[0].expert_idx = (uint32_t)(token_id % 64);
+                choices[0].weight = 1.0f;
                 uint32_t predicted[8];
-                size_t num_predicted = vitna_router_predict_downstream(
+                size_t num_predicted = 0;
+                vitna_router_predict_downstream(
                     config->router_lookahead,
                     0,
-                    token_id % 64,
+                    choices,
+                    1,
                     predicted,
-                    8
+                    &num_predicted
                 );
                 if (num_predicted > 0 && config->expert_store) {
                     vitna_expert_store_prefetch(config->expert_store, 4, predicted, num_predicted);
