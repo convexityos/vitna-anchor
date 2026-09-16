@@ -1,90 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-/**
- * Deterministic simulation of the C11 speculative rejection sampling engine
- * from engine/src/speculative.c to assert exact mathematical invariants.
- */
-class SpeculativeDrafterSim {
-  constructor(lookaheadWindow = 4, seed = 0x853c49e7) {
-    this.lookaheadWindow = lookaheadWindow;
-    this.rngState = seed;
-    this.totalDrafted = 0;
-    this.totalAccepted = 0;
-    this.verificationPasses = 0;
-  }
+import {
+  SpeculativeDrafter,
+  runSpeculativeGeneration,
+} from "../runtime/draft.mjs";
 
-  xorshift32() {
-    let x = this.rngState;
-    if (x === 0) x = 0x6a09e667;
-    x ^= (x << 13) >>> 0;
-    x ^= (x >>> 17) >>> 0;
-    x ^= (x << 5) >>> 0;
-    this.rngState = x >>> 0;
-    return this.rngState;
-  }
-
-  randomUnitFloat() {
-    return (this.xorshift32() & 0x00ffffff) / 0x01000000;
-  }
-
-  propose(currentTokenId) {
-    const candidates = [];
-    let runningId = currentTokenId;
-    for (let i = 0; i < this.lookaheadWindow; i++) {
-      const stepHash = this.xorshift32();
-      runningId += 1 + (stepHash % 7);
-      candidates.push({
-        tokenId: runningId,
-        draftProb: 0.75 + (stepHash % 20) / 100.0,
-        targetProb: 0.0,
-        accepted: false,
-      });
-    }
-    this.totalDrafted += this.lookaheadWindow;
-    return candidates;
-  }
-
-  verify(candidates) {
-    this.verificationPasses++;
-    let accepted = 0;
-    let lastToken = candidates[0].tokenId;
-
-    for (let i = 0; i < candidates.length; i++) {
-      const c = candidates[i];
-      if (c.targetProb <= 0) {
-        c.targetProb = Math.min(0.98, c.draftProb * (0.85 + (this.xorshift32() % 30) / 100.0));
-      }
-
-      const ratio = c.targetProb / Math.max(0.001, c.draftProb);
-      const r = this.randomUnitFloat();
-
-      if (ratio >= 1.0 || r <= ratio) {
-        c.accepted = true;
-        accepted++;
-        lastToken = c.tokenId;
-      } else {
-        c.accepted = false;
-        lastToken = c.tokenId + (this.xorshift32() % 15) + 1;
-        break;
-      }
-    }
-
-    this.totalAccepted += accepted;
-    return { acceptedCount: accepted, emittedTokenId: lastToken };
-  }
-
-  acceptanceRate() {
-    return this.totalDrafted > 0 ? this.totalAccepted / this.totalDrafted : 0;
-  }
-
-  speedupFactor() {
-    if (this.verificationPasses === 0) return 1.0;
-    const alpha = this.totalAccepted / this.verificationPasses;
-    const overhead = 0.05 * this.lookaheadWindow;
-    return Math.max(1.0, (alpha + 1.0) / (1.0 + overhead));
-  }
-}
+const SpeculativeDrafterSim = SpeculativeDrafter;
 
 test("speculative drafting proposes exactly lookahead_window candidate tokens", () => {
   const drafter = new SpeculativeDrafterSim(4);
@@ -148,4 +70,23 @@ test("multi-turn speculative execution achieves >2.0x empirical speedup over bas
 
   assert.ok(rate > 0.65, `acceptance rate should be >65%, got ${(rate * 100).toFixed(1)}%`);
   assert.ok(speedup > 2.0, `speculative speedup should be >2.0x, got ${speedup.toFixed(2)}x`);
+});
+
+test("runSpeculativeGeneration produces multi-step verification telemetry and speedup metrics", () => {
+  const sim = runSpeculativeGeneration("Explain NVMe DMA slab slicing", {
+    lookaheadWindow: 4,
+    turns: 6,
+  });
+
+  assert.equal(sim.lookaheadWindow, 4);
+  assert.equal(sim.steps.length, 6);
+  assert.ok(sim.totalDrafted >= 24);
+  assert.ok(sim.totalAccepted > 0);
+  assert.ok(sim.speedupFactor >= 1.5);
+  assert.ok(sim.generatedText.length > 0);
+
+  for (const step of sim.steps) {
+    assert.equal(step.candidates.length, 4);
+    assert.ok(step.emittedTokens.length > 0);
+  }
 });

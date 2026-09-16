@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { request as httpRequest } from "node:http";
 
-import { runProbe, startAnchorServer } from "../runtime/anchor-run.mjs";
+import {
+  runProbe,
+  startAnchorServer,
+  runRouteCli,
+  runDraftCli,
+} from "../runtime/anchor-run.mjs";
 
 function httpPost(port, path, data) {
   return new Promise((resolve, reject) => {
@@ -177,4 +182,36 @@ test("vitna-anchor serve provides OpenAI-compatible completions, Radix KV cache,
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("vitna-anchor route calculates lowest-cost provider and arbitrage savings", () => {
+  const result = runRouteCli("meta-llama/llama-3.3-70b-instruct", {
+    inputTokens: 2000,
+    outputTokens: 500,
+    isJson: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.family, "llama-3.3-70b");
+  assert.equal(result.chosenProvider, "deepinfra");
+  assert.ok(result.costUsd > 0);
+  assert.ok(result.savingsUsd > 0);
+  assert.ok(result.savingsPct > 0);
+  assert.ok(result.fallbackChain.length > 0);
+});
+
+test("vitna-anchor draft executes speculative candidate generation and verification", () => {
+  const result = runDraftCli("Benchmark direct NVMe DMA engine", {
+    window: 4,
+    turns: 4,
+    isJson: true,
+  });
+
+  assert.equal(result.lookaheadWindow, 4);
+  assert.equal(result.steps.length, 4);
+  assert.ok(result.totalDrafted >= 16);
+  assert.ok(result.totalAccepted > 0);
+  assert.ok(result.acceptanceRate > 0.5);
+  assert.ok(result.speedupFactor >= 1.5);
+  assert.ok(result.generatedText.length > 0);
 });

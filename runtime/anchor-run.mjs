@@ -22,6 +22,8 @@ import { compactMessages } from "./compaction.mjs";
 import { createStructuralStopGuard } from "./guard.mjs";
 import { ledgerRow } from "./ledger.mjs";
 import { runModelPull } from "./ingest.mjs";
+import { evaluateSmartOrderRoute, resolveModelFamily } from "./arbitrage.mjs";
+import { runSpeculativeGeneration, SpeculativeDrafter } from "./draft.mjs";
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -55,12 +57,16 @@ function printUsage() {
   console.log("  vitna-anchor probe [--json]");
   console.log("  vitna-anchor serve [--port <port>] [--host <ip>] [--model <name>]");
   console.log("  vitna-anchor chat  [--port <port>] [--host <ip>] [--model <name>]");
-  console.log("  vitna-anchor pull  <model-id-or-path> [--out <dir>] [--dry-run]\n");
+  console.log("  vitna-anchor pull  <model-id-or-path> [--out <dir>] [--dry-run]");
+  console.log("  vitna-anchor route [model-sku] [--tokens-in <n>] [--tokens-out <n>] [--json]");
+  console.log("  vitna-anchor draft [--prompt <text>] [--window <n>] [--turns <n>] [--json]\n");
   console.log("Commands:");
   console.log("  probe   Benchmark host memory bandwidth, NVMe direct I/O, and MoE capacity");
   console.log("  serve   Start OpenAI-compatible HTTP daemon with Radix KV and Grammar PDA");
   console.log("  chat    Open interactive Calm Terminal REPL session with live streaming");
-  console.log("  pull    Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs\n");
+  console.log("  pull    Stream SafeTensors from HuggingFace Hub and slice 4KB DMA slabs");
+  console.log("  route   Evaluate Smart Order Router cloud price arbitrage and fallback chain");
+  console.log("  draft   Simulate speculative token drafting and parallel rejection sampling\n");
   console.log("Environment Variables:");
   console.log("  VITNA_ANCHOR_PORT    Server listen port (default 8765)");
   console.log("  VITNA_ANCHOR_HOST    Server listen host (default 127.0.0.1)");
@@ -492,6 +498,99 @@ function isServerHealthy(host, port) {
   });
 }
 
+/**
+ * Execute Smart Order Router price arbitrage evaluation.
+ * @param {string} targetModel
+ * @param {{ inputTokens?: number, outputTokens?: number, isJson?: boolean }} options
+ */
+export function runRouteCli(targetModel, options = {}) {
+  const model = targetModel || "meta-llama/llama-3.3-70b-instruct";
+  const inputTokens = Number(options.inputTokens || 1000);
+  const outputTokens = Number(options.outputTokens || 300);
+  const isJson = Boolean(options.isJson);
+
+  const route = evaluateSmartOrderRoute({
+    model,
+    inputTokens,
+    outputTokens,
+  });
+
+  if (isJson) {
+    console.log(JSON.stringify(route, null, 2));
+    return route;
+  }
+
+  console.log("\n" + rule("SMART ORDER ROUTER · PRICE ARBITRAGE"));
+  console.log(`  Target SKU        : ${ANSI.bold}${model}${ANSI.reset}`);
+  console.log(`  Model Family      : ${ANSI.dim}${route.family || "general"}${ANSI.reset}`);
+  console.log(`  Chosen Provider   : ${ANSI.green}${route.chosenProvider}${ANSI.reset} (${route.chosenTag})`);
+  console.log(`  Quantization Tier : ${ANSI.bold}${route.quantization}${ANSI.reset}`);
+  console.log(`  Token Volume      : ${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out`);
+  console.log(`  Estimated Cost    : ${ANSI.green}$${route.costUsd.toFixed(6)} USD${ANSI.reset}`);
+  console.log(`  Market Median     : $${route.medianMarketCostUsd.toFixed(6)} USD`);
+  console.log(`  Arbitrage Savings : ${ANSI.bold}${ANSI.green}$${route.savingsUsd.toFixed(6)} USD (${route.savingsPct}% savings)${ANSI.reset}\n`);
+
+  if (route.fallbackChain && route.fallbackChain.length > 0) {
+    console.log("  Fallback Execution Chain:");
+    route.fallbackChain.forEach((fb, idx) => {
+      const diff = fb.costUsd > route.costUsd ? `+$${(fb.costUsd - route.costUsd).toFixed(6)}` : "baseline";
+      console.log(`    [${idx + 1}] ${pad(fb.provider, 12)} ${pad(`$${fb.costUsd.toFixed(6)} USD`, 16)} (${diff})`);
+    });
+    console.log("");
+  }
+  console.log(rule() + "\n");
+  return route;
+}
+
+/**
+ * Execute speculative drafting and parallel verification simulation.
+ * @param {string} prompt
+ * @param {{ targetModel?: string, draftModel?: string, window?: number, turns?: number, isJson?: boolean }} options
+ */
+export function runDraftCli(prompt, options = {}) {
+  const inputPrompt = prompt || "Explain NVMe DMA slab slicing for MoE models";
+  const targetModel = options.targetModel || "vitna/anchor-moe-70b";
+  const draftModel = options.draftModel || "vitna/anchor-draft-1b";
+  const lookaheadWindow = Number(options.window || 4);
+  const turns = Number(options.turns || 5);
+  const isJson = Boolean(options.isJson);
+
+  const result = runSpeculativeGeneration(inputPrompt, {
+    targetModel,
+    draftModel,
+    lookaheadWindow,
+    turns,
+  });
+
+  if (isJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  console.log("\n" + rule("SPECULATIVE DRAFTING & PARALLEL VERIFICATION"));
+  console.log(`  Target Model      : ${ANSI.bold}${result.targetModel}${ANSI.reset}`);
+  console.log(`  Draft Model       : ${ANSI.dim}${result.draftModel}${ANSI.reset}`);
+  console.log(`  Lookahead Window  : ${ANSI.bold}${result.lookaheadWindow} candidate tokens${ANSI.reset}`);
+  console.log(`  Input Prompt      : "${ANSI.dim}${inputPrompt}${ANSI.reset}"\n`);
+
+  for (const step of result.steps) {
+    const draftTexts = step.candidates.map((c) => c.text).join("");
+    const verifyMarks = step.candidates.map((c) => (c.accepted ? ANSI.green + "✓" + ANSI.reset : ANSI.amber + "✗" + ANSI.reset)).join("  ");
+    console.log(`  [Pass ${step.turn}] Drafted: [${ANSI.dim}${draftTexts.trim()}${ANSI.reset}]`);
+    console.log(`          Verified: [ ${verifyMarks} ] -> Accepted: ${ANSI.bold}${step.acceptedCount}/${step.candidates.length}${ANSI.reset}\n`);
+  }
+
+  console.log("  Speculative Telemetry:");
+  console.log(`    Total Drafted       : ${ANSI.bold}${result.totalDrafted} tokens${ANSI.reset}`);
+  console.log(`    Total Accepted      : ${ANSI.green}${result.totalAccepted} tokens${ANSI.reset}`);
+  console.log(`    Acceptance Rate     : ${ANSI.green}${(result.acceptanceRate * 100).toFixed(1)}%${ANSI.reset}`);
+  console.log(`    Verification Passes : ${result.verificationPasses}`);
+  console.log(`    Empirical Speedup   : ${ANSI.bold}${ANSI.green}${result.speedupFactor}x baseline tokens/sec${ANSI.reset}\n`);
+  console.log(`  Generated Preview     : "${ANSI.dim}${result.generatedText}${ANSI.reset}"\n`);
+  console.log(rule() + "\n");
+  return result;
+}
+
 // CLI Flag and Command Processing
 export function runCli(argv = process.argv.slice(2)) {
   const env = process.env;
@@ -583,6 +682,26 @@ export function runCli(argv = process.argv.slice(2)) {
         console.error(ANSI.amber + `Chat failed to launch: ${err.message}` + ANSI.reset);
         process.exit(1);
       });
+      break;
+    }
+
+    case "route": {
+      const target = positionalArgs[0] || namedArgs.model || "meta-llama/llama-3.3-70b-instruct";
+      const inputTokens = Number(namedArgs["tokens-in"] || namedArgs.in || 1000);
+      const outputTokens = Number(namedArgs["tokens-out"] || namedArgs.out || 300);
+      const isJson = switchArgs.has("json");
+      runRouteCli(target, { inputTokens, outputTokens, isJson });
+      break;
+    }
+
+    case "draft": {
+      const prompt = namedArgs.prompt || positionalArgs.join(" ") || "Explain NVMe DMA slab slicing for MoE models";
+      const targetModel = namedArgs.target || "vitna/anchor-moe-70b";
+      const draftModel = namedArgs.draft || "vitna/anchor-draft-1b";
+      const window = Number(namedArgs.window || 4);
+      const turns = Number(namedArgs.turns || 5);
+      const isJson = switchArgs.has("json");
+      runDraftCli(prompt, { targetModel, draftModel, window, turns, isJson });
       break;
     }
 
