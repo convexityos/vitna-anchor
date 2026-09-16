@@ -27,12 +27,12 @@ bool vitna_generate_run(
     if (!config) return false;
 
     double t_start = vitna_time_ms();
-    vitna_trajectory_hasher_t hasher;
-    vitna_trajectory_init(&hasher);
+    vitna_sha256_ctx_t hasher;
+    vitna_sha256_init(&hasher);
 
     /* Feed prompt seed into trajectory hasher */
     if (prompt) {
-        vitna_trajectory_feed(&hasher, (uint32_t)strlen(prompt), 1.0f);
+        vitna_trajectory_feed(&hasher, (int32_t)strlen(prompt), 1.0f);
     }
 
     size_t limit = config->max_new_tokens > 0 ? config->max_new_tokens : SAMPLE_VOCAB_LEN;
@@ -149,9 +149,7 @@ bool vitna_generate_run(
                     8
                 );
                 if (num_predicted > 0 && config->expert_store) {
-                    for (size_t p = 0; p < num_predicted; p++) {
-                        vitna_expert_store_prefetch(config->expert_store, 4, predicted[p]);
-                    }
+                    vitna_expert_store_prefetch(config->expert_store, 4, predicted, num_predicted);
                 }
             }
 
@@ -174,7 +172,7 @@ bool vitna_generate_run(
         }
 
         /* Feed token and top logit to rolling SHA-256 trajectory hasher */
-        vitna_trajectory_feed(&hasher, token_id, 0.95f);
+        vitna_trajectory_feed(&hasher, (int32_t)token_id, 0.95f);
 
         bool is_final = (step + 1 == limit);
         if (config->on_token) {
@@ -197,7 +195,7 @@ bool vitna_generate_run(
         stats->speculative_accepted = draft_accepted;
         stats->speculative_speedup = config->drafter ? vitna_speculative_speedup_factor(config->drafter) : 1.4f;
         stats->grammar_tokens_masked = grammar_masked;
-        vitna_trajectory_finalize(&hasher, stats->trajectory_hash_hex);
+        vitna_sha256_final_hex(&hasher, stats->trajectory_hash_hex);
         stats->airgap_verified = true;
     }
 

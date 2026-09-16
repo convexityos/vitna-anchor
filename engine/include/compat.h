@@ -26,6 +26,7 @@
 #else
   #define VITNA_OS_POSIX 1
   #define _GNU_SOURCE
+  #include <stdlib.h>
   #include <sys/mman.h>
   #include <sys/stat.h>
   #include <fcntl.h>
