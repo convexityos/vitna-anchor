@@ -4,7 +4,14 @@
 // a single logit, so gate A2 is held to a line drawn in advance. Loosening one
 // is a visible change to this file, with its reason in the pull request.
 //
-//   Token ids              exactly equal, for every prompt and corpus string
+//   Token ids              exactly equal to the tokenizers library's, running
+//                          the model's own tokenizer.json, for every prompt
+//                          and corpus string. First written as "the
+//                          reference's ids". Comparing the engine with them
+//                          showed that transformers 5.17 drops this model's
+//                          Digits pre-tokenizer step, so on one corpus string
+//                          its ids are not the file's. The fixture keeps both,
+//                          and names that string in tokenizer_disagreements.
 //   Logits                 |engine - reference| <= LOGIT_ATOL, for the 16
 //                          largest and 64 probe logits at every position of
 //                          every prompt, and for all 49152 at the last one
@@ -65,16 +72,19 @@ function argmax(row) {
 }
 
 /**
- * Compare token ids. `idsFor(text)` returns the engine's ids for a string.
- * Returns the mismatches, each { text, expected, actual }.
+ * Compare token ids with the model's own tokenizer.json, as the tokenizers
+ * library runs it. (A prompt's ids are the same under both tokenizers; the
+ * recorder refuses a prompt where they are not.) `idsFor(text)` returns the
+ * engine's ids for a string. Returns the mismatches, each { text, expected, actual }.
  */
 export function compareTokenization(fixture, idsFor) {
   const mismatches = [];
   const cases = [...fixture.corpus, ...fixture.prompts];
   for (const c of cases) {
+    const expected = c.tokenizer_json_ids ?? c.ids;
     const actual = idsFor(c.text);
-    if (actual.length !== c.ids.length || actual.some((id, i) => id !== c.ids[i])) {
-      mismatches.push({ text: c.text, expected: c.ids, actual });
+    if (actual.length !== expected.length || actual.some((id, i) => id !== expected[i])) {
+      mismatches.push({ text: c.text, expected, actual });
     }
   }
   return mismatches;

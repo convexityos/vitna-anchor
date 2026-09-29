@@ -46,6 +46,13 @@ test("the fixture is the one its pin, its inputs and its recorder describe", () 
   assert.deepEqual(fixture.prompts.map((p) => p.text), inputs.prompts.map((p) => p.text));
   assert.deepEqual(fixture.corpus.map((c) => c.text), inputs.corpus);
 
+  // transformers 5.17 and the model's own tokenizer.json disagree only where
+  // the fixture says they do: one string of non-ASCII numerals, because
+  // transformers drops the file's Digits step.
+  const disagree = fixture.corpus.filter((c) => JSON.stringify(c.ids) !== JSON.stringify(c.tokenizer_json_ids)).map((c) => c.text);
+  assert.deepEqual(disagree, fixture.tokenizer_disagreements);
+  assert.deepEqual(disagree, ["٣٤٥ ⅫⅣ ½ ²"]);
+
   for (const p of fixture.prompts) {
     assert.equal(p.positions.length, p.ids.length, p.id);
     assert.equal(p.lastLogits.length, VOCAB, p.id);
@@ -105,7 +112,14 @@ test("the comparison accepts the reference's own logits and rejects a wrong answ
   }
 
   // Tokenization: exact.
-  assert.deepEqual(compareTokenization(fixture, (text) => [...fixture.corpus, ...fixture.prompts].find((c) => c.text === text).ids), []);
+  const fileIds = (text) => {
+    const c = [...fixture.corpus, ...fixture.prompts].find((x) => x.text === text);
+    return c.tokenizer_json_ids ?? c.ids;
+  };
+  assert.deepEqual(compareTokenization(fixture, fileIds), []);
+  // transformers' own ids fail where it departs from tokenizer.json.
+  const hfIds = (text) => [...fixture.corpus, ...fixture.prompts].find((x) => x.text === text).ids;
+  assert.deepEqual(compareTokenization(fixture, hfIds).map((m) => m.text), fixture.tokenizer_disagreements);
   assert.equal(compareTokenization(fixture, () => [0]).length > 0, true);
 });
 

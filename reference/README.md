@@ -22,6 +22,8 @@ node scripts/fetch-model.mjs --check   # check what is there, download nothing
 - All 49,152 logits at each prompt's last position.
 - 32 steps of greedy decoding from each prompt, one token at a time through the key-value cache, with the top 8 logits and the margin at each step. transformers' own `generate()` must choose the same tokens, or recording stops.
 
+Token ids are recorded twice. The first set comes from transformers. The second comes from the tokenizers library running the model's own `tokenizer.json`, which is the model's definition of its tokenizer. They are not always the same. transformers 5.17 builds this model's tokenizer from its `GPT2Tokenizer` class, whose pre-tokenizer is `ByteLevel` alone, and drops the `Digits` step the file puts before it. Digits in ASCII tokenize the same either way, because the vocabulary has no multi-digit tokens. Other numerals do not. For `"٣٤٥ ⅫⅣ ½ ²"`, transformers keeps the space before `½` with the numeral, and the file splits it off. That is the one corpus string where the two disagree, and the fixture names it in `tokenizer_disagreements`. The engine follows the file. The model runs on the prompts' ids, and the recorder refuses any prompt where the two tokenizers disagree.
+
 Settings: float32 weights and arithmetic (the bfloat16 weights widen exactly), eager attention, one thread, deterministic algorithms, ties broken towards the lower token id. The software is pinned in [`requirements.txt`](requirements.txt), and `record.py` refuses to record with any other version:
 
 | | Version |
@@ -48,7 +50,7 @@ Set here in A1, before the engine could produce a single logit, and written in [
 
 | What | Must hold |
 |---|---|
-| Token ids | Exactly equal, for every prompt and corpus string |
+| Token ids | Exactly equal to the model's own `tokenizer.json`, as the tokenizers library runs it, for every prompt and corpus string. This was first written as "the reference's ids". The first comparison with the engine found where transformers departs from the file, as described above |
 | Logits | Within 1e-2 absolute: the 16 largest and 64 probe logits at every position, and all 49,152 at each last position |
 | logsumexp of each row | Within 1e-2 |
 | Argmax at each position | The reference's, unless the reference's top two are within 2e-2 of each other, where either is accepted |

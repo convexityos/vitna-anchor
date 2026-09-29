@@ -8,8 +8,10 @@ float32, with eager attention, on one thread, and writes token ids and logits
 for the inputs in reference/smollm2-135m/prompts.json to
 reference/smollm2-135m/fixture.json:
 
-- the tokenizer's ids for every prompt and every corpus string, and the text
-  its decoder gives back;
+- token ids for every prompt and every corpus string twice: from
+  transformers, and from the tokenizers library running the model's own
+  tokenizer.json, which transformers 5.17 does not follow exactly (it drops
+  the file's Digits step for this model), and the text the decoder gives back;
 - for every position of every prompt: the top 16 logits with their token
   ids, the logits of 64 fixed probe ids, the maximum, the logsumexp, the mean
   and the standard deviation of the whole row, and the margin between the
@@ -161,6 +163,7 @@ def record(model_dir: Path, inputs: dict, allow_other: bool) -> dict:
 
     import numpy as np
     import torch
+    from tokenizers import Tokenizer
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     torch.set_num_threads(1)
@@ -172,6 +175,12 @@ def record(model_dir: Path, inputs: dict, allow_other: bool) -> dict:
     model.eval()
     vocab = model.config.vocab_size
 
+    # The model's own tokenizer.json, run by the tokenizers library. transformers
+    # 5.17 builds this model's tokenizer from its GPT2Tokenizer class instead,
+    # with a ByteLevel pre-tokenizer alone: it drops the Digits step the file
+    # specifies, so the two disagree on non-ASCII numerals. Both are recorded.
+    file_tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+
     # 64 fixed vocabulary ids spread over the whole vocabulary, so every row
     # is also compared well away from its top entries.
     probe_ids = sorted(int(i) for i in np.random.default_rng(20260929).choice(vocab, PROBES, replace=False))
@@ -179,12 +188,17 @@ def record(model_dir: Path, inputs: dict, allow_other: bool) -> dict:
     corpus = []
     for text in inputs["corpus"]:
         ids = tok(text)["input_ids"]
-        corpus.append({"text": text, "ids": ids, "decoded": tok.decode(ids)})
+        corpus.append(
+            {"text": text, "ids": ids, "tokenizer_json_ids": file_tok.encode(text).ids, "decoded": tok.decode(ids)}
+        )
 
     steps = inputs["greedy_steps"]
     prompts = []
     for p in inputs["prompts"]:
         ids = tok(p["text"])["input_ids"]
+        # The model runs on these ids, so both tokenizers must agree on them.
+        if file_tok.encode(p["text"]).ids != ids:
+            sys.exit(f"prompt {p['id']}: transformers and tokenizer.json give different ids; choose another prompt")
         logits = model(torch.tensor([ids])).logits[0].numpy()
         positions = [row_summary(logits[t], probe_ids) for t in range(len(ids))]
         last = logits[-1].astype("<f4")
@@ -258,6 +272,8 @@ def record(model_dir: Path, inputs: dict, allow_other: bool) -> dict:
             "tie_break": "lowest token id",
         },
         "probe_ids": probe_ids,
+        # Where transformers' ids differ from the model's own tokenizer.json.
+        "tokenizer_disagreements": [c["text"] for c in corpus if c["ids"] != c["tokenizer_json_ids"]],
         "corpus": corpus,
         "prompts": prompts,
     }
@@ -269,8 +285,8 @@ def compare(old: dict, new: dict) -> int:
 
     failures = 0
     for a, b in zip(old["corpus"], new["corpus"]):
-        if a["ids"] != b["ids"]:
-            print(f"corpus {a['text']!r}: ids {a['ids']} became {b['ids']}")
+        if a["ids"] != b["ids"] or a["tokenizer_json_ids"] != b["tokenizer_json_ids"]:
+            print(f"corpus {a['text']!r}: ids changed")
             failures += 1
     worst = {"top": 0.0, "probe": 0.0, "lse": 0.0, "last": 0.0, "greedy": 0.0}
     for a, b in zip(old["prompts"], new["prompts"]):
