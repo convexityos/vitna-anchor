@@ -1,0 +1,74 @@
+{
+  "about": "Inputs for reference/record.py. The prompts are run through the model: logits at every position, then greedy decoding. The corpus is only tokenized. Change either and the fixture must be recorded again.",
+  "greedy_steps": 32,
+  "prompts": [
+    {
+      "id": "capital",
+      "text": "The capital of France is"
+    },
+    {
+      "id": "code",
+      "text": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return n\n"
+    },
+    {
+      "id": "numbers",
+      "text": "In 2024, the population grew by 3.7% to 1,234,567 people, according to"
+    },
+    {
+      "id": "science",
+      "text": "Photosynthesis is the process by which plants"
+    },
+    {
+      "id": "unicode",
+      "text": "\u00dcn\u00efc\u00f6d\u00e9 fa\u00e7ade: \u6771\u4eac\u30bf\u30ef\u30fc \ud83d\ude80 na\u00efve caf\u00e9, and then"
+    },
+    {
+      "id": "long",
+      "text": "The lighthouse keeper had kept the same routine for thirty-one years. Every evening at dusk he climbed the one hundred and twelve steps of the spiral staircase, trimmed the wick, polished the great lens until it shone, and lit the lamp. Then he sat by the window with a mug of strong tea and a notebook, and wrote down the ships he saw pass: their names when he could read them, their flags, the direction of the wind, and the state of the sea. Nobody had asked him to keep this log. He kept it because, as he told the few visitors who made the long walk out along the causeway, a light that nobody watches is only half a light. On the night the storm came,"
+    }
+  ],
+  "corpus": [
+    "",
+    " ",
+    "   ",
+    "\t",
+    "\n",
+    "\n\n\n",
+    "\r\n",
+    " \n \n",
+    "hello",
+    " hello",
+    "hello ",
+    "  hello  world  ",
+    "Hello, World!",
+    "HelloWorld123abc",
+    "don't I'm we'll they've she'd it's you're",
+    "DON'T IT'S",
+    "12345",
+    "3.14159",
+    "1,000,000",
+    "\u0663\u0664\u0665 \u216b\u2163 \u00bd \u00b2",
+    "!!!???...---",
+    "x = [i**2 for i in range(10)]",
+    "https://example.com/path?query=1&b=2#frag",
+    "if (a != b) { return a->c; }",
+    "\ud83d\ude80\ud83d\udd25",
+    "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+    "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f",
+    "\u6771\u4eac\u30bf\u30ef\u30fc",
+    "\u4e2d\u6587\u5206\u8bcd\u6d4b\u8bd5",
+    "\uc548\ub155\ud558\uc138\uc694",
+    "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645",
+    "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd",
+    "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e",
+    "\u00e9 versus e\u0301",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "<|endoftext|>",
+    "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
+    "a<|endoftext|>b",
+    "<|im_start|",
+    "control\u0004char\u0006s\u001d here",
+    "tab\there\tand\ttrailing\t",
+    "    def indented(self):\n        pass\n"
+  ]
+}

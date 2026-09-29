@@ -1,0 +1,48 @@
+name: Reference
+
+# Records the A1 reference again on GitHub's x86-64 runners and compares it
+# with the fixture, which was recorded on an ARM64 machine. Token ids must be
+# identical, and no logit may move by more than the tolerance gate A2 is held
+# to. The job prints the largest difference, which says how much torch itself
+# varies between CPUs.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "reference/**"
+      - "scripts/fetch-model.mjs"
+      - ".github/workflows/reference.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Re-record the reference (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Cache the pinned model files
+        uses: actions/cache@v6
+        with:
+          path: models/smollm2-135m
+          key: model-${{ hashFiles('reference/smollm2-135m/model.json') }}
+      - name: Fetch the model at the pinned revision, checking every file's SHA-256
+        run: node scripts/fetch-model.mjs
+      - name: Install the pinned reference software
+        run: python -m pip install -r reference/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Record again and compare with the fixture
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python reference/record.py --check

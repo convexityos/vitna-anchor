@@ -31,3 +31,11 @@ Thumbs.db
 # Test & coverage
 coverage/
 .nyc_output/
+
+# Model weights and other downloads: fetched by scripts/fetch-model.mjs, never committed
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
