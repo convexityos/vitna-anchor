@@ -4,6 +4,10 @@
 // pin and inputs describe, and the comparison catches a wrong answer. The last
 // three are gate A2: they run the engine against the fixture, and need the
 // model files (node scripts/fetch-model.mjs) and a built engine.
+//
+// VITNA_DEVICE=cuda runs the model on the GPU (--device cuda), for an engine
+// built with the CUDA path: that is gate A4, the same comparison with the same
+// fixture and the same tolerance. Unset, or cpu, the engine uses the CPU.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -133,6 +137,9 @@ const engine = [
   here(`../engine/build/vitna-anchor${EXE}`),
 ].filter(Boolean).find((p) => existsSync(p));
 const modelDir = process.env.ANCHOR_MODEL_DIR || here("../models/smollm2-135m/");
+const DEVICE = process.env.VITNA_DEVICE ?? "";
+assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
+const onDevice = DEVICE ? ["--device", DEVICE] : [];
 
 // Gate A2. Without a built engine or the model files these are skipped, with
 // the reason, unless VITNA_REQUIRE_REFERENCE=1 (as in CI), where they fail.
@@ -175,7 +182,7 @@ test("the engine's logits match the reference within the stated tolerance", A2, 
   try {
     for (const p of fixture.prompts) {
       const out = join(dir, `${p.id}.f32`);
-      runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", out]);
+      runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", out, ...onDevice]);
       const result = comparePrefill(fixture, p, readF32(out));
       assert.deepEqual(result.failures.slice(0, 10), [], p.id);
       worst = Math.max(worst, result.worst.logit);
@@ -184,7 +191,7 @@ test("the engine's logits match the reference within the stated tolerance", A2, 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  t.diagnostic(`largest |engine - reference|: logits ${worst.toExponential(2)}, logsumexp ${worstLse.toExponential(2)}; tolerance ${LOGIT_ATOL}`);
+  t.diagnostic(`on ${DEVICE || "cpu"}, largest |engine - reference|: logits ${worst.toExponential(2)}, logsumexp ${worstLse.toExponential(2)}; tolerance ${LOGIT_ATOL}`);
 });
 
 test("the engine's greedy decoding matches the reference token for token", A2, (t) => {
@@ -196,7 +203,7 @@ test("the engine's greedy decoding matches the reference token for token", A2, (
       const out = join(dir, `${p.id}.f32`);
       const stdout = runEngine([
         "generate", "--model", modelDir, "--ids", p.ids.join(","),
-        "--max-new", String(p.greedy_ids.length), "--greedy", "--logits-out", out,
+        "--max-new", String(p.greedy_ids.length), "--greedy", "--logits-out", out, ...onDevice,
       ]);
       const { ids } = JSON.parse(stdout);
       const result = compareGreedy(fixture, p, ids, readF32(out));
@@ -207,5 +214,5 @@ test("the engine's greedy decoding matches the reference token for token", A2, (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  t.diagnostic(`${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${worst.toExponential(2)}`);
+  t.diagnostic(`on ${DEVICE || "cpu"}, ${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${worst.toExponential(2)}`);
 });

@@ -3,7 +3,8 @@
 //
 // Needs a built engine and the model files (node scripts/fetch-model.mjs).
 // Without them these tests are skipped, with the reason, unless
-// VITNA_REQUIRE_REFERENCE=1 (as in CI), where they fail.
+// VITNA_REQUIRE_REFERENCE=1 (as in CI), where they fail. VITNA_DEVICE=cuda
+// serves from the GPU, for an engine built with the CUDA path.
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
@@ -32,6 +33,9 @@ const missing = !engine
     : null;
 const A3 = { skip: process.env.VITNA_REQUIRE_REFERENCE === "1" ? false : missing ?? false };
 const MODEL = "smollm2-135m";
+const DEVICE = process.env.VITNA_DEVICE ?? "";
+assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
+const onDevice = DEVICE ? ["--device", DEVICE] : [];
 
 let child = null;
 let base = null;
@@ -39,7 +43,7 @@ let base = null;
 before(async () => {
   if (A3.skip) return;
   assert.ok(!missing, missing ?? "");
-  child = spawn(engine, ["serve", "--model", modelDir, "--model-id", MODEL, "--port", "0", "--ctx", "1024"], {
+  child = spawn(engine, ["serve", "--model", modelDir, "--model-id", MODEL, "--port", "0", "--ctx", "1024", ...onDevice], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   base = await new Promise((resolve, reject) => {
