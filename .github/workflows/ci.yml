@@ -99,3 +99,39 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/reuse-and-json.test.mjs
+
+  cuda:
+    # GitHub's hosted runners have no GPU. This job compiles the CUDA path, so
+    # it cannot rot unnoticed, and checks that an engine asked for a device it
+    # cannot use says why and stops. It never runs the model on a GPU: gate A4
+    # was checked by hand on one, and the README says how.
+    name: CUDA path compiles (Linux, no GPU)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.1.1-devel-ubuntu24.04
+    env:
+      VITNA_REQUIRE_ENGINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+      - name: Install make, a host compiler and CMake
+        run: apt-get update && apt-get install -y --no-install-recommends make gcc g++ cmake
+      - name: An engine built without CUDA refuses --device cuda
+        run: |
+          make -C engine all
+          node --test --test-reporter=spec tests/device.test.mjs
+      - name: Build the engine and its unit tests with the CUDA path, with Make, for sm_86
+        run: |
+          make -C engine clean
+          make -C engine VITNA_CUDA=1 CUDA_ARCH=sm_86 all vitna-anchor-tests
+      - name: Run the unit tests
+        run: ./engine/vitna-anchor-tests
+      - name: With no GPU, the engine built with CUDA refuses --device cuda before loading anything
+        env:
+          VITNA_EXPECT_NO_GPU: "1"
+        run: node --test --test-reporter=spec tests/device.test.mjs
+      - name: Build with the CUDA path, with CMake, for every major GPU architecture
+        run: |
+          cmake -B engine/build -S engine -DVITNA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=all-major -DCMAKE_BUILD_TYPE=Release
+          cmake --build engine/build --parallel
