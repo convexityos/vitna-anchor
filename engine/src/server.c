@@ -1,14 +1,18 @@
 /**
- * server.c - Local HTTP server for vitna-engine.
+ * server.c - The engine's HTTP server: the network half of api.c.
  *
- * This server serves no model yet, and says so. Generation endpoints answer
- * 501 with an OpenAI-style error, the model list is empty, and nothing is
- * reported that was not measured. The engine runs a model from its command
- * line (gate A2); serving it here is gate A3 in the README.
+ * Reads one HTTP/1.1 request at a time (headers, then a body of
+ * Content-Length bytes), hands it to the API, and closes the connection after
+ * the response. A client that stalls is cut off after 30 seconds without a
+ * byte, and one that hangs up mid-stream ends that generation without taking
+ * the server down. Each request is logged to stderr as method, path, status
+ * and token counts; prompts and completions are never logged.
  */
 
 #include "server.h"
+#include "api.h"
 #include "compat.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,67 +23,200 @@
   typedef SOCKET socket_t;
   #define IS_INVALID_SOCKET(s) ((s) == INVALID_SOCKET)
   #define CLOSE_SOCKET(s) closesocket(s)
+  #define SHUTDOWN_SEND SD_SEND
 #else
   #include <sys/socket.h>
+  #include <sys/time.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
+  #include <signal.h>
   typedef int socket_t;
   #define IS_INVALID_SOCKET(s) ((s) < 0)
   #define CLOSE_SOCKET(s) close(s)
+  #define SHUTDOWN_SEND SHUT_WR
 #endif
 
-#define VITNA_NO_MODEL_MESSAGE \
-    "This server does not serve a model yet: that is gate A3 in the README. " \
-    "The engine runs one from its command line: vitna-anchor run --model <dir> --prompt <text>."
+#if defined(MSG_NOSIGNAL)
+  #define SEND_FLAGS MSG_NOSIGNAL
+#else
+  #define SEND_FLAGS 0
+#endif
 
-static void send_http_response(socket_t sock, int status_code, const char* status_text, const char* content_type, const char* body) {
-    char header[512];
-    size_t body_len = body ? strlen(body) : 0;
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        status_code, status_text, content_type, body_len
-    );
-    send(sock, header, (int)strlen(header), 0);
-    if (body_len > 0) {
-        send(sock, body, (int)body_len, 0);
+#define MAX_HEADER_BYTES (64 * 1024)
+#define MAX_BODY_BYTES (8 * 1024 * 1024)
+#define IO_TIMEOUT_MS 30000
+
+static bool sock_write(void* ctx, const void* data, size_t len) {
+    socket_t s = *(socket_t*)ctx;
+    const char* p = (const char*)data;
+    while (len > 0) {
+        int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+        int n = send(s, p, chunk, SEND_FLAGS);
+        if (n <= 0) return false;
+        p += n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
+static void send_simple(socket_t s, int status, const char* reason, const char* message) {
+    char body[512], head[256];
+    int bl = snprintf(body, sizeof(body), "{\"error\":{\"message\":\"%s\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}", message);
+    int hl = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", status, reason, bl);
+    sock_write(&s, head, (size_t)hl);
+    sock_write(&s, body, (size_t)bl);
+}
+
+static void set_timeouts(socket_t s) {
+#if defined(VITNA_OS_WINDOWS)
+    DWORD ms = IO_TIMEOUT_MS;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof(ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = IO_TIMEOUT_MS / 1000;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  #if defined(SO_NOSIGPIPE)
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  #endif
+#endif
+}
+
+typedef struct {
+    char method[16];
+    char path[1024];
+    char* buf;
+    size_t body_off;
+    size_t body_len;
+} request_t;
+
+static bool header_is(const char* name, size_t n, const char* want) {
+    size_t w = strlen(want);
+    if (n != w) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != want[i]) return false;
+    }
+    return true;
+}
+
+/* Returns 0 with the request read, an HTTP status to answer with, or -1 when
+ * the client went away before sending anything. */
+static int read_request(socket_t s, request_t* req) {
+    memset(req, 0, sizeof(*req));
+    size_t cap = 8192, len = 0, head_end = 0, scan_from = 0;
+    char* buf = (char*)malloc(cap + 1);
+    if (!buf) return 500;
+    req->buf = buf;
+    for (;;) {
+        /* The blank line that ends the headers can be anywhere in what has
+         * arrived, with body bytes after it in the same read. */
+        for (size_t i = scan_from; head_end == 0 && i + 4 <= len; i++) {
+            if (memcmp(buf + i, "\r\n\r\n", 4) == 0) head_end = i + 4;
+        }
+        if (head_end) break;
+        scan_from = len >= 3 ? len - 3 : 0;
+        if (len >= MAX_HEADER_BYTES) return 431;
+        if (len == cap) {
+            char* grown = (char*)realloc(buf, cap * 2 + 1);
+            if (!grown) return 500;
+            req->buf = buf = grown;
+            cap *= 2;
+        }
+        int n = recv(s, buf + len, (int)(cap - len), 0);
+        if (n <= 0) return len == 0 ? -1 : 408;
+        len += (size_t)n;
+    }
+    buf[len] = '\0';
+    if (sscanf(buf, "%15s %1023s", req->method, req->path) != 2) return 400;
+
+    bool expect_continue = false;
+    long long content_length = 0;
+    const char* line = strstr(buf, "\r\n") + 2;
+    while (line < buf + head_end - 2) {
+        const char* eol = strstr(line, "\r\n");
+        if (!eol || eol > buf + head_end) return 400; /* a NUL inside the headers */
+        const char* colon = memchr(line, ':', (size_t)(eol - line));
+        if (colon) {
+            const char* v = colon + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t name_len = (size_t)(colon - line);
+            if (header_is(line, name_len, "content-length")) {
+                char* end;
+                content_length = strtoll(v, &end, 10);
+                if (end == v || content_length < 0) return 400;
+            } else if (header_is(line, name_len, "transfer-encoding")) {
+                return 411; /* a chunked body; this server needs Content-Length */
+            } else if (header_is(line, name_len, "expect")) {
+                expect_continue = (size_t)(eol - v) >= 12 && (v[0] == '1');
+            }
+        }
+        line = eol + 2;
+    }
+    if (content_length > MAX_BODY_BYTES) return 413;
+
+    size_t need = head_end + (size_t)content_length;
+    if (need > len && expect_continue) {
+        const char* go = "HTTP/1.1 100 Continue\r\n\r\n";
+        sock_write(&s, go, strlen(go));
+    }
+    if (need + 1 > cap) {
+        char* grown = (char*)realloc(buf, need + 1);
+        if (!grown) return 500;
+        req->buf = buf = grown;
+        cap = need;
+    }
+    while (len < need) {
+        int n = recv(s, buf + len, (int)(need - len), 0);
+        if (n <= 0) return 408;
+        len += (size_t)n;
+    }
+    buf[need] = '\0';
+    req->body_off = head_end;
+    req->body_len = (size_t)content_length;
+    return 0;
+}
+
+static const char* status_reason(int status) {
+    switch (status) {
+        case 400: return "Bad Request";
+        case 408: return "Request Timeout";
+        case 411: return "Length Required";
+        case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
+        default: return "Internal Server Error";
     }
 }
 
-static void handle_client(socket_t client_sock) {
-    char buffer[4096];
-    int bytes_received = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received <= 0) {
-        CLOSE_SOCKET(client_sock);
-        return;
+static void handle_client(socket_t client, vitna_api_t* api) {
+    set_timeouts(client);
+    request_t req;
+    int rc = read_request(client, &req);
+    if (rc > 0) {
+        send_simple(client, rc, status_reason(rc),
+                    rc == 411 ? "Send the body with a Content-Length header" : "The request could not be read");
+        fprintf(stderr, "? ? %d\n", rc);
+    } else if (rc == 0) {
+        vitna_sink_t sink = { sock_write, &client, false };
+        vitna_api_result_t r = vitna_api_handle(api, req.method, req.path, req.buf + req.body_off, req.body_len, &sink);
+        char route[128];
+        size_t n = strcspn(req.path, "?");
+        snprintf(route, sizeof(route), "%.*s", (int)(n < 120 ? n : 120), req.path);
+        if (r.prompt_tokens || r.completion_tokens) {
+            fprintf(stderr, "%s %s %d prompt_tokens=%zu completion_tokens=%zu%s\n", req.method, route, r.status,
+                    r.prompt_tokens, r.completion_tokens, sink.failed ? " (the client went away)" : "");
+        } else {
+            fprintf(stderr, "%s %s %d\n", req.method, route, r.status);
+        }
     }
-    buffer[bytes_received] = '\0';
-
-    char method[16] = {0};
-    char path[256] = {0};
-    sscanf(buffer, "%15s %255s", method, path);
-
-    if (strcmp(method, "GET") == 0 && (strcmp(path, "/health") == 0 || strcmp(path, "/v1/health") == 0)) {
-        send_http_response(client_sock, 200, "OK", "application/json",
-            "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":null,\"generation\":false,"
-            "\"message\":\"" VITNA_NO_MODEL_MESSAGE "\"}");
-    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-        send_http_response(client_sock, 200, "OK", "application/json", "{\"object\":\"list\",\"data\":[]}");
-    } else if (strcmp(method, "POST") == 0 &&
-               (strcmp(path, "/v1/chat/completions") == 0 ||
-                strcmp(path, "/v1/completions") == 0 ||
-                strcmp(path, "/v1/embeddings") == 0)) {
-        send_http_response(client_sock, 501, "Not Implemented", "application/json",
-            "{\"error\":{\"message\":\"" VITNA_NO_MODEL_MESSAGE "\",\"type\":\"not_implemented\",\"code\":\"no_model\"}}");
-    } else {
-        send_http_response(client_sock, 404, "Not Found", "application/json",
-            "{\"error\":{\"message\":\"Not found\",\"type\":\"invalid_request_error\",\"code\":\"not_found\"}}");
-    }
-
-    CLOSE_SOCKET(client_sock);
+    fflush(stderr);
+    free(req.buf);
+    shutdown(client, SHUTDOWN_SEND);
+    CLOSE_SOCKET(client);
 }
 
 int vitna_server_run(const vitna_server_config_t* config) {
@@ -89,11 +226,15 @@ int vitna_server_run(const vitna_server_config_t* config) {
         fprintf(stderr, "WSAStartup failed\n");
         return -1;
     }
+#else
+    /* A client that hangs up mid-stream must end one response, not the process. */
+    signal(SIGPIPE, SIG_IGN);
 #endif
 
     /* Port 0 asks the OS for any free port; main.c defaults to 8765. */
     uint16_t port = config ? config->port : 8765;
     const char* bind_ip = config && config->bind_addr ? config->bind_addr : "127.0.0.1";
+    vitna_api_t* api = config ? (vitna_api_t*)config->engine_ctx : NULL;
 
     socket_t server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (IS_INVALID_SOCKET(server_sock)) {
@@ -149,22 +290,30 @@ int vitna_server_run(const vitna_server_config_t* config) {
     }
 
     printf("vitna-anchor listening on http://%s:%u\n", bind_ip, port);
-    printf("%s\n", VITNA_NO_MODEL_MESSAGE);
-    printf("Generation endpoints answer 501.\n");
+    if (api) {
+        printf("Serving %s at /v1/chat/completions and /v1/completions, one request at a time.\n", vitna_api_model_id(api));
+    } else {
+        printf("%s\n", vitna_api_no_model_message());
+        printf("Generation endpoints answer 501.\n");
+    }
+    if (strcmp(bind_ip, "127.0.0.1") != 0) {
+        printf("Warning: %s is not the loopback address. This server has no authentication.\n", bind_ip);
+    }
     fflush(stdout);
 
     while (1) {
         struct sockaddr_in client_addr;
-        int client_len = sizeof(client_addr);
 #if defined(VITNA_OS_WINDOWS)
+        int client_len = sizeof(client_addr);
         socket_t client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
 #else
-        socket_t client_sock = accept(server_sock, (struct sockaddr*)&client_addr, (socklen_t*)&client_len);
+        socklen_t client_len = sizeof(client_addr);
+        socket_t client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
 #endif
         if (IS_INVALID_SOCKET(client_sock)) {
             break;
         }
-        handle_client(client_sock);
+        handle_client(client_sock, api);
     }
 
     CLOSE_SOCKET(server_sock);
