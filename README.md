@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -19,7 +19,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | A1, a reference | One small dense open model is pinned by revision and file hash, token ids and logits for fixed prompts are recorded from a pinned reference implementation, and a test compares against them | Passed, [#4](https://github.com/convexityos/vitna-anchor/pull/4). See [`reference/`](reference/README.md) |
 | A2, a forward pass on a CPU | Tokenizer, embeddings, RMSNorm, attention over a real key-value cache, MLP and sampling in C. Logits match A1 within a stated tolerance, and greedy output matches token for token | Passed, [#5](https://github.com/convexityos/vitna-anchor/pull/5). CI checks it on every push |
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Passed, [#7](https://github.com/convexityos/vitna-anchor/pull/7). CI checks it on every push |
-| A4, one GPU | The A2 comparison passes on CUDA | Not started |
+| A4, one GPU | The A2 comparison passes on CUDA | This change: passed on one GPU, an NVIDIA GeForce RTX 3070, checked by hand with the command [below](#how-gate-a4-was-checked). CI compiles the CUDA path and does not run it: GitHub's runners have no GPU |
 | A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Not started |
 | A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Passed, [#9](https://github.com/convexityos/vitna-anchor/pull/9), for reuse of the previous request's cache and for JSON object mode. CI checks it on every push. Constraining output to a JSON Schema is not built |
 
@@ -30,6 +30,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | Component | Where | State |
 |---|---|---|
 | Llama forward pass in float32: embeddings, RMSNorm, grouped-query attention over a key-value cache, half-split rotary embeddings, SwiGLU MLP, tied output layer | `engine/src/model.c`, `engine/src/ops.c` | Matches the reference: every compared logit within the stated tolerance of 1e-2, and 192 of 192 greedy tokens equal. The largest difference on the machine that recorded the reference was 2.2e-4 |
+| The same forward pass on an NVIDIA GPU, in float32: a kernel for each of its steps, the weights uploaded once, the key-value cache on the device, logits copied back only when a step asks for them | `engine/src/model_cuda.cu` | Matches the reference on one GPU, checked by hand: every compared logit within 1e-2, the largest difference 2.3e-4, and 192 of 192 greedy tokens equal. CI compiles it and does not run it |
 | Byte-level BPE tokenizer read from `tokenizer.json` | `engine/src/tokenizer.c`, `engine/src/unicode.c` | Matches the model's own `tokenizer.json` on all 48 reference strings, and tested on a vocabulary worked by hand. Refuses tokenizer features it does not implement |
 | Greedy decoding and seeded temperature, top-k and top-p sampling | `engine/src/sampler.c` | Greedy matches the reference. Sampling is tested for its proportions and its seed |
 | Float32 matrix-vector product over F32, BF16 or F16 weights, with scalar, AVX2 and NEON paths | `engine/src/ops.c` | Tested against double precision |
@@ -54,7 +55,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 
 ## Build the engine and run the model
 
-The engine is C11 with no dependencies beyond the C library.
+The engine is C11 with no dependencies beyond the C library. Its CUDA path, built only when asked for, also needs the CUDA toolkit.
 
 Linux and macOS:
 
@@ -78,6 +79,20 @@ Windows, with any clang, gcc or `zig cc`. Set `VITNA_CC` to the compiler's path 
 .\engine\build.ps1 -Tests
 ```
 
+With the CUDA path, which runs the model on an NVIDIA GPU when given `--device cuda`. It needs the CUDA toolkit's `nvcc` (A4 was checked with 13.1) and, on Windows, Visual Studio's C++ build tools as nvcc's host compiler. Unless an architecture is named, it builds for the GPU in the machine:
+
+```bash
+cd engine
+make VITNA_CUDA=1              # CUDA_ARCH=sm_86 names an architecture
+```
+
+```powershell
+cmake -B engine/build -S engine -DVITNA_CUDA=ON     # -DCMAKE_CUDA_ARCHITECTURES=86 names one
+cmake --build engine/build --config Release
+```
+
+The CUDA runtime is linked in statically, so an engine built with the CUDA path loads no CUDA library to start, and on the CPU, its default, it makes no CUDA call at all. Asked for `--device cuda`, an engine built without the CUDA path says so and stops, and so does one that finds no usable GPU: the model never runs on the CPU in the GPU's place. `engine/build.ps1` builds the CPU engine only.
+
 Fetch the model, 269 MB, at its pinned revision, with every file checked against its SHA-256. Then run it:
 
 ```bash
@@ -95,7 +110,7 @@ node scripts/fetch-model.mjs
 | `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501 |
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
 
-Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json` and a single `model.safetensors`. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, or a sharded checkpoint.
+`run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json` and a single `model.safetensors`. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, or a sharded checkpoint.
 
 ## Serve the model
 
@@ -141,6 +156,30 @@ npm test
 ```
 
 `tests/engine-server.test.mjs`, `tests/reference.test.mjs`, `tests/serving.test.mjs` and `tests/reuse-and-json.test.mjs` run the built engine when they find one, and the last three also need the model files. Without them those tests are skipped, and say why. CI builds the engine and runs the unit tests on Linux, macOS and Windows, fetches the model, and requires all four engine tests to pass.
+
+With `VITNA_DEVICE=cuda`, the last three run the model on the GPU, in an engine built with the CUDA path; nothing else about them changes, the fixture and the tolerance included. `tests/device.test.mjs` checks that an engine refuses a device it cannot use. CI's CUDA job runs it against an engine built without the CUDA path and one built with it, on a runner with no GPU.
+
+## How gate A4 was checked
+
+By hand, on one machine, on 2026-09-29. CI does not run it again: GitHub's hosted runners have no GPU. What CI does is compile the CUDA path, with Make and with CMake, in NVIDIA's CUDA 13.1.1 development container, and check the refusals above.
+
+- GPU: NVIDIA GeForce RTX 3070, 8 GB, compute capability 8.6, driver 591.86
+- CUDA 13.1.1 (nvcc 13.1.115), with MSVC 19.44 from Visual Studio 2022 Build Tools 17.14 as its host compiler
+- Windows 11 (10.0.26200), AMD Ryzen 7 3700X, Node.js 24.19.0
+
+The commands, from a clone:
+
+```powershell
+cmake -B engine/build -S engine -DVITNA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build engine/build --config Release
+node scripts/fetch-model.mjs
+$env:VITNA_REQUIRE_REFERENCE = "1"; $env:VITNA_DEVICE = "cuda"
+node --test --test-reporter=spec tests/reference.test.mjs
+```
+
+All five tests passed. Every compared logit was within the tolerance of 1e-2, which A1 fixed before the engine existed and A4 left alone: the largest difference was 2.30e-4, and 1.48e-4 for logsumexp. 192 of 192 greedy tokens were equal, and the top logits at each step differed by at most 5.53e-5. On the same machine the CPU path's largest difference is 3.01e-4, with 192 of 192 greedy tokens equal. `tests/serving.test.mjs` and `tests/reuse-and-json.test.mjs` passed with `VITNA_DEVICE=cuda` as well, so serving and prefix reuse work over the cache on the device.
+
+On the GPU the arithmetic is float32 on CUDA cores. No tensor cores are used, so TF32 does not apply, and the build does not pass `--use_fast_math`, so division, square root and `expf` keep their accurate forms. nvcc's default fused multiply-add is on; the CPU path's AVX2 matrix-vector product uses FMA too.
 
 ## Measurements
 
