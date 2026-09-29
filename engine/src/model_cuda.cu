@@ -20,8 +20,14 @@
  * division, square root and expf keep their accurate forms. nvcc's default
  * fused multiply-add stays on; the CPU path's AVX2 matvec uses FMA too.
  *
- * Kernels run in order on the default stream. A step that returns no logits
- * does not wait for the device; one that does waits for the copy back.
+ * A token is a replay of CUDA graphs, not a launch of every kernel. After the
+ * upload, the kernels for the embedding and every layer are captured into one
+ * graph, and the final RMSNorm and output projection into a second. The token
+ * and its position reach the kernels through a small struct on the device,
+ * which one kernel writes before each replay, so the same graphs serve every
+ * position. Everything runs in order on the model's stream. A step that
+ * returns no logits does not wait for the device; one that does waits for the
+ * copy back.
  */
 
 #define NOMINMAX
@@ -36,7 +42,7 @@
 
 #include "model_cuda.h"
 
-/* Threads per block for every kernel: eight warps. */
+/* Threads per block for every kernel but set_step_kernel: eight warps. */
 #define THREADS 256
 #define WARPS (THREADS / 32)
 
@@ -55,6 +61,12 @@ typedef struct {
     const float* mlp_norm;
 } dlayer_t;
 
+/* The token being run and its position, as the graphs read them. */
+typedef struct {
+    int token;
+    int pos;
+} step_t;
+
 struct vitna_cuda_model {
     int device;
     char name[320];
@@ -71,6 +83,12 @@ struct vitna_cuda_model {
     float* k_cache;         /* [n_layers][ctx][n_kv_heads * head_dim] */
     float* v_cache;
     float *x, *xn, *q, *att, *gate, *up, *logits, *scores;
+    step_t* step;
+
+    cudaStream_t stream;
+    cudaGraphExec_t body;   /* the embedding and every layer */
+    cudaGraphExec_t head;   /* the final RMSNorm and the output projection */
+    float* host_logits;     /* pinned, for the copy back */
 };
 
 static bool fail(char* err, size_t err_len, const char* fmt, ...) {
@@ -142,10 +160,17 @@ __device__ float block_max(float v, float* red) {
     return warp_max(lane < WARPS ? red[lane] : NEG_INF);
 }
 
+/* The one kernel a step launches outside the graphs: it says which token to
+ * run and where. Its arguments are copied at launch, so the host can move on. */
+__global__ void set_step_kernel(step_t* step, int token, int pos) {
+    step->token = token;
+    step->pos = pos;
+}
+
 template <vitna_dtype_t DT>
-__global__ void embed_kernel(const void* __restrict__ table, int token, int hidden, float* __restrict__ x) {
+__global__ void embed_kernel(const void* __restrict__ table, const step_t* __restrict__ step, int hidden, float* __restrict__ x) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden) x[i] = widen<DT>(table, (size_t)token * hidden + i);
+    if (i < hidden) x[i] = widen<DT>(table, (size_t)step->token * hidden + i);
 }
 
 /* y = x / sqrt(mean(x^2) + eps) * w, as kernels.c's vitna_rmsnorm. One block. */
@@ -159,12 +184,15 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restr
 }
 
 /* y = W x, one warp per row of W. With add, the product is added to y
- * instead of replacing it: the residual add after a projection. */
+ * instead of replacing it: the residual add after a projection. With
+ * per_pos, y is the position's slot, y + pos * per_pos: a row of the cache. */
 template <vitna_dtype_t DT>
-__global__ void matvec_kernel(const void* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int add) {
+__global__ void matvec_kernel(const void* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
+                              int rows, int cols, int add, const step_t* __restrict__ step, int per_pos) {
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= rows) return; /* the whole warp leaves together */
+    if (per_pos) y += (size_t)step->pos * per_pos;
     const size_t base = (size_t)row * cols;
     float s = 0.0f;
     for (int c = lane; c < cols; c += 32) s = fmaf(widen<DT>(w, base + c), x[c], s);
@@ -173,13 +201,18 @@ __global__ void matvec_kernel(const void* __restrict__ w, const float* __restric
 }
 
 /* The half-split rotary embedding of ops.c's vitna_rope_half, element j
- * paired with j + head_dim / 2, on every query head and on this position's
- * key heads in the cache. cos_t and sin_t are the position's row. */
-__global__ void rope_kernel(float* __restrict__ q, float* __restrict__ k, const float* __restrict__ cos_t,
-                            const float* __restrict__ sin_t, int n_heads, int n_kv_heads, int head_dim) {
+ * paired with j + head_dim / 2, on every query head and on the position's
+ * key heads in the cache kc. */
+__global__ void rope_kernel(float* __restrict__ q, float* __restrict__ kc, const float* __restrict__ cos_all,
+                            const float* __restrict__ sin_all, const step_t* __restrict__ step,
+                            int n_heads, int n_kv_heads, int head_dim) {
     const int half = head_dim / 2;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (n_heads + n_kv_heads) * half) return;
+    const size_t pos = (size_t)step->pos;
+    const float* cos_t = cos_all + pos * half;
+    const float* sin_t = sin_all + pos * half;
+    float* k = kc + pos * n_kv_heads * head_dim;
     const int h = i / half, j = i % half;
     float* v = h < n_heads ? q + (size_t)h * head_dim : k + (size_t)(h - n_heads) * head_dim;
     const float a = v[j];
@@ -189,14 +222,15 @@ __global__ void rope_kernel(float* __restrict__ q, float* __restrict__ k, const 
 }
 
 /* Attention for one query head per block, as model.c's loop over heads:
- * scores against the cached keys of positions 0 to n - 1, a softmax, and
- * the weighted sum of the cached values. Query head h reads key-value head
+ * scores against the cached keys of positions 0 to pos, a softmax, and the
+ * weighted sum of the cached values. Query head h reads key-value head
  * h / group (repeat_kv). scores has room for ctx floats per head. */
 __global__ void attention_kernel(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
-                                 float* __restrict__ att, float* __restrict__ scores,
-                                 int n, int head_dim, int kv_dim, int group, int ctx, float scale) {
+                                 float* __restrict__ att, float* __restrict__ scores, const step_t* __restrict__ step,
+                                 int head_dim, int kv_dim, int group, int ctx, float scale) {
     __shared__ float red[WARPS];
     __shared__ float part[THREADS];
+    const int n = step->pos + 1;
     const int h = blockIdx.x, kvh = h / group;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const float* qh = q + (size_t)h * head_dim;
@@ -258,22 +292,73 @@ static unsigned int blocks_for(size_t n, size_t per_block) {
     return (unsigned int)((n + per_block - 1) / per_block);
 }
 
-static void matvec(const dmat_t* m, const float* x, float* y, int add) {
+static void matvec(cudaStream_t s, const dmat_t* m, const float* x, float* y, int add, const step_t* step, int per_pos) {
     const unsigned int blocks = blocks_for((size_t)m->rows, WARPS);
     switch (m->dtype) {
-        case VITNA_DTYPE_BF16: matvec_kernel<VITNA_DTYPE_BF16><<<blocks, THREADS>>>(m->w, x, y, m->rows, m->cols, add); break;
-        case VITNA_DTYPE_F16: matvec_kernel<VITNA_DTYPE_F16><<<blocks, THREADS>>>(m->w, x, y, m->rows, m->cols, add); break;
-        default: matvec_kernel<VITNA_DTYPE_F32><<<blocks, THREADS>>>(m->w, x, y, m->rows, m->cols, add); break;
+        case VITNA_DTYPE_BF16: matvec_kernel<VITNA_DTYPE_BF16><<<blocks, THREADS, 0, s>>>(m->w, x, y, m->rows, m->cols, add, step, per_pos); break;
+        case VITNA_DTYPE_F16: matvec_kernel<VITNA_DTYPE_F16><<<blocks, THREADS, 0, s>>>(m->w, x, y, m->rows, m->cols, add, step, per_pos); break;
+        default: matvec_kernel<VITNA_DTYPE_F32><<<blocks, THREADS, 0, s>>>(m->w, x, y, m->rows, m->cols, add, step, per_pos); break;
     }
 }
 
-static void embed(const dmat_t* table, int token, float* x) {
+static void embed(cudaStream_t s, const dmat_t* table, const step_t* step, float* x) {
     const unsigned int blocks = blocks_for((size_t)table->cols, THREADS);
     switch (table->dtype) {
-        case VITNA_DTYPE_BF16: embed_kernel<VITNA_DTYPE_BF16><<<blocks, THREADS>>>(table->w, token, table->cols, x); break;
-        case VITNA_DTYPE_F16: embed_kernel<VITNA_DTYPE_F16><<<blocks, THREADS>>>(table->w, token, table->cols, x); break;
-        default: embed_kernel<VITNA_DTYPE_F32><<<blocks, THREADS>>>(table->w, token, table->cols, x); break;
+        case VITNA_DTYPE_BF16: embed_kernel<VITNA_DTYPE_BF16><<<blocks, THREADS, 0, s>>>(table->w, step, table->cols, x); break;
+        case VITNA_DTYPE_F16: embed_kernel<VITNA_DTYPE_F16><<<blocks, THREADS, 0, s>>>(table->w, step, table->cols, x); break;
+        default: embed_kernel<VITNA_DTYPE_F32><<<blocks, THREADS, 0, s>>>(table->w, step, table->cols, x); break;
     }
+}
+
+/* The embedding and every layer, in model.c's order. Captured once, into g->body. */
+static void enqueue_body(const struct vitna_cuda_model* g) {
+    const cudaStream_t s = g->stream;
+    const int H = g->hidden, hd = g->head_dim, half = hd / 2;
+    const int kv_dim = g->n_kv_heads * hd;
+    const int group = g->n_heads / g->n_kv_heads;
+    const unsigned int rope_blocks = blocks_for((size_t)(g->n_heads + g->n_kv_heads) * half, THREADS);
+    const unsigned int mlp_blocks = blocks_for((size_t)g->intermediate, THREADS);
+
+    embed(s, &g->embed, g->step, g->x);
+    for (int l = 0; l < g->n_layers; l++) {
+        const dlayer_t* L = &g->layers[l];
+        float* kc = g->k_cache + (size_t)l * g->ctx * kv_dim;
+        float* vc = g->v_cache + (size_t)l * g->ctx * kv_dim;
+
+        /* Attention */
+        rmsnorm_kernel<<<1, THREADS, 0, s>>>(g->x, L->attn_norm, g->xn, H, g->eps);
+        matvec(s, &L->q, g->xn, g->q, 0, g->step, 0);
+        matvec(s, &L->k, g->xn, kc, 0, g->step, kv_dim);
+        matvec(s, &L->v, g->xn, vc, 0, g->step, kv_dim);
+        rope_kernel<<<rope_blocks, THREADS, 0, s>>>(g->q, kc, g->cos_t, g->sin_t, g->step, g->n_heads, g->n_kv_heads, hd);
+        attention_kernel<<<g->n_heads, THREADS, 0, s>>>(g->q, kc, vc, g->att, g->scores, g->step, hd, kv_dim, group, g->ctx, g->scale);
+        matvec(s, &L->o, g->att, g->x, 1, g->step, 0);
+
+        /* MLP */
+        rmsnorm_kernel<<<1, THREADS, 0, s>>>(g->x, L->mlp_norm, g->xn, H, g->eps);
+        matvec(s, &L->gate, g->xn, g->gate, 0, g->step, 0);
+        matvec(s, &L->up, g->xn, g->up, 0, g->step, 0);
+        silu_mul_kernel<<<mlp_blocks, THREADS, 0, s>>>(g->gate, g->up, g->intermediate);
+        matvec(s, &L->down, g->gate, g->x, 1, g->step, 0);
+    }
+}
+
+/* The final RMSNorm and the output projection. Captured once, into g->head. */
+static void enqueue_head(const struct vitna_cuda_model* g) {
+    rmsnorm_kernel<<<1, THREADS, 0, g->stream>>>(g->x, g->final_norm, g->xn, g->hidden, g->eps);
+    matvec(g->stream, &g->lm_head, g->xn, g->logits, 0, g->step, 0);
+}
+
+static cudaError_t capture(struct vitna_cuda_model* g, void (*enqueue)(const struct vitna_cuda_model*), cudaGraphExec_t* out) {
+    cudaGraph_t graph = NULL;
+    cudaError_t e = cudaStreamBeginCapture(g->stream, cudaStreamCaptureModeThreadLocal);
+    if (e != cudaSuccess) return e;
+    enqueue(g);
+    e = cudaStreamEndCapture(g->stream, &graph);
+    if (e == cudaSuccess) e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaGraphInstantiate(out, graph, 0);
+    if (graph) cudaGraphDestroy(graph);
+    return e;
 }
 
 /* --- Host side --- */
@@ -311,10 +396,13 @@ bool vitna_cuda_probe(char* err, size_t err_len) {
 
 void vitna_cuda_free(struct vitna_cuda_model* g) {
     if (!g) return;
-    if (g->arena) {
-        cudaSetDevice(g->device);
-        cudaFree(g->arena);
-    }
+    cudaSetDevice(g->device);
+    if (g->stream) cudaStreamSynchronize(g->stream);
+    if (g->body) cudaGraphExecDestroy(g->body);
+    if (g->head) cudaGraphExecDestroy(g->head);
+    if (g->stream) cudaStreamDestroy(g->stream);
+    if (g->host_logits) cudaFreeHost(g->host_logits);
+    if (g->arena) cudaFree(g->arena);
     free(g->layers);
     free(g);
 }
@@ -362,6 +450,8 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     cudaError_t e = cudaSetDevice(g->device);
     cudaDeviceProp prop;
     if (e == cudaSuccess) e = cudaGetDeviceProperties(&prop, g->device);
+    if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&g->stream, cudaStreamNonBlocking);
+    if (e == cudaSuccess) e = cudaMallocHost((void**)&g->host_logits, c->vocab * sizeof(float));
     if (e != cudaSuccess) {
         fail_cuda(err, err_len, "cannot use CUDA device 0", e);
         vitna_cuda_free(g);
@@ -385,7 +475,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     total += 2 * padded(cache_floats * sizeof(float));
     total += 2 * padded(c->hidden * sizeof(float)) + 2 * padded(q_dim * sizeof(float)) +
              2 * padded(c->intermediate * sizeof(float)) + padded(c->vocab * sizeof(float)) +
-             padded(c->n_heads * m->ctx * sizeof(float));
+             padded(c->n_heads * m->ctx * sizeof(float)) + padded(sizeof(step_t));
 
     e = cudaMalloc(&g->arena, total);
     if (e != cudaSuccess) {
@@ -456,8 +546,12 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         g->up = (float*)carve(&cv, c->intermediate * sizeof(float));
         g->logits = (float*)carve(&cv, c->vocab * sizeof(float));
         g->scores = (float*)carve(&cv, c->n_heads * m->ctx * sizeof(float));
+        g->step = (step_t*)carve(&cv, sizeof(step_t));
         /* A position is always written before it is read; zeros make a mistake there repeatable. */
         e = cudaMemset(g->k_cache, 0, 2 * padded(cache_floats * sizeof(float)));
+        /* The uploads and the memset ran on the default stream, which the
+         * model's non-blocking stream does not wait for: finish them first. */
+        if (e == cudaSuccess) e = cudaDeviceSynchronize();
         ok = e == cudaSuccess;
     }
     if (!ok) {
@@ -466,15 +560,27 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         return NULL;
     }
 
-    /* Run one kernel now, so a build with no code for this GPU fails on load, not at the first token. */
-    embed(&g->embed, 0, g->x);
+    e = capture(g, enqueue_body, &g->body);
+    if (e == cudaSuccess) e = capture(g, enqueue_head, &g->head);
+    if (e != cudaSuccess) {
+        fail_cuda(err, err_len, "capturing the forward pass as a CUDA graph failed", e);
+        vitna_cuda_free(g);
+        return NULL;
+    }
+
+    /* Run the graphs once, at position 0, so a build with no code for this
+     * GPU fails on load, not at the first token. What it writes to position
+     * 0 of the cache is written again before it is read. */
+    set_step_kernel<<<1, 1, 0, g->stream>>>(g->step, 0, 0);
     e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaGraphLaunch(g->body, g->stream);
+    if (e == cudaSuccess) e = cudaGraphLaunch(g->head, g->stream);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
     if (e != cudaSuccess) {
         if (e == cudaErrorNoKernelImageForDevice || e == cudaErrorUnsupportedPtxVersion) {
             fail(err, err_len, "this engine has no code for %s; rebuild it for that architecture (%s)", g->name, cudaGetErrorName(e));
         } else {
-            fail_cuda(err, err_len, "a first kernel failed on the device", e);
+            fail_cuda(err, err_len, "a first run on the device failed", e);
         }
         vitna_cuda_free(g);
         return NULL;
@@ -483,49 +589,20 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
 }
 
 bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, float* logits, char* err, size_t err_len) {
-    const int H = g->hidden, hd = g->head_dim, half = hd / 2;
-    const size_t kv_dim = (size_t)g->n_kv_heads * hd;
-    const int group = g->n_heads / g->n_kv_heads;
-    const int n = (int)pos + 1;
-    const unsigned int rope_blocks = blocks_for((size_t)(g->n_heads + g->n_kv_heads) * half, THREADS);
-    const unsigned int mlp_blocks = blocks_for((size_t)g->intermediate, THREADS);
-
     cudaError_t e = cudaSetDevice(g->device);
     if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
 
-    embed(&g->embed, token, g->x);
-    for (int l = 0; l < g->n_layers; l++) {
-        const dlayer_t* L = &g->layers[l];
-        float* kc = g->k_cache + (size_t)l * g->ctx * kv_dim;
-        float* vc = g->v_cache + (size_t)l * g->ctx * kv_dim;
-        float* k_here = kc + pos * kv_dim;
-        float* v_here = vc + pos * kv_dim;
-
-        /* Attention */
-        rmsnorm_kernel<<<1, THREADS>>>(g->x, L->attn_norm, g->xn, H, g->eps);
-        matvec(&L->q, g->xn, g->q, 0);
-        matvec(&L->k, g->xn, k_here, 0);
-        matvec(&L->v, g->xn, v_here, 0);
-        rope_kernel<<<rope_blocks, THREADS>>>(g->q, k_here, g->cos_t + pos * half, g->sin_t + pos * half, g->n_heads, g->n_kv_heads, hd);
-        attention_kernel<<<g->n_heads, THREADS>>>(g->q, kc, vc, g->att, g->scores, n, hd, (int)kv_dim, group, g->ctx, g->scale);
-        matvec(&L->o, g->att, g->x, 1);
-
-        /* MLP */
-        rmsnorm_kernel<<<1, THREADS>>>(g->x, L->mlp_norm, g->xn, H, g->eps);
-        matvec(&L->gate, g->xn, g->gate, 0);
-        matvec(&L->up, g->xn, g->up, 0);
-        silu_mul_kernel<<<mlp_blocks, THREADS>>>(g->gate, g->up, g->intermediate);
-        matvec(&L->down, g->gate, g->x, 1);
-    }
-    if (logits) {
-        rmsnorm_kernel<<<1, THREADS>>>(g->x, g->final_norm, g->xn, H, g->eps);
-        matvec(&g->lm_head, g->xn, g->logits, 0);
-    }
+    set_step_kernel<<<1, 1, 0, g->stream>>>(g->step, token, (int)pos);
     e = cudaGetLastError();
-    if (e != cudaSuccess) return fail_cuda(err, err_len, "a kernel could not be launched", e);
+    if (e == cudaSuccess) e = cudaGraphLaunch(g->body, g->stream);
+    if (e == cudaSuccess && logits) e = cudaGraphLaunch(g->head, g->stream);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass could not be launched", e);
     if (logits) {
-        e = cudaMemcpy(logits, g->logits, (size_t)g->vocab * sizeof(float), cudaMemcpyDeviceToHost);
+        const size_t bytes = (size_t)g->vocab * sizeof(float);
+        e = cudaMemcpyAsync(g->host_logits, g->logits, bytes, cudaMemcpyDeviceToHost, g->stream);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
         if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
+        memcpy(logits, g->host_logits, bytes);
     }
     return true;
 }
