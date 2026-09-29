@@ -42,7 +42,7 @@ jobs:
   build-engine:
     # Linux and Windows run x86-64 (the AVX2 path where the runner has it),
     # macOS runs arm64 (the NEON path).
-    name: Engine and gate A2 (${{ matrix.os }})
+    name: Engine and gates (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -95,3 +95,7 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/serving.test.mjs
+      - name: Gate A6, prefix reuse and JSON mode
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/reuse-and-json.test.mjs

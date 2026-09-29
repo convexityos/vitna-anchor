@@ -83,6 +83,14 @@ void vitna_llama_free(vitna_llama_t* m);
 void vitna_llama_reset(vitna_llama_t* m);
 
 /**
+ * Keep the first n positions and forget the rest, so the next token is at
+ * position n. A position's keys and values depend only on the tokens up to
+ * it, so what is kept is exactly what feeding those n tokens again would
+ * compute. n larger than the positions filled changes nothing.
+ */
+void vitna_llama_truncate(vitna_llama_t* m, size_t n);
+
+/**
  * Run one token at the next position (m->n_past), adding its keys and values
  * to the cache. Writes vocab logits to logits unless it is NULL, which skips
  * the output projection. Returns false if the cache is full or the token is
