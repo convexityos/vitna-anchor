@@ -3,22 +3,37 @@ name: CI
 on:
   push:
     branches: [ main ]
+  # Every pull request, whatever its base, so a pull request stacked on another
+  # one is checked too.
   pull_request:
-    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-node:
-    name: Node Test Suite (${{ matrix.os }})
+    name: Node ${{ matrix.node-version }} tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # One failing job must not cancel the others and hide what they would
+      # have found.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: [18.x, 20.x, 22.x]
+        # 18 and 20 are past end of life. 22 is the oldest line the test glob
+        # works on: npm runs scripts through cmd.exe on Windows, which leaves
+        # the pattern to the test runner, and the runner expands patterns
+        # itself only from Node 21.
+        node-version: [22.x, 24.x]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
       - name: Run Test Suite
@@ -28,11 +43,12 @@ jobs:
     name: Build C11 Engine (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build Engine with Make (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
