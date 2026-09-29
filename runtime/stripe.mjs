@@ -81,9 +81,10 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
       chunkIndex++;
     }
   } finally {
-    try { closeSync(inFd); } catch {}
+    // Closing on the way out: a failure here has nothing left to affect.
+    try { closeSync(inFd); } catch { /* see above */ }
     for (const f of perDriveFiles) {
-      try { closeSync(f.fd); } catch {}
+      try { closeSync(f.fd); } catch { /* see above */ }
     }
   }
 

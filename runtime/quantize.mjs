@@ -15,11 +15,9 @@ import {
   readSync,
   writeSync,
   closeSync,
-  statSync,
   mkdirSync,
   existsSync,
   writeFileSync,
-  readFileSync,
 } from "node:fs";
 import { join, basename } from "node:path";
 import { parseSafeTensorsHeader } from "./ingest.mjs";
@@ -189,7 +187,6 @@ export function quantizeSlabFile(inputPath, outputDir, options = {}) {
     throw new Error(`Input file not found: ${inputPath}`);
   }
 
-  const fileStat = statSync(inputPath);
   const fd = openSync(inputPath, "r");
 
   let parsedHeader;
