@@ -10,9 +10,11 @@
 #include "kernels.h"
 #include "model.h"
 #include "ops.h"
+#include "api.h"
 #include "safetensors.h"
 #include "sampler.h"
 #include "server.h"
+#include "strbuf.h"
 #include "tokenizer.h"
 
 #if defined(VITNA_OS_WINDOWS)
@@ -20,16 +22,15 @@
 #endif
 
 static void print_usage(const char* prog) {
-    printf("vitna-anchor engine: a dense Llama-architecture model on the CPU, in float32.\n");
-    printf("Serving is not built yet (gate A3): the HTTP server answers generation with 501.\n\n");
+    printf("vitna-anchor engine: a dense Llama-architecture model on the CPU, in float32.\n\n");
     printf("Usage:\n");
     printf("  %s run      --model <dir> --prompt <text> [--max-new <n>] [sampling]\n", prog);
     printf("  %s generate --model <dir> (--prompt <text> | --ids <a,b,...>) [--max-new <n>] [sampling]\n", prog);
     printf("               [--logits-out <file>] [--stop-at-special]\n");
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
+    printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>]\n", prog);
     printf("  %s info     --model <file.safetensors>\n", prog);
-    printf("  %s serve    [--port <port>]\n", prog);
     printf("  %s bench    [--iterations <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n\n");
@@ -39,8 +40,10 @@ static void print_usage(const char* prog) {
     printf("logits    writes the logits at every position of the prompt, positions x vocab, float32 LE\n");
     printf("tokenize  prints the ids of --text as a JSON array; without --text it reads one JSON string\n");
     printf("          per line from stdin and prints one array per line\n");
+    printf("serve     serves the model over an OpenAI-compatible HTTP API at /v1, on 127.0.0.1:8765 unless told\n");
+    printf("          otherwise, under the model directory's name unless --model-id says another. Without\n");
+    printf("          --model its generation endpoints answer 501\n");
     printf("info      lists the tensors in a SafeTensors file\n");
-    printf("serve     starts the HTTP server, whose generation endpoints answer 501\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
 }
 
@@ -51,6 +54,8 @@ typedef struct {
     const char* out;
     const char* logits_out;
     const char* text;
+    const char* model_id;
+    const char* host;
     size_t max_new;
     size_t ctx;
     int iterations;
@@ -75,6 +80,8 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--out")) a->out = v;
         else if (TAKE("--logits-out")) a->logits_out = v;
         else if (TAKE("--text")) a->text = v;
+        else if (TAKE("--model-id")) a->model_id = v;
+        else if (TAKE("--host")) a->host = v;
         else if (TAKE("--max-new")) a->max_new = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--ctx")) a->ctx = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--iterations")) a->iterations = atoi(v);
@@ -103,36 +110,11 @@ static void binary_stdio(void) {
 
 /* JSON string output. Invalid UTF-8 becomes U+FFFD, as a lossy decoder would. */
 static void print_json_string(FILE* f, const unsigned char* s, size_t n) {
-    fputc('"', f);
-    size_t i = 0;
-    while (i < n) {
-        unsigned char c = s[i];
-        if (c == '"') { fputs("\\\"", f); i++; continue; }
-        if (c == '\\') { fputs("\\\\", f); i++; continue; }
-        if (c < 0x20) { fprintf(f, "\\u%04x", c); i++; continue; }
-        if (c < 0x80) { fputc(c, f); i++; continue; }
-        size_t len = 0;
-        if (c >= 0xC2 && c <= 0xDF) len = 2;
-        else if (c >= 0xE0 && c <= 0xEF) len = 3;
-        else if (c >= 0xF0 && c <= 0xF4) len = 4;
-        bool valid = len > 0 && i + len <= n;
-        for (size_t k = 1; valid && k < len; k++) valid = (s[i + k] & 0xC0) == 0x80;
-        if (valid && len == 3) {
-            unsigned cp = ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
-            valid = cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF);
-        } else if (valid && len == 4) {
-            unsigned cp = ((c & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12) | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
-            valid = cp >= 0x10000 && cp <= 0x10FFFF;
-        }
-        if (valid) {
-            fwrite(s + i, 1, len, f);
-            i += len;
-        } else {
-            fputs("\\ufffd", f);
-            i++;
-        }
-    }
-    fputc('"', f);
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    vitna_sb_json_string(&sb, s, n);
+    if (sb.ok) fwrite(sb.data, 1, sb.len, f);
+    vitna_sb_free(&sb);
 }
 
 static void print_ids(FILE* f, const int32_t* ids, size_t n) {
@@ -495,6 +477,49 @@ static int cmd_bench(int iterations) {
     return 0;
 }
 
+/* The last path component of dir, without trailing slashes: the default model id. */
+static void dir_basename(const char* dir, char* out, size_t n) {
+    size_t end = strlen(dir);
+    while (end > 0 && (dir[end - 1] == '/' || dir[end - 1] == '\\')) end--;
+    size_t start = end;
+    while (start > 0 && dir[start - 1] != '/' && dir[start - 1] != '\\') start--;
+    size_t len = end - start < n - 1 ? end - start : n - 1;
+    memcpy(out, dir + start, len);
+    out[len] = '\0';
+}
+
+static int cmd_serve(const args_t* a) {
+    vitna_server_config_t cfg;
+    cfg.port = a->port;
+    cfg.bind_addr = a->host ? a->host : "127.0.0.1";
+    cfg.engine_ctx = NULL;
+    if (!a->model) return vitna_server_run(&cfg);
+
+    vitna_tokenizer_t* tok = load_tokenizer(a->model);
+    if (!tok) return 1;
+    vitna_llama_t m;
+    if (!load_model(a, &m)) {
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
+    char id[128];
+    if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
+    else dir_basename(a->model, id, sizeof(id));
+    vitna_api_t* api = vitna_api_create(&m, tok, id[0] ? id : "model");
+    int rc = 1;
+    if (!api) {
+        fprintf(stderr, "out of memory\n");
+    } else {
+        printf("Loaded %s: %zu layers, %zu-token context, matvec path %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_matvec_path());
+        cfg.engine_ctx = api;
+        rc = vitna_server_run(&cfg);
+        vitna_api_free(api);
+    }
+    vitna_llama_free(&m);
+    vitna_tokenizer_free(tok);
+    return rc;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -515,13 +540,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "tokenize") == 0) return cmd_tokenize(&a);
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
-    if (strcmp(cmd, "serve") == 0) {
-        vitna_server_config_t cfg;
-        cfg.port = a.port;
-        cfg.bind_addr = "127.0.0.1";
-        cfg.engine_ctx = NULL;
-        return vitna_server_run(&cfg);
-    }
+    if (strcmp(cmd, "serve") == 0) return cmd_serve(&a);
     print_usage(argv[0]);
     return 1;
 }

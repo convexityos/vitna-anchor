@@ -91,3 +91,7 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/reference.test.mjs
+      - name: Gate A3, serving over the OpenAI-compatible API
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/serving.test.mjs

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "api.h"
 #include "crypto.h"
 #include "json.h"
 #include "kernels.h"
@@ -22,6 +23,7 @@
 #include "ops.h"
 #include "safetensors.h"
 #include "sampler.h"
+#include "strbuf.h"
 #include "tokenizer.h"
 #include "unicode.h"
 
@@ -508,7 +510,37 @@ static void test_sampler(void) {
     vitna_sampler_free(&s);
 }
 
+/* --- JSON output, UTF-8 boundaries and ChatML, for the HTTP API --- */
+
+static void test_api_helpers(void) {
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    const unsigned char in[] = "a\"b\\c\n\x01\xC3\xA9\xFF\xE6\x9D";
+    vitna_sb_json_string(&sb, in, sizeof(in) - 1);
+    /* quote, backslash and newline escaped, U+0001 as \u0001, e-acute kept,
+     * a stray byte and a cut-off three-byte sequence each as U+FFFD */
+    const char* want = "\"a\\\"b\\\\c\\n\\u0001\xC3\xA9\\ufffd\\ufffd\\ufffd\"";
+    CHECK(sb.ok && strcmp(sb.data, want) == 0, "JSON string escaping: got %s", sb.data ? sb.data : "(null)");
+    vitna_sb_free(&sb);
+
+    const unsigned char euro[] = { 'x', 0xE2, 0x82, 0xAC };
+    CHECK(vitna_utf8_complete_prefix(euro, 4) == 4, "a whole character is complete");
+    CHECK(vitna_utf8_complete_prefix(euro, 3) == 1 && vitna_utf8_complete_prefix(euro, 2) == 1, "a character cut short is held back");
+    const unsigned char rocket[] = { 0xF0, 0x9F, 0x9A, 0x80 };
+    CHECK(vitna_utf8_complete_prefix(rocket, 3) == 0 && vitna_utf8_complete_prefix(rocket, 4) == 4, "four-byte characters");
+
+    const char* roles[] = { "system", "user" };
+    const char* contents[] = { "Be brief.", "Hi" };
+    char* out = NULL;
+    size_t n = 0;
+    CHECK(vitna_chatml_format(roles, contents, 2, &out, &n) &&
+          strcmp(out, "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n") == 0,
+          "ChatML formatting");
+    free(out);
+}
+
 int main(void) {
+    test_api_helpers();
     test_json();
     test_safetensors();
     test_unicode();
