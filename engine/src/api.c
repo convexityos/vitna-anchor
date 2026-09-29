@@ -99,20 +99,25 @@ static void set_error(api_error_t* e, int status, const char* type, const char* 
     va_end(ap);
 }
 
+/* {"error":{...}}: the body of an error response, and of a stream's error event. */
+static void error_json(vitna_strbuf_t* b, const api_error_t* e) {
+    vitna_sb_puts(b, "{\"error\":{\"message\":");
+    vitna_sb_json_string(b, (const unsigned char*)e->message, strlen(e->message));
+    vitna_sb_puts(b, ",\"type\":");
+    vitna_sb_json_string(b, (const unsigned char*)e->type, strlen(e->type));
+    vitna_sb_puts(b, ",\"param\":");
+    if (e->param) vitna_sb_json_string(b, (const unsigned char*)e->param, strlen(e->param));
+    else vitna_sb_puts(b, "null");
+    vitna_sb_puts(b, ",\"code\":");
+    if (e->code) vitna_sb_json_string(b, (const unsigned char*)e->code, strlen(e->code));
+    else vitna_sb_puts(b, "null");
+    vitna_sb_puts(b, "}}");
+}
+
 static int respond_error(vitna_sink_t* s, const api_error_t* e) {
     vitna_strbuf_t b;
     vitna_sb_init(&b);
-    vitna_sb_puts(&b, "{\"error\":{\"message\":");
-    vitna_sb_json_string(&b, (const unsigned char*)e->message, strlen(e->message));
-    vitna_sb_puts(&b, ",\"type\":");
-    vitna_sb_json_string(&b, (const unsigned char*)e->type, strlen(e->type));
-    vitna_sb_puts(&b, ",\"param\":");
-    if (e->param) vitna_sb_json_string(&b, (const unsigned char*)e->param, strlen(e->param));
-    else vitna_sb_puts(&b, "null");
-    vitna_sb_puts(&b, ",\"code\":");
-    if (e->code) vitna_sb_json_string(&b, (const unsigned char*)e->code, strlen(e->code));
-    else vitna_sb_puts(&b, "null");
-    vitna_sb_puts(&b, "}}");
+    error_json(&b, e);
     respond(s, e->status, e->status == 405 ? "Allow: POST\r\n" : NULL, b.data, b.len);
     vitna_sb_free(&b);
     return e->status;
@@ -472,6 +477,19 @@ static void send_chunk(gen_t* g, const unsigned char* text, size_t n, const char
     vitna_sb_free(&sb);
 }
 
+/* The last event of a stream that fails after its 200 has gone out. Its data
+ * is the body an error response would have had, and no final chunk or [DONE]
+ * follows it, so the reply so far cannot pass for a whole one. */
+static void send_error_event(gen_t* g, const api_error_t* e) {
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    vitna_sb_puts(&sb, "data: ");
+    error_json(&sb, e);
+    vitna_sb_puts(&sb, "\n\n");
+    sink_out(g->sink, sb.data, sb.len);
+    vitna_sb_free(&sb);
+}
+
 /* Text that cannot yet be streamed: the longest end of it that begins a stop sequence. */
 static size_t stop_holdback(const params_t* p, const char* text, size_t len) {
     size_t hold = 0;
@@ -593,7 +611,10 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
     api->cached.count = reuse;
     r.cached_tokens = reuse;
 
-    /* Prefill the rest, then one token at a time. */
+    /* Prefill the rest, then one token at a time. ok stays true while every
+     * step runs. A step that fails, as one on a GPU does when the device
+     * reports an error, ends the request with an error rather than with the
+     * reply so far, and its token never joins api->cached. */
     const char* finish = "length";
     bool ok = true;
     for (size_t t = reuse; t < ids->count && ok; t++) {
@@ -635,12 +656,16 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
         }
         if (p->stream) stream_ready(&g, false);
         if (s + 1 < max_new) {
-            if (!vitna_llama_step(m, next, api->row)) break;
-            vitna_token_list_push(&api->cached, next);
+            ok = vitna_llama_step(m, next, api->row);
+            if (ok) vitna_token_list_push(&api->cached, next);
         }
     }
 
-    if (!g.text.ok) {
+    if (!ok) {
+        set_error(&e, 500, "server_error", NULL, NULL, "The model failed to run a step, so the reply could not be completed.");
+        if (p->stream) send_error_event(&g, &e);
+        else r.status = respond_error(sink, &e);
+    } else if (!g.text.ok) {
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
         if (!p->stream) r.status = respond_error(sink, &e);
     } else if (p->stream) {

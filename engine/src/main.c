@@ -522,6 +522,22 @@ static int cmd_serve(const args_t* a) {
         vitna_tokenizer_free(tok);
         return 1;
     }
+    /* For tests only: VITNA_TEST_FAIL_STEP=<position> makes the step at that
+     * position fail once, so tests/step-failure.test.mjs can check what a
+     * client sees when a step fails, with no GPU error to cause one. */
+    const char* fail = getenv("VITNA_TEST_FAIL_STEP");
+    if (fail && *fail) {
+        char* end;
+        unsigned long long pos = strtoull(fail, &end, 10);
+        if (fail[0] < '0' || fail[0] > '9' || *end) {
+            fprintf(stderr, "VITNA_TEST_FAIL_STEP must be a position, a whole number, not %s\n", fail);
+            vitna_llama_free(&m);
+            vitna_tokenizer_free(tok);
+            return 1;
+        }
+        vitna_llama_fail_step_once(&m, (size_t)pos);
+        fprintf(stderr, "VITNA_TEST_FAIL_STEP is set, for a test: the step at position %llu will fail once.\n", pos);
+    }
     char id[128];
     if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
     else dir_basename(a->model, id, sizeof(id));
