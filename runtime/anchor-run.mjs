@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Command line for vitna-anchor.
 //
-// No model runs yet. `serve` answers every generation request with 501 and
-// `chat` says so and exits. The other commands work on files: they parse,
-// slice, stripe and quantize checkpoints, and compile JSON Schemas.
+// This command line runs no model. The C engine in engine/ does, from its own
+// command line (gate A2); serving it over HTTP is gate A3. Until then `serve`
+// answers every generation request with 501 and `chat` says so and exits.
+// The other commands work on files: they parse, slice, stripe and quantize
+// checkpoints, and compile JSON Schemas.
 //
 // Nothing this command line prints is a performance figure or a claim about
 // the machine. A figure appears only once a gate in the README measures it.
@@ -20,8 +22,8 @@ import { sliceStripedDmaSlabs, formatStripeSummary } from "./stripe.mjs";
 import { compileJsonSchemaToPda, formatGrammarSummary } from "./grammar.mjs";
 
 export const NO_MODEL_MESSAGE =
-  "No model runs yet. This build of vitna-anchor has no forward pass, so it cannot generate text. " +
-  "See the gate ladder in the README.";
+  "This server does not serve a model yet: that is gate A3 in the README. " +
+  "The engine runs one from its command line: vitna-anchor run --model <dir> --prompt <text>.";
 
 // Commands earlier versions offered, and why each one went. Calling one prints
 // its reason rather than a bare "unknown command".
