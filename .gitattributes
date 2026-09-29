@@ -1,0 +1,4 @@
+# Text files are LF in every checkout, so digests of files such as the
+# reference fixture's inputs are the same on every operating system.
+* text=auto eol=lf
+*.ps1 text eol=crlf

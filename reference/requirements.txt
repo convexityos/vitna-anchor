@@ -1,0 +1,11 @@
+# The software reference/record.py records the fixture with. It refuses to
+# record on any other versions, since a different version may compute
+# different floats.
+#
+# torch is the CPU build, from PyTorch's own index:
+#   pip install -r reference/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+transformers==5.17.0
+tokenizers==0.23.2
+safetensors==0.8.0
+numpy==2.5.3

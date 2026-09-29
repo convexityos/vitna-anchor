@@ -15,8 +15,8 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 
 | Gate | Passes when | Status |
 |---|---|---|
-| A0, honesty | This README, the command line and both servers state what runs today, and print no figure nobody measured | This change |
-| A1, a reference | One small dense open model is pinned by revision and file hash, token ids and logits for fixed prompts are recorded from a pinned reference implementation, and a test compares against them | Not started |
+| A0, honesty | This README, the command line and both servers state what runs today, and print no figure nobody measured | [#2](https://github.com/convexityos/vitna-anchor/pull/2) |
+| A1, a reference | One small dense open model is pinned by revision and file hash, token ids and logits for fixed prompts are recorded from a pinned reference implementation, and a test compares against them | This change. See [`reference/`](reference/README.md) |
 | A2, a forward pass on a CPU | Tokenizer, embeddings, RMSNorm, attention over a real key-value cache, MLP and sampling in C. Logits match A1 within a stated tolerance, and greedy output matches token for token | Not started |
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Not started |
 | A4, one GPU | The A2 comparison passes on CUDA | Not started |
@@ -43,6 +43,7 @@ Nothing below has been checked against an external reference yet. "Tested" means
 | Prefix tree over token ids | `engine/src/radix_kv.c` | Untested. It holds no key-value tensors |
 | SHA-256 | `engine/src/crypto.c` | Untested |
 | HTTP server | `engine/src/server.c`, `runtime/anchor-run.mjs` | Tested: health says no model, generation answers 501 |
+| Reference for SmolLM2-135M: pinned model, recorded token ids and logits, and the tolerance gate A2 must meet | `reference/` | Recorded with transformers on torch CPU. Reproduces bit for bit on the machine that recorded it. CI records it again on x86-64 Linux and Windows |
 
 ## Build the engine from source
 
@@ -96,7 +97,7 @@ node bin/vitna-anchor.mjs --help
 npm test
 ```
 
-`tests/engine-server.test.mjs` runs the built engine when it finds one, and is skipped otherwise. CI builds the engine on Linux, macOS and Windows and requires it.
+`tests/engine-server.test.mjs` runs the built engine when it finds one, and is skipped otherwise. CI builds the engine on Linux, macOS and Windows and requires it. `tests/reference.test.mjs` checks the reference fixture, and holds the engine's comparison with it as `todo` until gate A2.
 
 ## Measurements
 
