@@ -1,5 +1,11 @@
 /**
- * safetensors.h - Zero-copy Safetensors header parser and tensor locator.
+ * safetensors.h - Zero-copy SafeTensors reader.
+ *
+ * Maps the file and parses its JSON header into a tensor directory. Every
+ * tensor is checked on open: its dtype is known, its shape is at most 8
+ * dimensions, its byte range lies inside the file's data section, and that
+ * range holds exactly shape x dtype-size bytes. The __metadata__ entry is
+ * skipped. Tensor data is read in place from the mapping.
  */
 
 #ifndef VITNA_SAFETENSORS_H
@@ -23,17 +29,24 @@ typedef enum {
     VITNA_DTYPE_I16,
     VITNA_DTYPE_I8,
     VITNA_DTYPE_U8,
-    VITNA_DTYPE_BOOL
+    VITNA_DTYPE_BOOL,
+    VITNA_DTYPE_F64,
+    VITNA_DTYPE_I64,
+    VITNA_DTYPE_U16,
+    VITNA_DTYPE_U32,
+    VITNA_DTYPE_U64
 } vitna_dtype_t;
 
+#define VITNA_TENSOR_NAME_MAX 256
+
 typedef struct {
-    char name[128];
+    char name[VITNA_TENSOR_NAME_MAX];
     vitna_dtype_t dtype;
     size_t shape[8];
     size_t ndim;
-    uint64_t offset_begin;
+    uint64_t offset_begin;   /* relative to the start of the data section */
     uint64_t offset_end;
-    const void* data_ptr; /* non-NULL if mmap is active */
+    const void* data_ptr;    /* into the mapping */
 } vitna_tensor_desc_t;
 
 typedef struct {
@@ -46,9 +59,19 @@ typedef struct {
     uint64_t data_base_offset;
 } vitna_safetensors_t;
 
+/** Bytes per element of a dtype, or 0 for VITNA_DTYPE_UNKNOWN. */
+size_t vitna_dtype_size(vitna_dtype_t dtype);
+
+/** The SafeTensors name of a dtype ("BF16", ...). */
+const char* vitna_dtype_name(vitna_dtype_t dtype);
+
 /**
- * Open a safetensors file via memory-mapping and parse its tensor directory.
+ * Open a SafeTensors file, map it, and parse and check its tensor directory.
+ * On failure returns false, and writes a reason to err when err is not NULL.
  */
+bool vitna_safetensors_open_ex(const char* filepath, vitna_safetensors_t* st, char* err, size_t err_len);
+
+/** vitna_safetensors_open_ex without the reason. */
 bool vitna_safetensors_open(const char* filepath, vitna_safetensors_t* st);
 
 /**
@@ -56,6 +79,9 @@ bool vitna_safetensors_open(const char* filepath, vitna_safetensors_t* st);
  * Returns NULL if not found.
  */
 const vitna_tensor_desc_t* vitna_safetensors_find(const vitna_safetensors_t* st, const char* name);
+
+/** Number of elements in a tensor: the product of its shape. */
+uint64_t vitna_tensor_numel(const vitna_tensor_desc_t* t);
 
 /**
  * Close and release all memory-mapped resources.

@@ -1,204 +1,196 @@
 /**
- * safetensors.c - Lean, zero-dependency Safetensors parser.
+ * safetensors.c - Zero-copy SafeTensors reader.
+ *
+ * The header is parsed with json.c. The parser this replaced compared the
+ * first 10 characters of a 12-character key ("__metadata__"), so the metadata
+ * block was read as a tensor, and it never checked that a tensor's byte range
+ * lay inside the file.
  */
 
 #include "safetensors.h"
+#include "json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
-static vitna_dtype_t parse_dtype(const char* str, size_t len) {
-    if (len == 3 && strncmp(str, "F32", 3) == 0) return VITNA_DTYPE_F32;
-    if (len == 3 && strncmp(str, "F16", 3) == 0) return VITNA_DTYPE_F16;
-    if (len == 4 && strncmp(str, "BF16", 4) == 0) return VITNA_DTYPE_BF16;
-    if (len == 3 && strncmp(str, "I32", 3) == 0) return VITNA_DTYPE_I32;
-    if (len == 3 && strncmp(str, "I16", 3) == 0) return VITNA_DTYPE_I16;
-    if (len == 2 && strncmp(str, "I8", 2) == 0)  return VITNA_DTYPE_I8;
-    if (len == 2 && strncmp(str, "U8", 2) == 0)  return VITNA_DTYPE_U8;
-    if (len == 4 && strncmp(str, "BOOL", 4) == 0) return VITNA_DTYPE_BOOL;
+/* A header larger than this is refused rather than parsed. */
+#define VITNA_SAFETENSORS_MAX_HEADER (100ull * 1024 * 1024)
+
+static const struct { const char* name; vitna_dtype_t dtype; size_t size; } DTYPES[] = {
+    { "F32", VITNA_DTYPE_F32, 4 },
+    { "F16", VITNA_DTYPE_F16, 2 },
+    { "BF16", VITNA_DTYPE_BF16, 2 },
+    { "I32", VITNA_DTYPE_I32, 4 },
+    { "I16", VITNA_DTYPE_I16, 2 },
+    { "I8", VITNA_DTYPE_I8, 1 },
+    { "U8", VITNA_DTYPE_U8, 1 },
+    { "BOOL", VITNA_DTYPE_BOOL, 1 },
+    { "F64", VITNA_DTYPE_F64, 8 },
+    { "I64", VITNA_DTYPE_I64, 8 },
+    { "U16", VITNA_DTYPE_U16, 2 },
+    { "U32", VITNA_DTYPE_U32, 4 },
+    { "U64", VITNA_DTYPE_U64, 8 },
+};
+#define N_DTYPES (sizeof(DTYPES) / sizeof(DTYPES[0]))
+
+size_t vitna_dtype_size(vitna_dtype_t dtype) {
+    for (size_t i = 0; i < N_DTYPES; i++) if (DTYPES[i].dtype == dtype) return DTYPES[i].size;
+    return 0;
+}
+
+const char* vitna_dtype_name(vitna_dtype_t dtype) {
+    for (size_t i = 0; i < N_DTYPES; i++) if (DTYPES[i].dtype == dtype) return DTYPES[i].name;
+    return "UNKNOWN";
+}
+
+static vitna_dtype_t parse_dtype(const char* s) {
+    for (size_t i = 0; i < N_DTYPES; i++) if (strcmp(DTYPES[i].name, s) == 0) return DTYPES[i].dtype;
     return VITNA_DTYPE_UNKNOWN;
 }
 
-static const char* skip_ws(const char* p, const char* end) {
-    while (p < end && isspace((unsigned char)*p)) p++;
-    return p;
+static bool set_err(char* err, size_t err_len, const char* fmt, const char* a) {
+    if (err && err_len > 0) snprintf(err, err_len, fmt, a);
+    return false;
 }
 
-static bool parse_json_directory(vitna_safetensors_t* st) {
-    const char* p = st->header_json;
-    const char* end = st->header_json + st->header_len;
-
-    p = skip_ws(p, end);
-    if (p >= end || *p != '{') return false;
-    p++;
-
-    st->tensor_capacity = 64;
-    st->tensor_count = 0;
-    st->tensors = (vitna_tensor_desc_t*)malloc(st->tensor_capacity * sizeof(vitna_tensor_desc_t));
-    if (!st->tensors) return false;
-
-    const uint8_t* raw_base = (const uint8_t*)st->mmap.data + st->data_base_offset;
-
-    while (p < end) {
-        p = skip_ws(p, end);
-        if (p >= end || *p == '}') break;
-        if (*p == ',') { p++; continue; }
-
-        if (*p != '"') break;
-        p++;
-        const char* key_start = p;
-        while (p < end && *p != '"') p++;
-        if (p >= end) break;
-        size_t key_len = (size_t)(p - key_start);
-        p++; /* skip closing quote */
-
-        p = skip_ws(p, end);
-        if (p >= end || *p != ':') break;
-        p++;
-        p = skip_ws(p, end);
-
-        if (key_len == 10 && strncmp(key_start, "__metadata__", 10) == 0) {
-            /* Skip metadata block */
-            int brace_depth = 0;
-            while (p < end) {
-                if (*p == '{') brace_depth++;
-                else if (*p == '}') {
-                    brace_depth--;
-                    if (brace_depth <= 0) { p++; break; }
-                }
-                p++;
-            }
-            continue;
-        }
-
-        /* Tensor entry */
-        if (*p != '{') break;
-        p++;
-
-        if (st->tensor_count >= st->tensor_capacity) {
-            size_t new_cap = st->tensor_capacity * 2;
-            vitna_tensor_desc_t* resized = (vitna_tensor_desc_t*)realloc(st->tensors, new_cap * sizeof(vitna_tensor_desc_t));
-            if (!resized) return false;
-            st->tensors = resized;
-            st->tensor_capacity = new_cap;
-        }
-
-        vitna_tensor_desc_t* t = &st->tensors[st->tensor_count];
-        memset(t, 0, sizeof(*t));
-        size_t copy_len = key_len < sizeof(t->name) - 1 ? key_len : sizeof(t->name) - 1;
-        memcpy(t->name, key_start, copy_len);
-        t->name[copy_len] = '\0';
-
-        /* Parse fields inside tensor definition */
-        while (p < end && *p != '}') {
-            p = skip_ws(p, end);
-            if (*p == ',') { p++; continue; }
-            if (*p != '"') { p++; continue; }
-            p++;
-            const char* field_start = p;
-            while (p < end && *p != '"') p++;
-            size_t field_len = (size_t)(p - field_start);
-            if (p < end) p++; /* skip quote */
-            p = skip_ws(p, end);
-            if (p < end && *p == ':') p++;
-            p = skip_ws(p, end);
-
-            if (field_len == 5 && strncmp(field_start, "dtype", 5) == 0) {
-                if (*p == '"') {
-                    p++;
-                    const char* d_start = p;
-                    while (p < end && *p != '"') p++;
-                    t->dtype = parse_dtype(d_start, (size_t)(p - d_start));
-                    if (p < end) p++;
-                }
-            } else if (field_len == 5 && strncmp(field_start, "shape", 5) == 0) {
-                if (*p == '[') {
-                    p++;
-                    t->ndim = 0;
-                    while (p < end && *p != ']') {
-                        p = skip_ws(p, end);
-                        if (*p == ',') { p++; continue; }
-                        if (isdigit((unsigned char)*p)) {
-                            char* next_p;
-                            unsigned long val = strtoul(p, &next_p, 10);
-                            if (t->ndim < 8) {
-                                t->shape[t->ndim++] = (size_t)val;
-                            }
-                            p = next_p;
-                        } else {
-                            p++;
-                        }
-                    }
-                    if (p < end && *p == ']') p++;
-                }
-            } else if (field_len == 12 && strncmp(field_start, "data_offsets", 12) == 0) {
-                if (*p == '[') {
-                    p++;
-                    p = skip_ws(p, end);
-                    char* next_p;
-                    t->offset_begin = strtoull(p, &next_p, 10);
-                    p = next_p;
-                    p = skip_ws(p, end);
-                    if (*p == ',') p++;
-                    p = skip_ws(p, end);
-                    t->offset_end = strtoull(p, &next_p, 10);
-                    p = next_p;
-                    while (p < end && *p != ']') p++;
-                    if (p < end && *p == ']') p++;
-                }
-            } else {
-                /* Skip unhandled field value */
-                while (p < end && *p != ',' && *p != '}') p++;
-            }
-        }
-        if (p < end && *p == '}') p++;
-
-        t->data_ptr = raw_base + t->offset_begin;
-        st->tensor_count++;
-    }
-
+/* A non-negative integer that a JSON number holds exactly. */
+static bool as_u64(const vitna_json_value_t* v, uint64_t* out) {
+    double d;
+    if (!vitna_json_as_number(v, &d)) return false;
+    if (!(d >= 0.0) || d > 9007199254740992.0 || d != (double)(uint64_t)d) return false;
+    *out = (uint64_t)d;
     return true;
 }
 
-bool vitna_safetensors_open(const char* filepath, vitna_safetensors_t* st) {
+uint64_t vitna_tensor_numel(const vitna_tensor_desc_t* t) {
+    uint64_t n = 1;
+    for (size_t d = 0; d < t->ndim; d++) n *= (uint64_t)t->shape[d];
+    return n;
+}
+
+static bool parse_directory(vitna_safetensors_t* st, char* err, size_t err_len) {
+    char jerr[160];
+    vitna_json_doc_t* doc = vitna_json_parse(st->header_json, (size_t)st->header_len, jerr, sizeof(jerr));
+    if (!doc) return set_err(err, err_len, "header: %s", jerr);
+
+    bool ok = false;
+    const vitna_json_value_t* root = vitna_json_root(doc);
+    const uint64_t data_size = (uint64_t)st->mmap.size - st->data_base_offset;
+    const uint8_t* data_base = (const uint8_t*)st->mmap.data + st->data_base_offset;
+
+    if (root->type != VITNA_JSON_OBJECT) {
+        set_err(err, err_len, "%s", "header is not a JSON object");
+        goto done;
+    }
+    st->tensor_capacity = root->u.object.count > 0 ? root->u.object.count : 1;
+    st->tensors = (vitna_tensor_desc_t*)calloc(st->tensor_capacity, sizeof(vitna_tensor_desc_t));
+    if (!st->tensors) {
+        set_err(err, err_len, "%s", "out of memory");
+        goto done;
+    }
+
+    for (size_t i = 0; i < root->u.object.count; i++) {
+        const vitna_json_member_t* m = &root->u.object.members[i];
+        if (strcmp(m->key, "__metadata__") == 0) {
+            if (m->value->type != VITNA_JSON_OBJECT) {
+                set_err(err, err_len, "%s", "__metadata__ is not an object");
+                goto done;
+            }
+            continue;
+        }
+        if (m->key_len >= VITNA_TENSOR_NAME_MAX) {
+            set_err(err, err_len, "tensor name too long: %.64s...", m->key);
+            goto done;
+        }
+        const vitna_json_value_t* entry = m->value;
+        const char* dtype_s = vitna_json_as_string(vitna_json_get(entry, "dtype"));
+        const vitna_json_value_t* shape = vitna_json_get(entry, "shape");
+        const vitna_json_value_t* offsets = vitna_json_get(entry, "data_offsets");
+        if (entry->type != VITNA_JSON_OBJECT || !dtype_s || !shape || shape->type != VITNA_JSON_ARRAY ||
+            !offsets || offsets->type != VITNA_JSON_ARRAY || offsets->u.array.count != 2) {
+            set_err(err, err_len, "tensor %s: needs dtype, shape and two data_offsets", m->key);
+            goto done;
+        }
+        vitna_tensor_desc_t* t = &st->tensors[st->tensor_count];
+        memcpy(t->name, m->key, m->key_len + 1);
+        t->dtype = parse_dtype(dtype_s);
+        if (t->dtype == VITNA_DTYPE_UNKNOWN) {
+            set_err(err, err_len, "tensor %s: unknown dtype", m->key);
+            goto done;
+        }
+        if (shape->u.array.count > 8) {
+            set_err(err, err_len, "tensor %s: more than 8 dimensions", m->key);
+            goto done;
+        }
+        t->ndim = shape->u.array.count;
+        uint64_t numel = 1;
+        for (size_t d = 0; d < t->ndim; d++) {
+            uint64_t dim;
+            if (!as_u64(shape->u.array.items[d], &dim) || dim > SIZE_MAX) {
+                set_err(err, err_len, "tensor %s: bad shape", m->key);
+                goto done;
+            }
+            t->shape[d] = (size_t)dim;
+            if (dim != 0 && numel > UINT64_MAX / dim) {
+                set_err(err, err_len, "tensor %s: shape overflows", m->key);
+                goto done;
+            }
+            numel *= dim;
+        }
+        if (!as_u64(offsets->u.array.items[0], &t->offset_begin) || !as_u64(offsets->u.array.items[1], &t->offset_end) ||
+            t->offset_begin > t->offset_end || t->offset_end > data_size) {
+            set_err(err, err_len, "tensor %s: data_offsets outside the data section", m->key);
+            goto done;
+        }
+        if (t->offset_end - t->offset_begin != numel * vitna_dtype_size(t->dtype)) {
+            set_err(err, err_len, "tensor %s: byte range does not match shape x dtype size", m->key);
+            goto done;
+        }
+        t->data_ptr = data_base + t->offset_begin;
+        st->tensor_count++;
+    }
+    ok = true;
+
+done:
+    vitna_json_free(doc);
+    return ok;
+}
+
+bool vitna_safetensors_open_ex(const char* filepath, vitna_safetensors_t* st, char* err, size_t err_len) {
     if (!filepath || !st) return false;
     memset(st, 0, sizeof(*st));
+    if (err && err_len > 0) err[0] = '\0';
 
     if (!vitna_mmap_open(filepath, &st->mmap)) {
-        return false;
+        return set_err(err, err_len, "cannot open or map %s", filepath);
     }
-
     if (st->mmap.size < 8) {
         vitna_safetensors_close(st);
-        return false;
+        return set_err(err, err_len, "%s is shorter than a header length", filepath);
     }
 
-    /* Read 8-byte little-endian header size */
+    /* 8-byte little-endian header length */
     const uint8_t* raw = (const uint8_t*)st->mmap.data;
-    st->header_len = (uint64_t)raw[0] |
-                    ((uint64_t)raw[1] << 8) |
-                    ((uint64_t)raw[2] << 16) |
-                    ((uint64_t)raw[3] << 24) |
-                    ((uint64_t)raw[4] << 32) |
-                    ((uint64_t)raw[5] << 40) |
-                    ((uint64_t)raw[6] << 48) |
-                    ((uint64_t)raw[7] << 56);
+    st->header_len = 0;
+    for (int i = 7; i >= 0; i--) st->header_len = (st->header_len << 8) | raw[i];
 
-    if (8 + st->header_len > st->mmap.size) {
+    if (st->header_len > VITNA_SAFETENSORS_MAX_HEADER || 8 + st->header_len > (uint64_t)st->mmap.size) {
         vitna_safetensors_close(st);
-        return false;
+        return set_err(err, err_len, "%s: header length is larger than the file allows", filepath);
     }
 
     st->header_json = (const char*)(raw + 8);
     st->data_base_offset = 8 + st->header_len;
 
-    if (!parse_json_directory(st)) {
+    if (!parse_directory(st, err, err_len)) {
         vitna_safetensors_close(st);
         return false;
     }
-
     return true;
+}
+
+bool vitna_safetensors_open(const char* filepath, vitna_safetensors_t* st) {
+    return vitna_safetensors_open_ex(filepath, st, NULL, 0);
 }
 
 const vitna_tensor_desc_t* vitna_safetensors_find(const vitna_safetensors_t* st, const char* name) {
@@ -213,10 +205,8 @@ const vitna_tensor_desc_t* vitna_safetensors_find(const vitna_safetensors_t* st,
 
 void vitna_safetensors_close(vitna_safetensors_t* st) {
     if (!st) return;
-    if (st->tensors) {
-        free(st->tensors);
-        st->tensors = NULL;
-    }
+    free(st->tensors);
+    st->tensors = NULL;
     st->tensor_count = 0;
     st->tensor_capacity = 0;
     vitna_mmap_close(&st->mmap);
