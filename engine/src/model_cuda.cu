@@ -200,6 +200,37 @@ __global__ void matvec_kernel(const void* __restrict__ w, const float* __restric
     if (lane == 0) y[row] = add ? y[row] + s : s;
 }
 
+/* matvec_kernel for BF16 rows that are a whole number of 16-byte chunks:
+ * each lane reads eight weights at a time instead of one. The weights are
+ * widened exactly as widen<VITNA_DTYPE_BF16> does; in a 32-bit word the
+ * lower-addressed bfloat16 is the low half. */
+__global__ void matvec_bf16x8_kernel(const uint4* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
+                                     int rows, int cols, int add, const step_t* __restrict__ step, int per_pos) {
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    if (per_pos) y += (size_t)step->pos * per_pos;
+    const int chunks = cols >> 3;
+    const uint4* wr = w + (size_t)row * chunks;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float s = 0.0f;
+    for (int c = lane; c < chunks; c += 32) {
+        const uint4 p = wr[c];
+        const float4 a = x4[2 * c];
+        const float4 b = x4[2 * c + 1];
+        s = fmaf(__uint_as_float(p.x << 16), a.x, s);
+        s = fmaf(__uint_as_float(p.x & 0xffff0000u), a.y, s);
+        s = fmaf(__uint_as_float(p.y << 16), a.z, s);
+        s = fmaf(__uint_as_float(p.y & 0xffff0000u), a.w, s);
+        s = fmaf(__uint_as_float(p.z << 16), b.x, s);
+        s = fmaf(__uint_as_float(p.z & 0xffff0000u), b.y, s);
+        s = fmaf(__uint_as_float(p.w << 16), b.z, s);
+        s = fmaf(__uint_as_float(p.w & 0xffff0000u), b.w, s);
+    }
+    s = warp_sum(s);
+    if (lane == 0) y[row] = add ? y[row] + s : s;
+}
+
 /* The half-split rotary embedding of ops.c's vitna_rope_half, element j
  * paired with j + head_dim / 2, on every query head and on the position's
  * key heads in the cache kc. */
@@ -294,6 +325,12 @@ static unsigned int blocks_for(size_t n, size_t per_block) {
 
 static void matvec(cudaStream_t s, const dmat_t* m, const float* x, float* y, int add, const step_t* step, int per_pos) {
     const unsigned int blocks = blocks_for((size_t)m->rows, WARPS);
+    /* Every matrix starts on a 256-byte boundary in the arena, so rows of a
+     * multiple of eight weights stay 16-byte aligned, and so do the vectors. */
+    if (m->dtype == VITNA_DTYPE_BF16 && m->cols % 8 == 0) {
+        matvec_bf16x8_kernel<<<blocks, THREADS, 0, s>>>(static_cast<const uint4*>(m->w), x, y, m->rows, m->cols, add, step, per_pos);
+        return;
+    }
     switch (m->dtype) {
         case VITNA_DTYPE_BF16: matvec_kernel<VITNA_DTYPE_BF16><<<blocks, THREADS, 0, s>>>(m->w, x, y, m->rows, m->cols, add, step, per_pos); break;
         case VITNA_DTYPE_F16: matvec_kernel<VITNA_DTYPE_F16><<<blocks, THREADS, 0, s>>>(m->w, x, y, m->rows, m->cols, add, step, per_pos); break;
