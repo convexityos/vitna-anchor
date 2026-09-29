@@ -471,6 +471,28 @@ static void test_sha256(void) {
     free(million);
 }
 
+/* --- Clock --- */
+
+static void test_clock(void) {
+    /* Windows' performance counter usually runs at 10 MHz. ticks * 1e9 used
+     * to overflow 64 bits past 2^64 / 1e9 ticks, 31 minutes after boot. */
+    const uint64_t f = 10000000ULL;
+    const uint64_t wrap = 18446744073ULL; /* 2^64 / 1e9, rounded down */
+    CHECK(vitna_ticks_to_nanos(0, f) == 0, "no ticks, no time");
+    CHECK(vitna_ticks_to_nanos(3, f) == 300, "a 10 MHz tick is 100 ns");
+    CHECK(vitna_ticks_to_nanos(f, f) == 1000000000ULL, "10 million ticks are a second");
+    const uint64_t before = vitna_ticks_to_nanos(wrap - 1, f);
+    const uint64_t after = vitna_ticks_to_nanos(wrap + 1, f);
+    CHECK(before == 1844674407200ULL && after == 1844674407400ULL, "past the old wrap the clock runs on: %llu, then %llu",
+          (unsigned long long)before, (unsigned long long)after);
+    CHECK(vitna_ticks_to_nanos(86400ULL * f, f) == 86400ULL * 1000000000ULL, "a day of ticks at 10 MHz is exact");
+    const uint64_t g = 3000000000ULL;
+    CHECK(vitna_ticks_to_nanos(86400ULL * g + g / 2, g) == 86400500000000ULL, "and a day and half a second at 3 GHz");
+    const uint64_t t0 = vitna_time_nanos();
+    const uint64_t t1 = vitna_time_nanos();
+    CHECK(t1 >= t0, "the clock does not run backwards");
+}
+
 /* --- Sampling --- */
 
 static void test_sampler(void) {
@@ -739,6 +761,7 @@ int main(void) {
     test_rmsnorm_and_swiglu();
     test_quantized_gemv();
     test_sha256();
+    test_clock();
     test_sampler();
     printf("%d checks, %d failed (matvec path: %s, Unicode %s)\n", g_checks, g_failures, vitna_matvec_path(), vitna_uni_version());
     return g_failures == 0 ? 0 : 1;
