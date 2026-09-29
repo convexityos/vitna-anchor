@@ -13,11 +13,11 @@
 #include "server.h"
 
 static void print_usage(const char* prog) {
-    printf("vitna-anchor - Sovereign MoE inference daemon\n\n");
+    printf("vitna-anchor engine. No model runs yet: see the gate ladder in the README.\n\n");
     printf("Usage:\n");
-    printf("  %s serve [--port <port>] [--model <path>] [--ram-gb <gb>]\n", prog);
-    printf("  %s info  --model <path>\n", prog);
-    printf("  %s bench [--model <path>] [--iterations <n>]\n", prog);
+    printf("  %s serve [--port <port>]           HTTP server; generation endpoints answer 501\n", prog);
+    printf("  %s info  --model <file>            list the tensors in a .safetensors file\n", prog);
+    printf("  %s bench [--iterations <n>]        time the int4 matrix-vector kernel on synthetic data\n", prog);
 }
 
 static int cmd_info(const char* model_path) {
@@ -58,16 +58,17 @@ static int cmd_info(const char* model_path) {
 static int cmd_bench(const char* model_path, int iterations) {
     (void)model_path;
     vitna_simd_capabilities_t caps = vitna_detect_simd_capabilities();
-    printf("Running vitna-anchor streaming benchmark (%d iterations)...\n", iterations);
-    printf("Hardware acceleration: [AVX2: %s] [AVX512: %s] [ARM NEON: %s] [FMA: %s]\n",
-        caps.has_avx2 ? "active" : "no",
-        caps.has_avx512 ? "active" : "no",
-        caps.has_neon ? "active" : "no",
-        caps.has_fma ? "active" : "no"
+    printf("int4 matrix-vector kernel, 2048 x 2048, synthetic weights, %d iterations\n", iterations);
+    printf("CPU features detected: AVX2 %s, AVX-512F %s, NEON %s, FMA %s\n",
+        caps.has_avx2 ? "yes" : "no",
+        caps.has_avx512 ? "yes" : "no",
+        caps.has_neon ? "yes" : "no",
+        caps.has_fma ? "yes" : "no"
     );
     double t0 = vitna_time_ms();
 
-    /* Benchmark synthetic routing & GEMV int4 operations */
+    /* Time the int4 GEMV kernel on constant synthetic weights. This measures
+     * one kernel on this machine; it says nothing about running a model. */
     const size_t rows = 2048;
     const size_t cols = 2048;
     size_t packed_bytes = (rows * cols) / 2;
@@ -92,7 +93,7 @@ static int cmd_bench(const char* model_path, int iterations) {
     vitna_aligned_free(y);
 
     double t1 = vitna_time_ms();
-    printf("Completed %d int4 matrix-vector ops in %.2f ms (%.2f ops/sec)\n",
+    printf("%d int4 matrix-vector products in %.2f ms (%.2f per second)\n",
         iterations, t1 - t0, (iterations / ((t1 - t0) / 1000.0))
     );
     return 0;
