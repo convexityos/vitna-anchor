@@ -71,6 +71,11 @@ async function post(path, body) {
   return { status: res.status, headers: res.headers, text, json: res.headers.get("content-type")?.includes("json") ? JSON.parse(text) : null };
 }
 
+/** The three token counts of a usage object, without the cache detail, which depends on earlier requests. */
+function counts(u) {
+  return { prompt_tokens: u.prompt_tokens, completion_tokens: u.completion_tokens, total_tokens: u.total_tokens };
+}
+
 /** The data payloads of a server-sent event stream, [DONE] included. */
 function events(text) {
   return text
@@ -104,11 +109,13 @@ test("a greedy completion is the reference's greedy output, and usage counts its
     assert.equal(r.json.object, "text_completion");
     assert.equal(r.json.choices[0].text, p.greedy_text, p.id);
     assert.equal(r.json.choices[0].finish_reason, "length", p.id);
-    assert.deepEqual(r.json.usage, {
+    assert.deepEqual(counts(r.json.usage), {
       prompt_tokens: p.ids.length,
       completion_tokens: p.greedy_ids.length,
       total_tokens: p.ids.length + p.greedy_ids.length,
     }, p.id);
+    const cached = r.json.usage.prompt_tokens_details.cached_tokens;
+    assert.ok(Number.isInteger(cached) && cached < p.ids.length, "cached tokens are a part of the prompt, never all of it");
   }
   // A prompt given as token ids reads exactly those tokens.
   const p = fixture.prompts[0];
@@ -131,10 +138,10 @@ test("streaming sends the same text in deltas, and usage at the end", A3, async 
   const final = chunks.find((c) => c.choices.length && c.choices[0].finish_reason);
   assert.equal(chunks.map((c) => c.choices[0]?.text ?? "").join(""), whole.json.choices[0].text);
   assert.equal(final.choices[0].finish_reason, "length");
-  assert.deepEqual(final.usage, whole.json.usage);
+  assert.deepEqual(counts(final.usage), counts(whole.json.usage));
   const usageOnly = chunks.at(-1);
   assert.deepEqual(usageOnly.choices, []);
-  assert.deepEqual(usageOnly.usage, whole.json.usage);
+  assert.deepEqual(usageOnly.usage, final.usage);
   // No chunk splits a UTF-8 character: every delta decodes cleanly.
   for (const c of chunks) assert.ok(!(c.choices[0]?.text ?? "").includes("�"));
 
@@ -204,7 +211,7 @@ test("what it cannot do, it refuses by name", A3, async () => {
   const cases = [
     [{ n: 2 }, 400, "n"],
     [{ tools: [{ type: "function", function: { name: "f" } }] }, 400, "tools"],
-    [{ response_format: { type: "json_object" } }, 400, "response_format"],
+    [{ response_format: { type: "json_schema", json_schema: { name: "x", schema: { type: "object" } } } }, 400, "response_format"],
     [{ logprobs: true }, 400, "logprobs"],
     [{ presence_penalty: 0.5 }, 400, "presence_penalty"],
     [{ logit_bias: { 5: 10 } }, 400, "logit_bias"],

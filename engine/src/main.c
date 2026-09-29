@@ -29,7 +29,7 @@ static void print_usage(const char* prog) {
     printf("               [--logits-out <file>] [--stop-at-special]\n");
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
-    printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>]\n", prog);
+    printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
@@ -61,6 +61,7 @@ typedef struct {
     int iterations;
     uint16_t port;
     bool stop_at_special;
+    bool no_prefix_cache;
     vitna_sampling_t sampling;
 } args_t;
 
@@ -92,6 +93,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--seed")) a->sampling.seed = strtoull(v, NULL, 10);
         else if (strcmp(k, "--greedy") == 0) a->sampling.temperature = 0.0f;
         else if (strcmp(k, "--stop-at-special") == 0) a->stop_at_special = true;
+        else if (strcmp(k, "--no-prefix-cache") == 0) a->no_prefix_cache = true;
         else {
             fprintf(stderr, "Unknown or incomplete option: %s\n", k);
             return false;
@@ -510,6 +512,7 @@ static int cmd_serve(const args_t* a) {
     if (!api) {
         fprintf(stderr, "out of memory\n");
     } else {
+        vitna_api_set_prefix_cache(api, !a->no_prefix_cache);
         printf("Loaded %s: %zu layers, %zu-token context, matvec path %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_matvec_path());
         cfg.engine_ctx = api;
         rc = vitna_server_run(&cfg);

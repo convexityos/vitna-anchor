@@ -8,8 +8,10 @@
 #include "api.h"
 #include "compat.h"
 #include "json.h"
+#include "jsonpfx.h"
 #include "sampler.h"
 #include "strbuf.h"
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +30,8 @@ struct vitna_api {
     uint64_t counter;
     vitna_sampler_t sampler;
     float* row;
+    bool prefix_cache;
+    vitna_token_list_t cached;  /* the tokens whose keys and values are in the model's cache, in order */
 };
 
 typedef struct {
@@ -45,6 +49,7 @@ typedef struct {
     bool stream;
     bool include_usage;
     bool has_stream_options;
+    bool json;              /* response_format json_object: only a valid JSON object may be generated */
 } params_t;
 
 typedef struct {
@@ -249,8 +254,13 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
             }
         } else if (strcmp(k, "response_format") == 0) {
             const char* t = vitna_json_as_string(vitna_json_get(v, "type"));
-            if (!t || strcmp(t, "text") != 0) {
-                unsupported(e, k, "constrained decoding, which JSON output needs, is gate A6");
+            if (t && strcmp(t, "json_object") == 0) {
+                p->json = true;
+            } else if (t && strcmp(t, "json_schema") == 0) {
+                unsupported(e, k, "it constrains output to a JSON object (type json_object) but not yet to a schema");
+                return false;
+            } else if (!t || strcmp(t, "text") != 0) {
+                unsupported(e, k, "its types are text and json_object");
                 return false;
             }
         } else if (strcmp(k, "tools") == 0 || strcmp(k, "functions") == 0) {
@@ -418,8 +428,9 @@ typedef struct {
     size_t emitted;        /* bytes of text already streamed */
 } gen_t;
 
-static void usage_json(vitna_strbuf_t* sb, size_t prompt, size_t completion) {
-    vitna_sb_printf(sb, "{\"prompt_tokens\":%zu,\"completion_tokens\":%zu,\"total_tokens\":%zu}", prompt, completion, prompt + completion);
+static void usage_json(vitna_strbuf_t* sb, const vitna_api_result_t* r) {
+    vitna_sb_printf(sb, "{\"prompt_tokens\":%zu,\"completion_tokens\":%zu,\"total_tokens\":%zu,\"prompt_tokens_details\":{\"cached_tokens\":%zu}}",
+                    r->prompt_tokens, r->completion_tokens, r->prompt_tokens + r->completion_tokens, r->cached_tokens);
 }
 
 /* One server-sent event. text is a delta, finish the finish reason or NULL,
@@ -454,7 +465,7 @@ static void send_chunk(gen_t* g, const unsigned char* text, size_t n, const char
     }
     if (usage) {
         vitna_sb_puts(&sb, ",\"usage\":");
-        usage_json(&sb, usage->prompt_tokens, usage->completion_tokens);
+        usage_json(&sb, usage);
     }
     vitna_sb_puts(&sb, "}\n\n");
     sink_out(g->sink, sb.data, sb.len);
@@ -505,8 +516,27 @@ static void stream_ready(gen_t* g, bool final) {
     }
 }
 
+/* JSON mode: set the logit of every token that could not continue a JSON
+ * object to minus infinity, so neither greedy decoding nor sampling can
+ * choose it. Special tokens are masked too; the object's closing brace ends
+ * the reply instead. Returns false when no token is left. */
+static bool mask_json(vitna_api_t* api, const vitna_jsonpfx_t* state) {
+    uint8_t allowed[32];
+    vitna_jsonpfx_next_bytes(state, allowed);
+    size_t left = 0;
+    for (size_t id = 0; id < api->model->cfg.vocab; id++) {
+        size_t n = 0;
+        const unsigned char* b = vitna_tokenizer_token_bytes(api->tok, (int32_t)id, &n);
+        bool ok = b && n > 0 && !vitna_tokenizer_is_special(api->tok, (int32_t)id) &&
+                  (allowed[b[0] >> 3] & (1u << (b[0] & 7))) && vitna_jsonpfx_accepts(state, b, n);
+        if (ok) left++;
+        else api->row[id] = -INFINITY;
+    }
+    return left > 0;
+}
+
 static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const params_t* p, const vitna_token_list_t* ids, const char* ignored) {
-    vitna_api_result_t r = { 200, ids->count, 0 };
+    vitna_api_result_t r = { 200, ids->count, 0, 0 };
     vitna_llama_t* m = api->model;
     api_error_t e;
     if (ids->count == 0) {
@@ -551,14 +581,35 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
         if (p->chat) send_chunk(&g, NULL, 0, NULL, NULL, true, false);
     }
 
-    /* Prefill, then one token at a time. */
-    vitna_llama_reset(m);
+    /* Reuse the longest prefix the model's cache already holds from the
+     * previous request. The last prompt token is always fed again, for the
+     * logits that choose the first new token. */
+    size_t reuse = 0;
+    if (api->prefix_cache) {
+        size_t limit = ids->count - 1 < api->cached.count ? ids->count - 1 : api->cached.count;
+        while (reuse < limit && api->cached.ids[reuse] == ids->ids[reuse]) reuse++;
+    }
+    vitna_llama_truncate(m, reuse);
+    api->cached.count = reuse;
+    r.cached_tokens = reuse;
+
+    /* Prefill the rest, then one token at a time. */
     const char* finish = "length";
     bool ok = true;
-    for (size_t t = 0; t < ids->count && ok; t++) {
+    for (size_t t = reuse; t < ids->count && ok; t++) {
         ok = vitna_llama_step(m, ids->ids[t], t + 1 == ids->count ? api->row : NULL);
+        if (ok) vitna_token_list_push(&api->cached, ids->ids[t]);
     }
+    vitna_jsonpfx_t json_state;
+    vitna_jsonpfx_init(&json_state);
     for (size_t s = 0; ok && s < max_new && !sink->failed; s++) {
+        if (p->json && !mask_json(api, &json_state)) {
+            /* No token can continue the object. The pinned model's vocabulary
+             * never gets here: the 21 bytes it lacks are control characters,
+             * which JSON escapes, and UTF-8 lead bytes a string can do without. */
+            finish = "stop";
+            break;
+        }
         int32_t next = vitna_sample(&api->sampler, api->row, &cfg);
         r.completion_tokens++;
         if (vitna_tokenizer_is_special(api->tok, next)) {
@@ -568,15 +619,25 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
         size_t n = 0;
         const unsigned char* bytes = vitna_tokenizer_token_bytes(api->tok, next, &n);
         size_t before = g.text.len;
-        if (bytes) vitna_sb_append(&g.text, bytes, n);
+        if (bytes) {
+            vitna_sb_append(&g.text, bytes, n);
+            if (p->json) vitna_jsonpfx_feed(&json_state, bytes, n);
+        }
         long long cut = find_stop(p, g.text.data ? g.text.data : "", g.text.len, before);
         if (cut >= 0) {
             g.text.len = (size_t)cut;
             finish = "stop";
             break;
         }
+        if (p->json && vitna_jsonpfx_complete(&json_state)) {
+            finish = "stop"; /* the object has closed, and nothing may follow it */
+            break;
+        }
         if (p->stream) stream_ready(&g, false);
-        if (s + 1 < max_new && !vitna_llama_step(m, next, api->row)) break;
+        if (s + 1 < max_new) {
+            if (!vitna_llama_step(m, next, api->row)) break;
+            vitna_token_list_push(&api->cached, next);
+        }
     }
 
     if (!g.text.ok) {
@@ -604,7 +665,7 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
             vitna_sb_json_string(&b, (const unsigned char*)(g.text.data ? g.text.data : ""), g.text.len);
         }
         vitna_sb_printf(&b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", finish);
-        usage_json(&b, r.prompt_tokens, r.completion_tokens);
+        usage_json(&b, &r);
         vitna_sb_puts(&b, "}");
         respond(sink, 200, headers.data, b.data, b.len);
         vitna_sb_free(&b);
@@ -638,19 +699,27 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
         return NULL;
     }
     memcpy(api->model_id, model_id, n);
+    api->prefix_cache = true;
+    /* The cache starts empty, and api->cached says so. */
+    vitna_llama_reset(model);
     return api;
+}
+
+void vitna_api_set_prefix_cache(vitna_api_t* api, bool on) {
+    api->prefix_cache = on;
 }
 
 void vitna_api_free(vitna_api_t* api) {
     if (!api) return;
     vitna_sampler_free(&api->sampler);
+    vitna_token_list_free(&api->cached);
     free(api->row);
     free(api->model_id);
     free(api);
 }
 
 static vitna_api_result_t completion_route(vitna_api_t* api, bool chat, const char* body, size_t body_len, vitna_sink_t* sink) {
-    vitna_api_result_t r = { 200, 0, 0 };
+    vitna_api_result_t r = { 200, 0, 0, 0 };
     api_error_t e;
     char jerr[160];
     vitna_json_doc_t* doc = vitna_json_parse(body ? body : "", body_len, jerr, sizeof(jerr));
@@ -703,7 +772,7 @@ done:
 
 vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const char* path,
                                     const char* body, size_t body_len, vitna_sink_t* sink) {
-    vitna_api_result_t r = { 200, 0, 0 };
+    vitna_api_result_t r = { 200, 0, 0, 0 };
     api_error_t e;
     char route[256];
     size_t plen = strcspn(path, "?");

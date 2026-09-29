@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -21,7 +21,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Passed, [#7](https://github.com/convexityos/vitna-anchor/pull/7). CI checks it on every push |
 | A4, one GPU | The A2 comparison passes on CUDA | Not started |
 | A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Not started |
-| A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Not started |
+| A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | This change: reuse of the previous request's cache, and JSON object mode. JSON Schema is not constrained yet |
 
 ## What is in the repository
 
@@ -42,8 +42,10 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | Top-k softmax routing over experts | `engine/src/router.c` | Untested |
 | Expert store and asynchronous reads | `engine/src/expert_store.c`, `engine/src/async_io.c` | Untested. Shards are opened with direct I/O off |
 | Prefix tree over token ids | `engine/src/radix_kv.c` | Untested. It holds no key-value tensors |
-| JSON Schema to pushdown automaton compiler | `runtime/grammar.mjs`, `engine/src/grammar.c` | The JavaScript half is tested. Neither masks logits yet |
+| JSON Schema to pushdown automaton compiler | `runtime/grammar.mjs` | Tested. Used by the Node.js command line's `schema` command, not by the engine. Its C counterpart, `grammar.c`, rejected every object with a key (`{"key": 1}` at byte 2) and accepted `{abc}`; A6 deleted it |
 | OpenAI-compatible HTTP API: chat and text completions, streamed or not, usage from tokens | `engine/src/api.c`, `engine/src/server.c` | A greedy completion through it equals the reference's greedy output, with prompt and completion tokens counted exactly, on all six reference prompts. Streaming, stop sequences, seeds, refusals and a client hanging up mid-stream are tested |
+| Prefix reuse: a request keeps the key-value cache for the tokens it shares with the one before | `engine/src/api.c`, `engine/src/model.c` | Tested: a repeated prompt reuses all but its last token and still returns the reference's greedy output, and replies equal those of a server that reuses nothing, greedy or sampled |
+| JSON mode: every token that could not continue a JSON object has its logit set to minus infinity before each choice | `engine/src/jsonpfx.c`, `engine/src/api.c` | The check is tested against the engine's JSON parser on 3,000 mutated objects, and on cases worked by hand. Replies parse as JSON objects, or are valid starts of one when `max_tokens` cuts them short |
 | The Node.js command line's server | `runtime/anchor-run.mjs` | Tested: it serves no model, answers generation with 501, and names the engine's server |
 | SafeTensors and GGUF v2/v3 header parsers | `runtime/ingest.mjs` | Tested on synthetic files |
 | Checkpoint rewrite with every tensor at a 4096-byte offset | `runtime/ingest.mjs` | Tested on synthetic files |
@@ -106,10 +108,12 @@ curl http://127.0.0.1:8765/v1/chat/completions -H "content-type: application/jso
 Any OpenAI client can use `http://127.0.0.1:8765/v1` as its base URL. The model is served under its directory's name unless `--model-id` gives another, and a request naming a different model gets a 404.
 
 - **Endpoints.** `GET /v1/models`, `GET /v1/health`, `POST /v1/chat/completions` and `POST /v1/completions`, each streamed as server-sent events with `"stream": true`. A completion prompt may be a string or an array of token ids.
-- **Usage.** `prompt_tokens` counts the tokens the model read, after the chat format is applied. `completion_tokens` counts the tokens it generated, including the end-of-text or other special token it stopped on. A streamed response carries usage on its final chunk, and also sends OpenAI's separate usage chunk when `stream_options.include_usage` is true.
+- **Usage.** `prompt_tokens` counts the tokens the model read, after the chat format is applied. `completion_tokens` counts the tokens it generated, including the end-of-text or other special token it stopped on. `prompt_tokens_details.cached_tokens` counts the prompt tokens whose keys and values were reused from the request before, rather than computed again. A streamed response carries usage on its final chunk, and also sends OpenAI's separate usage chunk when `stream_options.include_usage` is true.
 - **Chat format.** Messages are formatted as ChatML (`<|im_start|>role`), the format the SmolLM2 family's instruct models use. The pinned model is the base model, which was not trained on it, so its chat replies are poor. Generation stops at any special token.
-- **Parameters.** `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `top_k`, `seed`, `stop` (up to four), `stream` and `stream_options`. The seed used is returned in an `x-vitna-seed` header, so a sampled reply can be reproduced. Anything that would change the output and is not implemented is refused with a 400 naming it: `n` above 1, tools, JSON output (`response_format`, which needs gate A6), log probabilities, penalties and logit bias. A field the server does not know is ignored and named in an `x-vitna-ignored` header.
-- **Limits.** One request at a time, each starting with an empty key-value cache: reusing a prefix is gate A6. The context is the model's maximum, at most 4096 tokens, or `--ctx`. A request that would not fit is refused, not cut short. There is no authentication, so the server listens on 127.0.0.1 unless `--host` says otherwise, and warns if it does.
+- **Parameters.** `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `top_k`, `seed`, `stop` (up to four), `stream`, `stream_options` and `response_format`. The seed used is returned in an `x-vitna-seed` header, so a sampled reply can be reproduced. Anything that would change the output and is not implemented is refused with a 400 naming it: `n` above 1, tools, a JSON Schema (`response_format` of type `json_schema`), log probabilities, penalties and logit bias. A field the server does not know is ignored and named in an `x-vitna-ignored` header.
+- **JSON mode.** With `"response_format": {"type": "json_object"}`, before each token is chosen the logit of every token that could not continue a JSON object is set to minus infinity: special tokens, and any token whose bytes would break the object. Strings must be valid UTF-8, and a run of whitespace is capped at 16 characters so the model cannot pad forever. Generation stops when the object closes. A reply cut short, by `max_tokens` (`finish_reason` `length`) or by a stop sequence, is the valid start of an object. The model is not told to write JSON, so the prompt should ask for it.
+- **Prefix reuse.** The server keeps the key-value cache of the last request and reuses it for the longest prefix the next prompt shares with it, recomputing at least the last prompt token. A conversation sent back with one more turn reuses its history. Reuse only skips work: a reply, and its usage apart from `cached_tokens`, is what a server started with `--no-prefix-cache`, which turns reuse off, returns for the same request.
+- **Limits.** One request at a time. The cache holds one sequence, so two clients taking turns evict each other's prefix. The context is the model's maximum, at most 4096 tokens, or `--ctx`. A request that would not fit is refused, not cut short. There is no authentication, so the server listens on 127.0.0.1 unless `--host` says otherwise, and warns if it does.
 
 ## The Node.js command line
 
@@ -136,7 +140,7 @@ node bin/vitna-anchor.mjs --help
 npm test
 ```
 
-`tests/engine-server.test.mjs`, `tests/reference.test.mjs` and `tests/serving.test.mjs` run the built engine when they find one, and the last two also need the model files. Without them those tests are skipped, and say why. CI builds the engine and runs the unit tests on Linux, macOS and Windows, fetches the model, and requires all three engine tests to pass.
+`tests/engine-server.test.mjs`, `tests/reference.test.mjs`, `tests/serving.test.mjs` and `tests/reuse-and-json.test.mjs` run the built engine when they find one, and the last three also need the model files. Without them those tests are skipped, and say why. CI builds the engine and runs the unit tests on Linux, macOS and Windows, fetches the model, and requires all four engine tests to pass.
 
 ## Measurements
 

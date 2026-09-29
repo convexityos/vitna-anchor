@@ -207,8 +207,8 @@ static void handle_client(socket_t client, vitna_api_t* api) {
         size_t n = strcspn(req.path, "?");
         snprintf(route, sizeof(route), "%.*s", (int)(n < 120 ? n : 120), req.path);
         if (r.prompt_tokens || r.completion_tokens) {
-            fprintf(stderr, "%s %s %d prompt_tokens=%zu completion_tokens=%zu%s\n", req.method, route, r.status,
-                    r.prompt_tokens, r.completion_tokens, sink.failed ? " (the client went away)" : "");
+            fprintf(stderr, "%s %s %d prompt_tokens=%zu cached_tokens=%zu completion_tokens=%zu%s\n", req.method, route, r.status,
+                    r.prompt_tokens, r.cached_tokens, r.completion_tokens, sink.failed ? " (the client went away)" : "");
         } else {
             fprintf(stderr, "%s %s %d\n", req.method, route, r.status);
         }

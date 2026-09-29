@@ -41,12 +41,22 @@ typedef struct {
     int status;
     size_t prompt_tokens;
     size_t completion_tokens;
+    size_t cached_tokens;   /* prompt tokens whose keys and values were reused, not recomputed */
 } vitna_api_result_t;
 
 /** Serve model under model_id. The API keeps the pointers; it frees neither the model nor the tokenizer. */
 vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok, const char* model_id);
 
 void vitna_api_free(vitna_api_t* api);
+
+/**
+ * Whether a request may reuse the key-value cache the previous one left
+ * (on by default). The longest prefix of tokens the two share is kept
+ * rather than recomputed, and reported as usage.prompt_tokens_details
+ * .cached_tokens. Reuse cannot change a response: the keys and values it
+ * keeps are the ones the same tokens would produce again.
+ */
+void vitna_api_set_prefix_cache(vitna_api_t* api, bool on);
 
 /**
  * Answer one request with a complete HTTP response through sink. api may be

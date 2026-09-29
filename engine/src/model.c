@@ -233,6 +233,10 @@ void vitna_llama_reset(vitna_llama_t* m) {
     m->n_past = 0;
 }
 
+void vitna_llama_truncate(vitna_llama_t* m, size_t n) {
+    if (n < m->n_past) m->n_past = n;
+}
+
 bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
     if (token < 0 || (size_t)token >= c->vocab || m->n_past >= m->ctx) return false;

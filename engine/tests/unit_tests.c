@@ -18,6 +18,7 @@
 #include "api.h"
 #include "crypto.h"
 #include "json.h"
+#include "jsonpfx.h"
 #include "kernels.h"
 #include "kv_cache.h"
 #include "ops.h"
@@ -539,8 +540,195 @@ static void test_api_helpers(void) {
     free(out);
 }
 
+/* --- The JSON-object prefix check behind JSON mode --- */
+
+/* Whether every byte of s is accepted, and whether the object is then complete. */
+static void pfx_run(const char* s, size_t n, bool* all, bool* complete) {
+    vitna_jsonpfx_t p;
+    vitna_jsonpfx_init(&p);
+    *all = vitna_jsonpfx_feed(&p, (const unsigned char*)s, n);
+    *complete = *all && vitna_jsonpfx_complete(&p);
+}
+
+/* A random JSON value into sb, nested at most depth deep, with some whitespace. */
+static void rand_ws(vitna_strbuf_t* sb) {
+    static const char* ws[] = { "", "", "", " ", "\n", "  ", "\t", "\r\n" };
+    vitna_sb_puts(sb, ws[rnd_u32() % 8]);
+}
+
+static void rand_string(vitna_strbuf_t* sb) {
+    static const char* parts[] = { "a", "key", " ", "\\\"", "\\\\", "\\n", "\\u00e9", "\\uD83D\\uDE80", "\xC3\xA9", "\xE6\x9D\xB1", "\xF0\x9F\x9A\x80", "}", "{", "]", ",", ":", "1" };
+    vitna_sb_puts(sb, "\"");
+    size_t n = rnd_u32() % 5;
+    for (size_t i = 0; i < n; i++) vitna_sb_puts(sb, parts[rnd_u32() % 17]);
+    vitna_sb_puts(sb, "\"");
+}
+
+static void rand_value(vitna_strbuf_t* sb, int depth, bool object) {
+    int kind = object ? 0 : (int)(rnd_u32() % (depth > 0 ? 7 : 5));
+    static const char* numbers[] = { "0", "-0", "12", "-7.25", "3e8", "1E-5", "0.5e+2", "-10.0" };
+    static const char* literals[] = { "true", "false", "null" };
+    switch (kind) {
+        case 0: case 5: {
+            vitna_sb_puts(sb, "{");
+            size_t n = rnd_u32() % 4;
+            for (size_t i = 0; i < n; i++) {
+                if (i) vitna_sb_puts(sb, ",");
+                rand_ws(sb);
+                rand_string(sb);
+                rand_ws(sb);
+                vitna_sb_puts(sb, ":");
+                rand_ws(sb);
+                rand_value(sb, depth - 1, false);
+                rand_ws(sb);
+            }
+            if (n == 0) rand_ws(sb);
+            vitna_sb_puts(sb, "}");
+            break;
+        }
+        case 6: {
+            vitna_sb_puts(sb, "[");
+            size_t n = rnd_u32() % 4;
+            for (size_t i = 0; i < n; i++) {
+                if (i) vitna_sb_puts(sb, ",");
+                rand_ws(sb);
+                rand_value(sb, depth - 1, false);
+                rand_ws(sb);
+            }
+            vitna_sb_puts(sb, "]");
+            break;
+        }
+        case 1: rand_string(sb); break;
+        case 2: vitna_sb_puts(sb, numbers[rnd_u32() % 8]); break;
+        default: vitna_sb_puts(sb, literals[rnd_u32() % 3]); break;
+    }
+}
+
+static void test_jsonpfx(void) {
+    bool all, complete;
+    struct { const char* s; bool all; bool complete; } cases[] = {
+        { "{}", true, true },
+        { " {\"a\": 1}", true, true },
+        { "{\"key\": 1}", true, true },            /* the old grammar.c rejected this at byte 2 */
+        { "{\"a\": null, \"b\": [true, false, -0.5e3, \"}\"]}", true, true },
+        { "{\"a\": \"}\"}", true, true },           /* a brace inside a string is text */
+        { "{\"a\": {\"b\": [[], {}]}}", true, true },
+        { "{\"a\": 1", true, false },               /* a prefix: accepted, not complete */
+        { "{\"a\": tr", true, false },
+        { "{\"a\": \"\\u00", true, false },
+        { "{\"a\": 01}", false, false },           /* no leading zeros */
+        { "{\"a\": tru}", false, false },
+        { "{abc}", false, false },                 /* the old grammar.c accepted this */
+        { "{\"a\" 1}", false, false },
+        { "{\"a\": 1,}", false, false },           /* no trailing comma */
+        { "[1, 2]", false, false },                /* the top level must be an object */
+        { "{\"a\": \"x\ny\"}", false, false },     /* a raw newline in a string */
+        { "{\"a\": \"\\q\"}", false, false },      /* not an escape */
+        { "{\"a\": \"\xC0\xAF\"}", false, false }, /* overlong UTF-8 */
+        { "{\"a\": \"\xED\xA0\x80\"}", false, false }, /* an encoded surrogate */
+        { "{} x", false, false },                  /* nothing but whitespace after the object */
+        { "{}   ", true, true },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        pfx_run(cases[i].s, strlen(cases[i].s), &all, &complete);
+        CHECK(all == cases[i].all && complete == cases[i].complete, "jsonpfx on %s: accepted %d complete %d", cases[i].s, all, complete);
+    }
+
+    /* A run of whitespace is capped, so padding cannot go on forever. */
+    char pad[64] = "{";
+    memset(pad + 1, ' ', VITNA_JSONPFX_MAX_WS + 1);
+    pfx_run(pad, 1 + VITNA_JSONPFX_MAX_WS, &all, &complete);
+    CHECK(all, "whitespace up to the cap is accepted");
+    pfx_run(pad, 2 + VITNA_JSONPFX_MAX_WS, &all, &complete);
+    CHECK(!all, "whitespace past the cap is refused");
+
+    /* The bytes allowed after `{"a":` are exactly those that can start a value, or whitespace. */
+    vitna_jsonpfx_t p;
+    vitna_jsonpfx_init(&p);
+    vitna_jsonpfx_feed(&p, (const unsigned char*)"{\"a\":", 5);
+    uint8_t allowed[32];
+    vitna_jsonpfx_next_bytes(&p, allowed);
+    const char* starts = " \t\n\r{[\"-0123456789tfn";
+    int count = 0;
+    for (int b = 0; b < 256; b++) count += (allowed[b >> 3] >> (b & 7)) & 1;
+    bool all_starts = true;
+    for (const char* c = starts; *c; c++) all_starts = all_starts && ((allowed[(unsigned char)*c >> 3] >> (*c & 7)) & 1);
+    CHECK(all_starts && count == (int)strlen(starts), "next bytes after a colon: %d allowed", count);
+
+    /* Random objects: every one is accepted byte by byte, and complete only at its end. */
+    int bad = 0;
+    for (int i = 0; i < 400; i++) {
+        vitna_strbuf_t sb;
+        vitna_sb_init(&sb);
+        rand_value(&sb, 4, true);
+        vitna_jsonpfx_t q;
+        vitna_jsonpfx_init(&q);
+        for (size_t k = 0; k < sb.len; k++) {
+            if (!vitna_jsonpfx_feed(&q, (const unsigned char*)sb.data + k, 1) || (vitna_jsonpfx_complete(&q) != (k + 1 == sb.len))) {
+                bad++;
+                break;
+            }
+        }
+        vitna_sb_free(&sb);
+    }
+    CHECK(bad == 0, "400 random objects accepted byte by byte, complete exactly at the end (%d failed)", bad);
+
+    /* Random objects mutated by one ASCII byte: the check agrees with the
+     * engine's JSON parser about which are complete objects. */
+    int disagree = 0;
+    static const char alphabet[] = "{}[]\":,-0123456789.eEtrufalsn \\u";
+    for (int i = 0; i < 3000; i++) {
+        vitna_strbuf_t sb;
+        vitna_sb_init(&sb);
+        rand_value(&sb, 3, true);
+        size_t at = rnd_u32() % (sb.len + 1);
+        char c = alphabet[rnd_u32() % (sizeof(alphabet) - 1)];
+        int op = (int)(rnd_u32() % 3);
+        vitna_strbuf_t m;
+        vitna_sb_init(&m);
+        vitna_sb_append(&m, sb.data, at);
+        if (op != 2) vitna_sb_append(&m, &c, 1);                       /* insert, or replace */
+        size_t skip = (op == 0) ? at : at + 1;                          /* op 1 and 2 drop the byte at `at` */
+        if (skip < sb.len) vitna_sb_append(&m, sb.data + skip, sb.len - skip);
+        pfx_run(m.data ? m.data : "", m.len, &all, &complete);
+        char err[160];
+        vitna_json_doc_t* doc = vitna_json_parse(m.data ? m.data : "", m.len, err, sizeof(err));
+        bool parser_object = doc && vitna_json_root(doc)->type == VITNA_JSON_OBJECT;
+        vitna_json_free(doc);
+        /* A mutation can cut a multi-byte character in two. JSON text must
+         * be UTF-8 (RFC 8259 section 8.1), and the prefix check holds to
+         * that, while the engine's parser copies string bytes unchecked; so
+         * where the text is not UTF-8 the check must refuse it, whatever the
+         * parser says. */
+        bool utf8 = vitna_utf8_complete_prefix((const unsigned char*)m.data, m.len) == m.len;
+        for (size_t k = 0; utf8 && k < m.len;) {
+            uint32_t cp;
+            size_t l = vitna_utf8_decode((const unsigned char*)m.data + k, m.len - k, &cp);
+            utf8 = cp < 0x110000;
+            k += l;
+        }
+        bool expected = utf8 && parser_object;
+        if (complete != expected) {
+            if (disagree < 3) {
+                fprintf(stderr, "  disagreement (check %d, parser %d, utf8 %d) on:", complete, parser_object, utf8);
+                for (size_t k = 0; k < m.len; k++) {
+                    unsigned char ch = (unsigned char)m.data[k];
+                    if (ch >= 0x20 && ch < 0x7F) fputc(ch, stderr);
+                    else fprintf(stderr, "\\x%02X", ch);
+                }
+                fputc('\n', stderr);
+            }
+            disagree++;
+        }
+        vitna_sb_free(&sb);
+        vitna_sb_free(&m);
+    }
+    CHECK(disagree == 0, "3000 mutated objects: the prefix check and the parser agree (%d did not)", disagree);
+}
+
 int main(void) {
     test_api_helpers();
+    test_jsonpfx();
     test_json();
     test_safetensors();
     test_unicode();
