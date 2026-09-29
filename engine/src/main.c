@@ -30,7 +30,7 @@ static void print_usage(const char* prog) {
     printf("Usage:\n");
     printf("  %s run      --model <dir> --prompt <text> [--max-new <n>] [sampling]\n", prog);
     printf("  %s generate --model <dir> (--prompt <text> | --ids <a,b,...>) [--max-new <n>] [sampling]\n", prog);
-    printf("               [--logits-out <file>] [--stop-at-special]\n");
+    printf("               [--logits-out <file>] [--stop-at-special] [--timing]\n");
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
@@ -42,7 +42,8 @@ static void print_usage(const char* prog) {
     printf("engine built with the CUDA path. Asked for a device it cannot use, the engine says why and stops.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
-    printf("          step's logits as float32, little-endian, steps x vocab\n");
+    printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
+    printf("          long the prompt and the new tokens took, measured on this machine\n");
     printf("logits    writes the logits at every position of the prompt, positions x vocab, float32 LE\n");
     printf("tokenize  prints the ids of --text as a JSON array; without --text it reads one JSON string\n");
     printf("          per line from stdin and prints one array per line\n");
@@ -69,6 +70,7 @@ typedef struct {
     uint16_t port;
     bool stop_at_special;
     bool no_prefix_cache;
+    bool timing;
     vitna_sampling_t sampling;
 } args_t;
 
@@ -102,6 +104,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (strcmp(k, "--greedy") == 0) a->sampling.temperature = 0.0f;
         else if (strcmp(k, "--stop-at-special") == 0) a->stop_at_special = true;
         else if (strcmp(k, "--no-prefix-cache") == 0) a->no_prefix_cache = true;
+        else if (strcmp(k, "--timing") == 0) a->timing = true;
         else {
             fprintf(stderr, "Unknown or incomplete option: %s\n", k);
             return false;
@@ -305,12 +308,15 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         return 1;
     }
     int rc = 0;
+    const double t_prompt = vitna_time_ms();
     for (size_t t = 0; t < prompt->count && rc == 0; t++) {
         if (!vitna_llama_step(m, prompt->ids[t], t + 1 == prompt->count ? row : NULL)) {
             fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", prompt->ids[t], t);
             rc = 1;
         }
     }
+    const double t_first = vitna_time_ms();
+    double t_after_first = t_first;
     for (size_t s = 0; s < a->max_new && rc == 0; s++) {
         if (logits_out && fwrite(row, sizeof(float), V, logits_out) != V) {
             fprintf(stderr, "cannot write the logits\n");
@@ -318,6 +324,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
             break;
         }
         int32_t next = vitna_sample(&sampler, row, &a->sampling);
+        if (s == 0) t_after_first = vitna_time_ms();
         if (!vitna_token_list_push(out, next)) { rc = 1; break; }
         if (on_token) on_token(tok, next);
         if (a->stop_at_special && tok && vitna_tokenizer_is_special(tok, next)) break;
@@ -325,6 +332,12 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
             fprintf(stderr, "the key-value cache is full at %zu positions; raise --ctx\n", m->ctx);
             rc = 1;
         }
+    }
+    /* Each token after the first new one cost one forward step and one choice. */
+    if (a->timing && rc == 0 && out->count > 1) {
+        const double ms = vitna_time_ms() - t_after_first;
+        fprintf(stderr, "timing: %zu prompt tokens in %.3f ms; %zu tokens after the first new one in %.3f ms, %.4f ms each\n",
+                prompt->count, t_first - t_prompt, out->count - 1, ms, ms / (double)(out->count - 1));
     }
     vitna_sampler_free(&sampler);
     free(row);
