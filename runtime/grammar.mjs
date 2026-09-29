@@ -73,6 +73,9 @@ export function createGrammarParser(compiledPda) {
   const stack = [];
   const populatedKeys = new Set();
   let currentKey = "";
+  // Written by the scanner below and read by no transition, so the automaton
+  // cannot yet tell a brace inside a string from one that closes an object.
+  // Kept as the marker of that gap rather than deleted to quiet a linter.
   let inQuote = false;
 
   return {
@@ -95,7 +98,9 @@ export function createGrammarParser(compiledPda) {
           }
           return true;
         }
-      } catch {}
+      } catch {
+        // Text that does not parse as JSON is not an accepted object.
+      }
       return false;
     },
     feedToken(token) {
@@ -123,7 +128,7 @@ export function createGrammarParser(compiledPda) {
             currentState = stack.length === 0 ? PDA_STATES.TERMINAL : PDA_STATES.EXPECT_COMMA_OR_CLOSE;
           } else if (!/\s/.test(char)) {
             currentState = PDA_STATES.REJECT;
-            return { accepted: false, state: currentState, error: `Expected '\"' or '}', got '${char}'` };
+            return { accepted: false, state: currentState, error: `Expected '"' or '}', got '${char}'` };
           }
         } else if (currentState === PDA_STATES.IN_KEY) {
           if (char === '"') {

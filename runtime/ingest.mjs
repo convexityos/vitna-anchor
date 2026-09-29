@@ -1219,7 +1219,7 @@ export async function runModelPull(target, options = {}) {
   }
 
   mkdirSync(outDir, { recursive: true });
-  const localSourcePath = join(outDir, `${repoId.replace(/[\/\\]/g, "_")}.safetensors`);
+  const localSourcePath = join(outDir, `${repoId.replace(/[/\\]/g, "_")}.safetensors`);
 
   console.log(`  Downloading checkpoint from HuggingFace...`);
   try {
