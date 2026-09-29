@@ -2,9 +2,8 @@
 //
 // The first tests need nothing but the repository: the fixture is the one its
 // pin and inputs describe, and the comparison catches a wrong answer. The last
-// three run the engine against the fixture. They need the model files
-// (node scripts/fetch-model.mjs) and a built engine, and they stay "todo"
-// until gate A2 gives the engine a forward pass.
+// three are gate A2: they run the engine against the fixture, and need the
+// model files (node scripts/fetch-model.mjs) and a built engine.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -135,7 +134,14 @@ const engine = [
 ].filter(Boolean).find((p) => existsSync(p));
 const modelDir = process.env.ANCHOR_MODEL_DIR || here("../models/smollm2-135m/");
 
-const A2 = { todo: "gate A2: the engine has no forward pass yet" };
+// Gate A2. Without a built engine or the model files these are skipped, with
+// the reason, unless VITNA_REQUIRE_REFERENCE=1 (as in CI), where they fail.
+const missing = !engine
+  ? "no built engine found"
+  : !existsSync(join(modelDir, "model.safetensors"))
+    ? `no model in ${modelDir}; run node scripts/fetch-model.mjs`
+    : null;
+const A2 = { skip: process.env.VITNA_REQUIRE_REFERENCE === "1" ? false : missing ?? false };
 
 function runEngine(args, input) {
   assert.ok(engine, "no built engine found");
@@ -150,32 +156,41 @@ function readF32(path) {
   return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4).slice();
 }
 
-test("the engine's tokenizer gives the reference's ids", A2, () => {
+test("the engine's tokenizer gives the ids of the model's own tokenizer.json", A2, (t) => {
   const cases = [...fixture.corpus, ...fixture.prompts];
   const lines = runEngine(["tokenize", "--model", modelDir], cases.map((c) => JSON.stringify(c.text)).join("\n") + "\n")
     .trim()
     .split("\n")
     .map((l) => JSON.parse(l));
+  assert.equal(lines.length, cases.length);
   const byText = new Map(cases.map((c, i) => [c.text, lines[i]]));
-  assert.deepEqual(compareTokenization(fixture, (t) => byText.get(t)), []);
+  assert.deepEqual(compareTokenization(fixture, (text) => byText.get(text)), []);
+  t.diagnostic(`${cases.length} of ${cases.length} strings tokenized exactly`);
 });
 
-test("the engine's logits match the reference within the stated tolerance", A2, () => {
+test("the engine's logits match the reference within the stated tolerance", A2, (t) => {
   const dir = mkdtempSync(join(tmpdir(), "vitna-logits-"));
+  let worst = 0;
+  let worstLse = 0;
   try {
     for (const p of fixture.prompts) {
       const out = join(dir, `${p.id}.f32`);
       runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", out]);
-      const { failures } = comparePrefill(fixture, p, readF32(out));
-      assert.deepEqual(failures.slice(0, 10), [], p.id);
+      const result = comparePrefill(fixture, p, readF32(out));
+      assert.deepEqual(result.failures.slice(0, 10), [], p.id);
+      worst = Math.max(worst, result.worst.logit);
+      worstLse = Math.max(worstLse, result.worst.lse);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  t.diagnostic(`largest |engine - reference|: logits ${worst.toExponential(2)}, logsumexp ${worstLse.toExponential(2)}; tolerance ${LOGIT_ATOL}`);
 });
 
-test("the engine's greedy decoding matches the reference token for token", A2, () => {
+test("the engine's greedy decoding matches the reference token for token", A2, (t) => {
   const dir = mkdtempSync(join(tmpdir(), "vitna-greedy-"));
+  let worst = 0;
+  let tokens = 0;
   try {
     for (const p of fixture.prompts) {
       const out = join(dir, `${p.id}.f32`);
@@ -184,10 +199,13 @@ test("the engine's greedy decoding matches the reference token for token", A2, (
         "--max-new", String(p.greedy_ids.length), "--greedy", "--logits-out", out,
       ]);
       const { ids } = JSON.parse(stdout);
-      const { failures } = compareGreedy(fixture, p, ids, readF32(out));
-      assert.deepEqual(failures.slice(0, 10), [], p.id);
+      const result = compareGreedy(fixture, p, ids, readF32(out));
+      assert.deepEqual(result.failures.slice(0, 10), [], p.id);
+      worst = Math.max(worst, result.worst.logit);
+      tokens += ids.length;
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  t.diagnostic(`${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${worst.toExponential(2)}`);
 });

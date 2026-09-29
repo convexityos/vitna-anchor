@@ -122,7 +122,6 @@ void vitna_sha256_update(vitna_sha256_ctx_t *ctx, const void *data, size_t len) 
 void vitna_sha256_final(vitna_sha256_ctx_t *ctx, uint8_t digest[32]) {
     if (!ctx || !digest) return;
     uint8_t pad = 0x80;
-    size_t buffer_index = (size_t)(ctx->count & 0x3f);
     uint64_t total_bits = ctx->count * 8;
     int i;
 

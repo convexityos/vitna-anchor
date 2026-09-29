@@ -40,7 +40,9 @@ jobs:
         run: npm test
 
   build-engine:
-    name: Build C11 Engine (${{ matrix.os }})
+    # Linux and Windows run x86-64 (the AVX2 path where the runner has it),
+    # macOS runs arm64 (the NEON path).
+    name: Engine and gate A2 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -52,25 +54,40 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24.x
-      - name: Build Engine with Make (Linux / macOS)
+      - name: Build the engine and its unit tests with Make (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
           cd engine
-          make
+          make all vitna-anchor-tests
+      - name: Run the unit tests (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: ./engine/vitna-anchor-tests
       - name: Run the int4 kernel microbenchmark (Linux / macOS)
         if: runner.os != 'Windows'
-        run: |
-          ./engine/vitna-anchor bench --iterations 5
-      - name: Build Engine with CMake (Windows)
+        run: ./engine/vitna-anchor bench --iterations 5
+      - name: Build the engine and its unit tests with CMake (Windows)
         if: runner.os == 'Windows'
         run: |
           cmake -B engine/build -S engine
           cmake --build engine/build --config Release
+      - name: Run the unit tests (Windows)
+        if: runner.os == 'Windows'
+        run: .\engine\build\Release\vitna-anchor-tests.exe
       - name: Run the int4 kernel microbenchmark (Windows)
         if: runner.os == 'Windows'
-        run: |
-          .\engine\build\Release\vitna-anchor.exe bench --iterations 5
+        run: .\engine\build\Release\vitna-anchor.exe bench --iterations 5
       - name: Test the engine's server
         env:
           VITNA_REQUIRE_ENGINE: "1"
         run: node --test tests/engine-server.test.mjs
+      - name: Cache the pinned model files
+        uses: actions/cache@v6
+        with:
+          path: models/smollm2-135m
+          key: model-${{ hashFiles('reference/smollm2-135m/model.json') }}
+      - name: Fetch the model at the pinned revision, checking every file's SHA-256
+        run: node scripts/fetch-model.mjs
+      - name: Gate A2, the engine against the reference
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/reference.test.mjs

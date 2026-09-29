@@ -53,11 +53,11 @@ async function call(port, method, path, body) {
   return { status: res.status, headers: res.headers, body: await res.json() };
 }
 
-test("the engine's server states that no model runs, and answers generation with 501", { skip: !engine && !required && "no built engine found" }, async () => {
+test("the engine's server says it serves no model yet, and answers generation with 501", { skip: !engine && !required && "no built engine found" }, async () => {
   assert.ok(engine, `no built engine found; looked in ${CANDIDATES.join(", ")}`);
   const { child, port, out } = await startEngine();
   try {
-    assert.match(out, /No model runs yet/);
+    assert.match(out, /does not serve a model yet/);
 
     const health = await call(port, "GET", "/v1/health");
     assert.equal(health.status, 200);

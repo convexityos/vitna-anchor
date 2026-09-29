@@ -1,0 +1,525 @@
+/**
+ * unit_tests.c - Tests for the engine's parts, each against an independent
+ * statement of what it should compute: published test vectors, a formula
+ * evaluated in double precision, or a small input worked by hand.
+ *
+ * The forward pass as a whole is tested against the pinned reference by
+ * tests/reference.test.mjs. These tests cover the pieces, including those
+ * the forward pass does not use yet.
+ *
+ * Exit status 0 when every check passes.
+ */
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "crypto.h"
+#include "json.h"
+#include "kernels.h"
+#include "kv_cache.h"
+#include "ops.h"
+#include "safetensors.h"
+#include "sampler.h"
+#include "tokenizer.h"
+#include "unicode.h"
+
+static int g_checks = 0;
+static int g_failures = 0;
+
+#define CHECK(cond, ...)                                                    \
+    do {                                                                    \
+        g_checks++;                                                         \
+        if (!(cond)) {                                                      \
+            g_failures++;                                                   \
+            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);            \
+            fprintf(stderr, __VA_ARGS__);                                   \
+            fputc('\n', stderr);                                            \
+        }                                                                   \
+    } while (0)
+
+/* A deterministic generator for test data. */
+static uint64_t g_rng = 0x2545F4914F6CDD1DULL;
+static uint32_t rnd_u32(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return (uint32_t)(g_rng >> 16);
+}
+static float rnd_f(float lo, float hi) {
+    return lo + (hi - lo) * (float)(rnd_u32() & 0xFFFFFF) / (float)0x1000000;
+}
+
+static bool write_file(const char* path, const void* data, size_t n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(data, 1, n, f) == n;
+    fclose(f);
+    return ok;
+}
+
+/* --- JSON --- */
+
+static void test_json(void) {
+    const char* text = "\xEF\xBB\xBF {\"a\": [1, -2.5e2, true, false, null], \"s\": \"x\\u00e9\\ud83d\\ude80\\ud800q\\n\\\"\", \"o\": {}}";
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(text, strlen(text), err, sizeof(err));
+    CHECK(doc != NULL, "a valid document parses: %s", err);
+    if (doc) {
+        const vitna_json_value_t* root = vitna_json_root(doc);
+        const vitna_json_value_t* a = vitna_json_get(root, "a");
+        double d = 0;
+        CHECK(a && a->type == VITNA_JSON_ARRAY && a->u.array.count == 5, "array of five");
+        CHECK(a && vitna_json_as_number(a->u.array.items[1], &d) && d == -250.0, "-2.5e2 reads as -250");
+        CHECK(a && a->u.array.items[2]->type == VITNA_JSON_TRUE && a->u.array.items[4]->type == VITNA_JSON_NULL, "literals");
+        const char* s = vitna_json_as_string(vitna_json_get(root, "s"));
+        /* x, e-acute, rocket (a surrogate pair), a lone surrogate as U+FFFD, q, newline, quote */
+        const char want[] = "x\xC3\xA9\xF0\x9F\x9A\x80\xEF\xBF\xBDq\n\"";
+        CHECK(s && strcmp(s, want) == 0, "escapes decode to UTF-8");
+        CHECK(vitna_json_get(root, "o") && vitna_json_get(root, "o")->type == VITNA_JSON_OBJECT, "empty object");
+        CHECK(vitna_json_get(root, "missing") == NULL, "a missing key is NULL");
+        vitna_json_free(doc);
+    }
+    const char* bad[] = { "{\"a\":1,}", "[1,2", "\"abc", "{\"a\" 1}", "01", "[1] 2", "\"\x01\"", "tru" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        vitna_json_doc_t* d = vitna_json_parse(bad[i], strlen(bad[i]), err, sizeof(err));
+        CHECK(d == NULL, "invalid JSON is refused: %s", bad[i]);
+        vitna_json_free(d);
+    }
+    /* Nesting past the limit is refused rather than overflowing the stack. */
+    size_t depth = VITNA_JSON_MAX_DEPTH + 10;
+    char* deep = (char*)malloc(2 * depth + 1);
+    for (size_t i = 0; i < depth; i++) { deep[i] = '['; deep[depth + i] = ']'; }
+    deep[2 * depth] = '\0';
+    vitna_json_doc_t* d = vitna_json_parse(deep, 2 * depth, err, sizeof(err));
+    CHECK(d == NULL && strstr(err, "nested") != NULL, "deep nesting is refused");
+    vitna_json_free(d);
+    free(deep);
+}
+
+/* --- SafeTensors --- */
+
+static size_t build_safetensors(unsigned char* buf, const char* header, const void* data, size_t data_len) {
+    uint64_t n = strlen(header);
+    for (int i = 0; i < 8; i++) buf[i] = (unsigned char)(n >> (8 * i));
+    memcpy(buf + 8, header, n);
+    memcpy(buf + 8 + n, data, data_len);
+    return 8 + n + data_len;
+}
+
+static void test_safetensors(void) {
+    const char* path = "vitna-unit-test.safetensors";
+    unsigned char buf[1024];
+    float data[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    char err[256];
+    vitna_safetensors_t st;
+
+    size_t n = build_safetensors(buf,
+        "{\"__metadata__\":{\"format\":\"pt\"},\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}", data, 16);
+    CHECK(write_file(path, buf, n), "write a test file");
+    bool ok = vitna_safetensors_open_ex(path, &st, err, sizeof(err));
+    CHECK(ok, "a valid file opens: %s", err);
+    if (ok) {
+        CHECK(st.tensor_count == 1, "__metadata__ is not counted as a tensor (got %zu)", st.tensor_count);
+        const vitna_tensor_desc_t* t = vitna_safetensors_find(&st, "w");
+        CHECK(t && t->dtype == VITNA_DTYPE_F32 && t->ndim == 2 && vitna_tensor_numel(t) == 4, "the tensor's directory entry");
+        CHECK(t && ((const float*)t->data_ptr)[3] == 4.0f, "the tensor's data, in place");
+        CHECK(vitna_safetensors_find(&st, "__metadata__") == NULL, "no tensor named __metadata__");
+        vitna_safetensors_close(&st);
+    }
+
+    struct { const char* header; size_t data_len; const char* why; } bad[] = {
+        { "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,32]}}", 16, "outside the data section" },
+        { "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,8]}}", 16, "does not match" },
+        { "{\"w\":{\"dtype\":\"Q7\",\"shape\":[4],\"data_offsets\":[0,16]}}", 16, "unknown dtype" },
+        { "{\"w\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[8,0]}}", 16, "outside the data section" },
+        { "{\"w\":{\"dtype\":\"F32\",\"shape\":[-4],\"data_offsets\":[0,16]}}", 16, "bad shape" },
+        { "[1,2]", 0, "not a JSON object" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        n = build_safetensors(buf, bad[i].header, data, bad[i].data_len);
+        write_file(path, buf, n);
+        ok = vitna_safetensors_open_ex(path, &st, err, sizeof(err));
+        CHECK(!ok && strstr(err, bad[i].why) != NULL, "refused (%s): got \"%s\"", bad[i].why, ok ? "opened" : err);
+        if (ok) vitna_safetensors_close(&st);
+    }
+    /* A header length past the end of the file. */
+    unsigned char short_file[12] = { 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, '{', '}', 0, 0 };
+    write_file(path, short_file, sizeof(short_file));
+    ok = vitna_safetensors_open_ex(path, &st, err, sizeof(err));
+    CHECK(!ok, "a header length larger than the file is refused");
+    if (ok) vitna_safetensors_close(&st);
+    remove(path);
+}
+
+/* --- Unicode --- */
+
+static void test_unicode(void) {
+    CHECK(vitna_uni_is_letter('a') && vitna_uni_is_letter(0x00E9) && vitna_uni_is_letter(0x6771) && vitna_uni_is_letter(0x05E9), "letters");
+    CHECK(!vitna_uni_is_letter('1') && !vitna_uni_is_letter(' ') && !vitna_uni_is_letter(0x1F680), "not letters");
+    CHECK(vitna_uni_is_number('7') && vitna_uni_is_number(0x0663) && vitna_uni_is_number(0x216B) && vitna_uni_is_number(0x00BD), "numbers: Nd, Nl, No");
+    CHECK(!vitna_uni_is_number('x'), "not a number");
+    CHECK(vitna_uni_is_space(' ') && vitna_uni_is_space('\t') && vitna_uni_is_space(0x3000) && vitna_uni_is_space(0x85), "White_Space");
+    CHECK(!vitna_uni_is_space(0x1D) && !vitna_uni_is_space(0x200B), "U+001D and U+200B are not White_Space");
+    uint32_t cp;
+    const unsigned char rocket[] = { 0xF0, 0x9F, 0x9A, 0x80 };
+    CHECK(vitna_utf8_decode(rocket, 4, &cp) == 4 && cp == 0x1F680, "a four-byte sequence");
+    const unsigned char overlong[] = { 0xC0, 0xAF };
+    CHECK(vitna_utf8_decode(overlong, 2, &cp) == 1 && cp >= 0x110000, "an overlong sequence is one invalid byte");
+    const unsigned char surrogate[] = { 0xED, 0xA0, 0x80 };
+    CHECK(vitna_utf8_decode(surrogate, 3, &cp) == 1 && cp >= 0x110000, "an encoded surrogate is invalid");
+}
+
+/* --- Tokenizer, on a vocabulary small enough to work by hand --- */
+
+static const char* TINY_TOKENIZER =
+    "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":11,\"content\":\"<s>\",\"single_word\":false,\"lstrip\":false,"
+    "\"rstrip\":false,\"normalized\":false,\"special\":true}],\"normalizer\":null,"
+    "\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Digits\",\"individual_digits\":true},"
+    "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":true}]},"
+    "\"post_processor\":null,\"decoder\":{\"type\":\"ByteLevel\"},"
+    "\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":null,"
+    "\"end_of_word_suffix\":null,\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,"
+    "\"vocab\":{\"a\":0,\"b\":1,\"c\":2,\"d\":3,\"\\u0120\":4,\"1\":5,\"2\":6,\"ab\":7,\"bc\":8,\"abc\":9,"
+    "\"\\u0120a\":10,\"<s>\":11,\"aa\":12,\"!\":13,\"?\":14,\"!?\":15},"
+    "\"merges\":[\"a b\",\"b c\",\"ab c\",\"\\u0120 a\",\"a a\",\"! ?\"]}}";
+
+static bool ids_equal(const vitna_token_list_t* got, const int32_t* want, size_t n) {
+    if (got->count != n) return false;
+    for (size_t i = 0; i < n; i++) if (got->ids[i] != want[i]) return false;
+    return true;
+}
+
+static void test_tokenizer(void) {
+    const char* path = "vitna-unit-test-tokenizer.json";
+    write_file(path, TINY_TOKENIZER, strlen(TINY_TOKENIZER));
+    char err[256];
+    vitna_tokenizer_t* tok = vitna_tokenizer_load(path, err, sizeof(err));
+    CHECK(tok != NULL, "the tiny tokenizer loads: %s", err);
+    if (tok) {
+        struct { const char* text; int32_t ids[8]; size_t n; const char* why; } cases[] = {
+            { "abc", { 9 }, 1, "merges apply lowest rank first: a+b, then ab+c" },
+            { "bc", { 8 }, 1, "a single merge" },
+            { "abab", { 7, 7 }, 2, "a merge applies at every position" },
+            { "aaa", { 12, 0 }, 2, "equal ranks merge leftmost first" },
+            { "a\x04" "b", { 0, 1 }, 2, "a byte with no token is dropped, and pieces do not merge across the split" },
+            { "!\x04?", { 15 }, 1, "inside one piece, the neighbours of a dropped byte merge" },
+            { "a12", { 0, 5, 6 }, 3, "each digit is its own piece" },
+            { "<s>ab<s>", { 11, 7, 11 }, 3, "added tokens are matched before anything else" },
+            { " a", { 10 }, 1, "a single leading space joins the letters" },
+            { "  a", { 4, 10 }, 2, "a run of spaces before a letter leaves its last space to it" },
+            { "", { 0 }, 0, "nothing in, nothing out" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            vitna_token_list_t got = {0};
+            vitna_tokenizer_encode(tok, cases[i].text, strlen(cases[i].text), &got);
+            CHECK(ids_equal(&got, cases[i].ids, cases[i].n), "%s (%zu ids)", cases[i].why, got.count);
+            vitna_token_list_free(&got);
+        }
+        size_t n = 0;
+        const unsigned char* b = vitna_tokenizer_token_bytes(tok, 10, &n);
+        CHECK(b && n == 2 && b[0] == ' ' && b[1] == 'a', "a byte-level token decodes to its bytes");
+        CHECK(vitna_tokenizer_is_special(tok, 11) && !vitna_tokenizer_is_special(tok, 7), "special tokens");
+        vitna_tokenizer_free(tok);
+    }
+    /* Anything the loader does not implement is refused, not approximated. */
+    const char* unsupported = "{\"normalizer\":{\"type\":\"NFC\"},\"pre_tokenizer\":{\"type\":\"ByteLevel\"},"
+                              "\"model\":{\"type\":\"BPE\",\"vocab\":{},\"merges\":[]}}";
+    write_file(path, unsupported, strlen(unsupported));
+    tok = vitna_tokenizer_load(path, err, sizeof(err));
+    CHECK(tok == NULL && strstr(err, "normalizer") != NULL, "a normalizer is refused");
+    vitna_tokenizer_free(tok);
+    remove(path);
+}
+
+/* --- Float operations --- */
+
+static void test_conversions(void) {
+    CHECK(vitna_bf16_to_f32(0x3F80) == 1.0f && vitna_bf16_to_f32(0xC000) == -2.0f, "bf16");
+    CHECK(vitna_f16_to_f32(0x3C00) == 1.0f && vitna_f16_to_f32(0xC000) == -2.0f, "f16 normal");
+    CHECK(vitna_f16_to_f32(0x0001) == ldexpf(1.0f, -24), "f16 smallest subnormal");
+    CHECK(vitna_f16_to_f32(0x03FF) == ldexpf(1023.0f, -24), "f16 largest subnormal");
+    CHECK(vitna_f16_to_f32(0x7BFF) == 65504.0f && isinf(vitna_f16_to_f32(0x7C00)) && isnan(vitna_f16_to_f32(0x7E00)), "f16 max, inf, nan");
+}
+
+static double rel_err(double got, double want, double scale) {
+    return fabs(got - want) / (scale > 1e-30 ? scale : 1e-30);
+}
+
+static void test_matvec(void) {
+    const size_t shapes[][2] = { { 3, 5 }, { 67, 131 }, { 64, 576 }, { 17, 1536 } };
+    for (size_t s = 0; s < 4; s++) {
+        size_t rows = shapes[s][0], cols = shapes[s][1];
+        uint16_t* wb = (uint16_t*)malloc(rows * cols * sizeof(uint16_t));
+        float* wf = (float*)malloc(rows * cols * sizeof(float));
+        float* x = (float*)malloc(cols * sizeof(float));
+        float* y = (float*)malloc(rows * sizeof(float));
+        float* ys = (float*)malloc(rows * sizeof(float));
+        for (size_t i = 0; i < rows * cols; i++) {
+            float v = rnd_f(-1.0f, 1.0f);
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            wb[i] = (uint16_t)(bits >> 16);
+            wf[i] = vitna_bf16_to_f32(wb[i]);
+        }
+        for (size_t c = 0; c < cols; c++) x[c] = rnd_f(-2.0f, 2.0f);
+        double worst_b = 0, worst_f = 0, worst_s = 0;
+        vitna_matvec(wb, VITNA_DTYPE_BF16, x, y, rows, cols);
+        vitna_matvec_scalar(wb, VITNA_DTYPE_BF16, x, ys, rows, cols);
+        for (size_t r = 0; r < rows; r++) {
+            double ref = 0, mag = 0;
+            for (size_t c = 0; c < cols; c++) {
+                ref += (double)wf[r * cols + c] * x[c];
+                mag += fabs((double)wf[r * cols + c] * x[c]);
+            }
+            double e1 = rel_err(y[r], ref, mag), e2 = rel_err(ys[r], ref, mag);
+            if (e1 > worst_b) worst_b = e1;
+            if (e2 > worst_s) worst_s = e2;
+        }
+        vitna_matvec(wf, VITNA_DTYPE_F32, x, y, rows, cols);
+        for (size_t r = 0; r < rows; r++) {
+            double ref = 0, mag = 0;
+            for (size_t c = 0; c < cols; c++) {
+                ref += (double)wf[r * cols + c] * x[c];
+                mag += fabs((double)wf[r * cols + c] * x[c]);
+            }
+            double e = rel_err(y[r], ref, mag);
+            if (e > worst_f) worst_f = e;
+        }
+        /* float32 accumulation of up to 1536 products: within a few 1e-6 of
+         * the double-precision sum, relative to the sum of magnitudes. */
+        CHECK(worst_b < 2e-5 && worst_s < 2e-5 && worst_f < 2e-5,
+              "matvec %zux%zu (%s path): bf16 %.2e, scalar %.2e, f32 %.2e", rows, cols, vitna_matvec_path(), worst_b, worst_s, worst_f);
+        free(wb); free(wf); free(x); free(y); free(ys);
+    }
+}
+
+static void test_rope(void) {
+    const size_t hd = 64;
+    float v[64], w[64], cs[32], sn[32];
+    const double theta = 100000.0;
+    for (size_t pos = 0; pos < 300; pos += 37) {
+        for (size_t i = 0; i < hd; i++) v[i] = w[i] = rnd_f(-3.0f, 3.0f);
+        for (size_t j = 0; j < hd / 2; j++) {
+            double a = (double)pos * pow(theta, -(double)(2 * j) / (double)hd);
+            cs[j] = (float)cos(a);
+            sn[j] = (float)sin(a);
+        }
+        vitna_rope_half(v, hd, cs, sn);
+        double worst = 0;
+        for (size_t j = 0; j < hd / 2; j++) {
+            double a = (double)pos * pow(theta, -(double)(2 * j) / (double)hd);
+            double e0 = w[j] * cos(a) - w[j + hd / 2] * sin(a);
+            double e1 = w[j + hd / 2] * cos(a) + w[j] * sin(a);
+            worst = fmax(worst, fmax(fabs(v[j] - e0), fabs(v[j + hd / 2] - e1)));
+        }
+        CHECK(worst < 1e-5, "half-split rotation at position %zu: %.2e", pos, worst);
+
+        /* kv_cache.c's interleaved rotation, which the Llama forward pass
+         * does not use: pairs (2j, 2j + 1) turned by pos / theta^(2j / d). */
+        for (size_t i = 0; i < hd; i++) v[i] = w[i];
+        vitna_rope_apply(v, hd, pos, (float)theta);
+        worst = 0;
+        for (size_t j = 0; j < hd / 2; j++) {
+            double a = (double)pos / pow(theta, (double)(2 * j) / (double)hd);
+            double e0 = w[2 * j] * cos(a) - w[2 * j + 1] * sin(a);
+            double e1 = w[2 * j] * sin(a) + w[2 * j + 1] * cos(a);
+            worst = fmax(worst, fmax(fabs(v[2 * j] - e0), fabs(v[2 * j + 1] - e1)));
+        }
+        /* A float32 angle of up to 300 radians is good to about 3e-5. */
+        CHECK(worst < 1e-3, "interleaved rotation at position %zu: %.2e", pos, worst);
+    }
+}
+
+static void test_rmsnorm_and_swiglu(void) {
+    const size_t dims[] = { 7, 17, 576, 1537 };
+    for (size_t k = 0; k < 4; k++) {
+        size_t n = dims[k];
+        float* x = (float*)malloc(n * sizeof(float));
+        float* w = (float*)malloc(n * sizeof(float));
+        float* y = (float*)malloc(n * sizeof(float));
+        double ss = 0;
+        for (size_t i = 0; i < n; i++) {
+            x[i] = rnd_f(-4.0f, 4.0f);
+            w[i] = rnd_f(0.5f, 1.5f);
+            ss += (double)x[i] * x[i];
+        }
+        vitna_rmsnorm(x, w, y, n, 1e-5f);
+        double inv = 1.0 / sqrt(ss / (double)n + 1e-5);
+        double worst = 0, largest = 0;
+        for (size_t i = 0; i < n; i++) {
+            double e = x[i] * inv * w[i];
+            worst = fmax(worst, fabs(y[i] - e));
+            largest = fmax(largest, fabs(e));
+        }
+        CHECK(worst / largest < 1e-6, "rmsnorm over %zu: error %.2e of the largest output", n, worst / largest);
+        free(x); free(w); free(y);
+    }
+    float gu[16], out[8], a[8], b[8], c[8];
+    for (int i = 0; i < 8; i++) { gu[i] = a[i] = rnd_f(-6.0f, 6.0f); gu[8 + i] = b[i] = rnd_f(-2.0f, 2.0f); }
+    vitna_swiglu(gu, out, 8);
+    vitna_silu_mul(a, b, c, 8);
+    double worst = 0;
+    for (int i = 0; i < 8; i++) {
+        double e = a[i] / (1.0 + exp(-a[i])) * b[i];
+        worst = fmax(worst, fmax(fabs(out[i] - e), fabs(c[i] - e)));
+    }
+    CHECK(worst < 1e-5, "silu(gate) * up: %.2e", worst);
+}
+
+/* The quantized matrix-vector products, each against a decoding of the
+ * format its header describes, in double precision. */
+static void test_quantized_gemv(void) {
+    const size_t rows = 9, cols = 256, group = 64;
+    const size_t groups = rows * cols / group;
+    float* scales = (float*)malloc(groups * sizeof(float));
+    float* x = (float*)malloc(cols * sizeof(float));
+    float* y = (float*)malloc(rows * sizeof(float));
+    for (size_t i = 0; i < groups; i++) scales[i] = rnd_f(0.01f, 0.1f);
+    for (size_t c = 0; c < cols; c++) x[c] = rnd_f(-1.0f, 1.0f);
+
+    /* int8: one signed byte per weight. */
+    int8_t* w8 = (int8_t*)malloc(rows * cols);
+    for (size_t i = 0; i < rows * cols; i++) w8[i] = (int8_t)(rnd_u32() & 0xFF);
+    vitna_gemv_int8(w8, scales, group, x, y, rows, cols);
+    double worst8 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        double ref = 0;
+        for (size_t c = 0; c < cols; c++) ref += w8[r * cols + c] * (double)scales[r * cols / group + c / group] * x[c];
+        worst8 = fmax(worst8, fabs(y[r] - ref));
+    }
+    CHECK(worst8 < 1e-3, "int8 GEMV against its format: %.2e", worst8);
+
+    /* int4: two per byte, low nibble first, stored with an offset of 8. */
+    uint8_t* w4 = (uint8_t*)malloc(rows * cols / 2);
+    for (size_t i = 0; i < rows * cols / 2; i++) w4[i] = (uint8_t)rnd_u32();
+    vitna_gemv_int4(w4, scales, group, x, y, rows, cols);
+    double worst4 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        double ref = 0;
+        for (size_t c = 0; c < cols; c++) {
+            uint8_t byte = w4[(r * cols + c) / 2];
+            int q = ((c % 2) ? (byte >> 4) : (byte & 0x0F)) - 8;
+            ref += q * (double)scales[r * cols / group + c / group] * x[c];
+        }
+        worst4 = fmax(worst4, fabs(y[r] - ref));
+    }
+    CHECK(worst4 < 1e-3, "int4 GEMV against its format: %.2e", worst4);
+
+    /* int3: eight per three bytes, least significant bits first, offset 4. */
+    uint8_t* w3 = (uint8_t*)malloc(rows * cols / 8 * 3);
+    for (size_t i = 0; i < rows * cols / 8 * 3; i++) w3[i] = (uint8_t)rnd_u32();
+    vitna_gemv_int3(w3, scales, group, x, y, rows, cols);
+    double worst3 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        double ref = 0;
+        for (size_t c = 0; c < cols; c++) {
+            const uint8_t* p = w3 + r * (cols / 8 * 3) + (c / 8) * 3;
+            uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+            int q = (int)((v >> (3 * (c % 8))) & 7) - 4;
+            ref += q * (double)scales[r * cols / group + c / group] * x[c];
+        }
+        worst3 = fmax(worst3, fabs(y[r] - ref));
+    }
+    CHECK(worst3 < 1e-3, "int3 GEMV against its format: %.2e", worst3);
+
+    /* int2: four per byte, least significant bits first, offset 2. */
+    uint8_t* w2 = (uint8_t*)malloc(rows * cols / 4);
+    for (size_t i = 0; i < rows * cols / 4; i++) w2[i] = (uint8_t)rnd_u32();
+    vitna_gemv_int2(w2, scales, group, x, y, rows, cols);
+    double worst2 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        double ref = 0;
+        for (size_t c = 0; c < cols; c++) {
+            int q = (int)((w2[(r * cols + c) / 4] >> (2 * (c % 4))) & 3) - 2;
+            ref += q * (double)scales[r * cols / group + c / group] * x[c];
+        }
+        worst2 = fmax(worst2, fabs(y[r] - ref));
+    }
+    CHECK(worst2 < 1e-3, "int2 GEMV against its format: %.2e", worst2);
+
+    free(scales); free(x); free(y); free(w8); free(w4); free(w3); free(w2);
+}
+
+/* --- SHA-256, against FIPS 180-2's examples --- */
+
+static void sha_hex(const void* data, size_t n, size_t chunk, char out[65]) {
+    vitna_sha256_ctx_t ctx;
+    vitna_sha256_init(&ctx);
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; i += chunk) vitna_sha256_update(&ctx, p + i, (n - i < chunk) ? n - i : chunk);
+    vitna_sha256_final_hex(&ctx, out);
+}
+
+static void test_sha256(void) {
+    char hex[65];
+    sha_hex("", 0, 1, hex);
+    CHECK(strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0, "SHA-256 of nothing: %s", hex);
+    sha_hex("abc", 3, 3, hex);
+    CHECK(strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 0, "SHA-256 of abc: %s", hex);
+    const char* two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha_hex(two, strlen(two), 7, hex);
+    CHECK(strcmp(hex, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") == 0, "SHA-256 of the two-block example, fed 7 bytes at a time: %s", hex);
+    char* million = (char*)malloc(1000000);
+    memset(million, 'a', 1000000);
+    sha_hex(million, 1000000, 4093, hex);
+    CHECK(strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") == 0, "SHA-256 of a million a's: %s", hex);
+    free(million);
+}
+
+/* --- Sampling --- */
+
+static void test_sampler(void) {
+    float tied[5] = { 1.0f, 3.0f, 2.0f, 3.0f, -1.0f };
+    CHECK(vitna_argmax(tied, 5) == 1, "argmax takes the lowest id among ties");
+
+    float logits[3] = { logf(0.7f), logf(0.2f), logf(0.1f) };
+    vitna_sampler_t s;
+    vitna_sampler_init(&s, 3, 42);
+    vitna_sampling_t greedy = { 0.0f, 0, 1.0f, 0 };
+    CHECK(vitna_sample(&s, logits, &greedy) == 0, "temperature 0 is greedy");
+    vitna_sampling_t k1 = { 1.0f, 1, 1.0f, 0 };
+    CHECK(vitna_sample(&s, logits, &k1) == 0, "top-k 1 is greedy");
+    vitna_sampling_t p_small = { 1.0f, 0, 0.5f, 0 };
+    CHECK(vitna_sample(&s, logits, &p_small) == 0, "top-p 0.5 keeps only the 0.7 token");
+
+    vitna_sampling_t plain = { 1.0f, 0, 1.0f, 0 };
+    int counts[3] = { 0, 0, 0 };
+    const int n = 40000;
+    for (int i = 0; i < n; i++) counts[vitna_sample(&s, logits, &plain)]++;
+    CHECK(fabs(counts[0] / (double)n - 0.7) < 0.015 && fabs(counts[1] / (double)n - 0.2) < 0.015 && fabs(counts[2] / (double)n - 0.1) < 0.015,
+          "temperature 1 draws in proportion: %d %d %d of %d", counts[0], counts[1], counts[2], n);
+
+    vitna_sampling_t p9 = { 1.0f, 0, 0.85f, 0 };
+    counts[0] = counts[1] = counts[2] = 0;
+    for (int i = 0; i < n; i++) counts[vitna_sample(&s, logits, &p9)]++;
+    CHECK(counts[2] == 0 && fabs(counts[0] / (double)n - 0.7 / 0.9) < 0.015, "top-p 0.85 keeps the 0.7 and 0.2 tokens, renormalized: %d %d %d", counts[0], counts[1], counts[2]);
+
+    /* The same seed gives the same draws. */
+    vitna_sampler_t a, b;
+    vitna_sampler_init(&a, 3, 7);
+    vitna_sampler_init(&b, 3, 7);
+    bool same = true;
+    for (int i = 0; i < 100; i++) same = same && vitna_sample(&a, logits, &plain) == vitna_sample(&b, logits, &plain);
+    CHECK(same, "a seed reproduces its draws");
+    vitna_sampler_free(&a);
+    vitna_sampler_free(&b);
+    vitna_sampler_free(&s);
+}
+
+int main(void) {
+    test_json();
+    test_safetensors();
+    test_unicode();
+    test_tokenizer();
+    test_conversions();
+    test_matvec();
+    test_rope();
+    test_rmsnorm_and_swiglu();
+    test_quantized_gemv();
+    test_sha256();
+    test_sampler();
+    printf("%d checks, %d failed (matvec path: %s, Unicode %s)\n", g_checks, g_failures, vitna_matvec_path(), vitna_uni_version());
+    return g_failures == 0 ? 0 : 1;
+}

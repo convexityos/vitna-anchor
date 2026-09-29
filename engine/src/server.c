@@ -1,10 +1,10 @@
 /**
  * server.c - Local HTTP server for vitna-engine.
  *
- * No model runs yet, and this server says so. Generation endpoints answer
+ * This server serves no model yet, and says so. Generation endpoints answer
  * 501 with an OpenAI-style error, the model list is empty, and nothing is
- * reported that was not measured. Serving real completions is gate A3 in the
- * README, and it waits on a forward pass (gate A2).
+ * reported that was not measured. The engine runs a model from its command
+ * line (gate A2); serving it here is gate A3 in the README.
  */
 
 #include "server.h"
@@ -29,8 +29,8 @@
 #endif
 
 #define VITNA_NO_MODEL_MESSAGE \
-    "No model runs yet. This build of vitna-anchor has no forward pass, so it cannot generate text. " \
-    "See the gate ladder in the README."
+    "This server does not serve a model yet: that is gate A3 in the README. " \
+    "The engine runs one from its command line: vitna-anchor run --model <dir> --prompt <text>."
 
 static void send_http_response(socket_t sock, int status_code, const char* status_text, const char* content_type, const char* body) {
     char header[512];
