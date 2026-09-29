@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test \"tests/*.test.mjs\"",
     "probe": "node runtime/anchor-run.mjs probe",
     "chat": "node runtime/anchor-run.mjs chat",
     "serve": "node runtime/anchor-run.mjs serve",
@@ -48,6 +48,6 @@
   "author": "Convexity <engineering@convexity.com>",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }
