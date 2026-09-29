@@ -1,7 +1,8 @@
-// Multi-Drive NVMe Direct DMA Striping Engine (RAID-0 Weight Pooling).
+// Striping: splits a file round-robin, in fixed-size chunks, across several
+// directories, which may sit on different drives, and records the layout.
 //
-// Interleaves 4KB sector slabs round-robin across multiple drive mount points
-// to multiply direct DMA read throughput without enterprise GPU memory.
+// Whether reading a striped file back is faster than reading one drive has not
+// been measured here. Nothing in this repository reads striped files yet.
 //
 // Zero external dependencies.
 // Dark Calm Terminal styling. Strictly zero em-dashes.
@@ -22,6 +23,12 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
     throw new Error(`Chunk size (${chunkSize}) must be a multiple of 4096 bytes for direct DMA.`);
   }
 
+  // A missing source is an error. It used to be striped as 16 MB of made-up
+  // bytes, so a mistyped path reported success.
+  if (!existsSync(sourcePath)) {
+    throw new Error(`Source file not found: ${sourcePath}`);
+  }
+
   const modelName = basename(sourcePath).replace(/\.(dma\.anchor|gguf|safetensors|bin)$/i, "");
   const numDrives = drivePaths.length;
 
@@ -32,17 +39,8 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
     }
   }
 
-  // Open input file or generate synthetic benchmark slabs if testing
-  let totalBytes = 0;
-  let inFd = null;
-  const isSynthetic = !existsSync(sourcePath);
-
-  if (!isSynthetic) {
-    totalBytes = statSync(sourcePath).size;
-    inFd = openSync(sourcePath, "r");
-  } else {
-    totalBytes = options.syntheticSizeBytes || 16 * 1024 * 1024; // 16MB default for testing
-  }
+  const totalBytes = statSync(sourcePath).size;
+  const inFd = openSync(sourcePath, "r");
 
   const perDriveFiles = [];
   const perDriveHashes = [];
@@ -66,19 +64,11 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
       const driveIdx = chunkIndex % numDrives;
       const bytesToRead = Math.min(bytesRemaining, chunkSize);
 
-      if (!isSynthetic && inFd !== null) {
-        const bytesRead = readSync(inFd, buffer, 0, bytesToRead, null);
-        if (bytesRead <= 0) break;
-        // Pad to sector alignment if last chunk
-        if (bytesRead < chunkSize) {
-          buffer.fill(0, bytesRead, chunkSize);
-        }
-      } else {
-        // Synthetic deterministic test payload
-        buffer.fill((chunkIndex % 255) + 1, 0, bytesToRead);
-        if (bytesToRead < chunkSize) {
-          buffer.fill(0, bytesToRead, chunkSize);
-        }
+      const bytesRead = readSync(inFd, buffer, 0, bytesToRead, null);
+      if (bytesRead <= 0) break;
+      // Pad the last chunk with zeros to the full chunk size
+      if (bytesRead < chunkSize) {
+        buffer.fill(0, bytesRead, chunkSize);
       }
 
       masterHash.update(buffer);
@@ -91,9 +81,7 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
       chunkIndex++;
     }
   } finally {
-    if (inFd !== null) {
-      try { closeSync(inFd); } catch {}
-    }
+    try { closeSync(inFd); } catch {}
     for (const f of perDriveFiles) {
       try { closeSync(f.fd); } catch {}
     }
@@ -116,36 +104,14 @@ export function sliceStripedDmaSlabs(sourcePath, drivePaths = [], options = {}) 
     totalInputBytes: totalBytes,
     totalSectorPaddedBytes: chunkIndex * chunkSize,
     driveCount: numDrives,
-    bandwidthScalingFactor: Number((numDrives * 0.94).toFixed(2)), // ~94% linear scaling
     partitions,
-    airgapSha256: masterHash.digest("hex"),
+    // SHA-256 of every chunk in stripe order: the source file, zero-padded to
+    // a whole number of chunks.
+    stripedDataSha256: masterHash.digest("hex"),
     generatedAt: new Date().toISOString(),
   };
 
   return manifest;
-}
-
-export function benchmarkStripedReadThroughput(driveCount = 2, baseBandwidthGBps = 7.45) {
-  const d = Math.max(1, Math.min(8, Number(driveCount) || 2));
-  const efficiency = d === 1 ? 1.0 : d === 2 ? 0.96 : d === 4 ? 0.92 : 0.88;
-  const aggregateGBps = Number((d * baseBandwidthGBps * efficiency).toFixed(2));
-  const random4kIops = Math.round(d * 145000 * efficiency);
-
-  // Projected token generation throughput across hardware architectures
-  const projectedDeepSeek671b = Number(Math.min(48, (aggregateGBps / 37.2) * 28.5).toFixed(1));
-  const projectedLlama70b = Number(Math.min(96, (aggregateGBps / 14.0) * 16.2).toFixed(1));
-
-  return {
-    driveCount: d,
-    baseBandwidthGBps,
-    aggregateGBps,
-    random4kIops,
-    scalingEfficiencyPct: Math.round(efficiency * 100),
-    projectedToksSec: {
-      deepseek671b: projectedDeepSeek671b,
-      llama70b: projectedLlama70b,
-    },
-  };
 }
 
 export function formatStripeSummary(manifest, ansi = {}) {
@@ -153,17 +119,15 @@ export function formatStripeSummary(manifest, ansi = {}) {
   const bold = ansi.bold || "";
   const dim = ansi.dim || "";
   const green = ansi.green || "";
-  const amber = ansi.amber || "";
   const hairline = ansi.hairline || "";
 
   const lines = [
-    hairline + "── [ MULTI-DRIVE NVME STRIPE COMPLETE ] ───────────────────────────────────" + reset,
-    `  Model Checkpoint  : ${bold}${manifest.model}${reset}`,
-    `  Drive Count       : ${green}${manifest.driveCount} Drives Striped (RAID-0 DMA)${reset}`,
-    `  Chunk Sector Size : ${manifest.chunkSizeBytes} bytes (4KB DMA aligned)`,
+    hairline + "── [ STRIPE WRITTEN ] ─────────────────────────────────────────────────────" + reset,
+    `  Source File       : ${bold}${manifest.model}${reset}`,
+    `  Directories       : ${green}${manifest.driveCount}, chunks written round-robin${reset}`,
+    `  Chunk Size        : ${manifest.chunkSizeBytes} bytes`,
     `  Total Stored Size : ${(manifest.totalSectorPaddedBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
-    `  Bandwidth Scale   : ${amber}${manifest.bandwidthScalingFactor}x linear acceleration${reset}`,
-    `  Air-Gap SHA-256   : ${dim}${manifest.airgapSha256.slice(0, 16)}...${reset}`,
+    `  Striped SHA-256   : ${dim}${manifest.stripedDataSha256}${reset} (source zero-padded to whole chunks)`,
     "",
     bold + "  DRIVE PARTITIONS:" + reset,
   ];

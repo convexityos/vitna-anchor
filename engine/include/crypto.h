@@ -10,25 +10,17 @@ extern "C" {
 #endif
 
 /**
- * SHA-256 state context for rolling token trajectory hashing.
+ * SHA-256 state context.
  * Pure C11 with zero external runtime dependencies.
+ *
+ * A hash of the tokens a run produced says which tokens they were. It says
+ * nothing about where the run happened or what it sent over a network.
  */
 typedef struct {
     uint32_t state[8];
     uint64_t count;
     uint8_t buffer[64];
 } vitna_sha256_ctx_t;
-
-/**
- * Sovereign air-gap execution proof.
- * Binds token generation trajectory to a cryptographic hash proving local air-gapped compute.
- */
-typedef struct {
-    char trajectory_hash[65];     /* 64-char hex string + null terminator */
-    uint32_t token_count;         /* Number of tokens hashed in trajectory */
-    bool airgap_verified;         /* Verified 0 external socket bytes */
-    uint64_t duration_us;         /* Microsecond execution duration */
-} vitna_sovereign_proof_t;
 
 /**
  * Initialize a SHA-256 context.

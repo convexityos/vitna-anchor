@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { writeFileSync, unlinkSync, rmSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -84,12 +85,14 @@ test("quantizeSlabFile packs tensors into 4KB sector aligned quantized slabs", (
     assert.equal(dryRes.totalTensors, 2);
     assert.equal(dryRes.bits, 4);
     assert.ok(dryRes.netCompressionRatio > 0);
+    assert.equal(dryRes.sha256, null, "a dry run writes no slab, so it has no digest");
 
     // 2. Physical write
     const realRes = quantizeSlabFile(srcFile, outDir, { bits: 4, dryRun: false });
     assert.equal(realRes.totalTensors, 2);
     assert.ok(existsSync(realRes.quantizedSlabPath));
     assert.ok(existsSync(realRes.manifestPath));
+    assert.equal(realRes.sha256, createHash("sha256").update(readFileSync(realRes.quantizedSlabPath)).digest("hex"));
 
     const manifest = JSON.parse(readFileSync(realRes.manifestPath, "utf8"));
     assert.equal(manifest.sectorSize, 4096);

@@ -1,285 +1,107 @@
 # vitna-anchor
 
 [![CI](https://github.com/convexityos/vitna-anchor/actions/workflows/ci.yml/badge.svg)](https://github.com/convexityos/vitna-anchor/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/vitna-anchor.svg?style=flat-square)](https://www.npmjs.com/package/vitna-anchor)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
-[![Zero Egress](https://img.shields.io/badge/socket__egress-0__bytes-22c55e.svg?style=flat-square)](https://vitna.ai/anchor)
 
-**Sovereign Mixture-of-Experts inference engine, direct NVMe DMA streaming, speculative MoE drafting, and Smart Order Router.**
+An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-Vitna Anchor is a zero-dependency C11 sovereign inference engine and developer CLI designed to run frontier open-weight models on consumer and workstation hardware with certified zero network socket egress.
+**No model runs yet.** There is no tokenizer and no attention, so nothing here can generate text. The HTTP server answers generation requests with `501 Not Implemented`. Nothing has been published to npm, so there is no install command: build from source.
 
-When local compute overflows, Anchor's built-in Smart Order Router (SOR) transparently executes cross-cloud price arbitrage across DeepInfra, Together, Fireworks, Groq, and OpenRouter, saving up to 58.4% against market median list prices.
+Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
----
+## The gate ladder
 
-## Quickstart
+Each gate has a pass condition that a test checks. Nothing is claimed here, in the command line's output or anywhere else in this repository before the gate that proves it has passed.
 
-Run directly via `npx` with zero installation:
+| Gate | Passes when | Status |
+|---|---|---|
+| A0, honesty | This README, the command line and both servers state what runs today, and print no figure nobody measured | This change |
+| A1, a reference | One small dense open model is pinned by revision and file hash, token ids and logits for fixed prompts are recorded from a pinned reference implementation, and a test compares against them | Not started |
+| A2, a forward pass on a CPU | Tokenizer, embeddings, RMSNorm, attention over a real key-value cache, MLP and sampling in C. Logits match A1 within a stated tolerance, and greedy output matches token for token | Not started |
+| A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Not started |
+| A4, one GPU | The A2 comparison passes on CUDA | Not started |
+| A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Not started |
+| A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Not started |
 
-```bash
-# 1. Launch the interactive Calm Terminal REPL
-npx vitna-anchor chat
+## What is in the repository
 
-# 2. Benchmark local NVMe direct I/O, RAM bandwidth, and air-gap attestation
-npx vitna-anchor probe
+Nothing below has been checked against an external reference yet. "Tested" means the repository's own tests exercise it, on inputs they build themselves.
 
-# 3. Start a local OpenAI-compatible daemon on port 8765
-npx vitna-anchor serve --port 8765
-```
+| Component | Where | State |
+|---|---|---|
+| SafeTensors and GGUF v2/v3 header parsers | `runtime/ingest.mjs` | Tested on synthetic files |
+| Checkpoint rewrite with every tensor at a 4096-byte offset | `runtime/ingest.mjs` | Tested on synthetic files |
+| Block-wise INT4 and INT8 quantizer | `runtime/quantize.mjs` | Tested for round-trip error on random tensors |
+| Round-robin striping of a file across directories | `runtime/stripe.mjs` | Tested for layout. Read throughput has not been measured |
+| JSON Schema to pushdown automaton compiler | `runtime/grammar.mjs`, `engine/src/grammar.c` | The JavaScript half is tested. Neither masks any logits, since none exist yet |
+| SafeTensors parser in C | `engine/src/safetensors.c` | Untested. Known defect: the `__metadata__` block is read as a tensor |
+| RMSNorm, SwiGLU, and int2/3/4/8 matrix-vector products, with scalar, AVX2 and NEON paths | `engine/src/kernels.c` | Untested beyond a timing loop on synthetic data |
+| Rotary position embedding | `engine/src/kv_cache.c` | Untested. Uses the interleaved-pair convention, not the half-split one that Hugging Face Llama checkpoints expect |
+| Paged key-value cache | `engine/src/kv_cache.c` | Untested. Known defect: all layers share one block pool sized for a single layer |
+| Top-k softmax routing over experts | `engine/src/router.c` | Untested |
+| Expert store and asynchronous reads | `engine/src/expert_store.c`, `engine/src/async_io.c` | Untested. Shards are opened with direct I/O off |
+| Prefix tree over token ids | `engine/src/radix_kv.c` | Untested. It holds no key-value tensors |
+| SHA-256 | `engine/src/crypto.c` | Untested |
+| HTTP server | `engine/src/server.c`, `runtime/anchor-run.mjs` | Tested: health says no model, generation answers 501 |
 
-Or install globally:
+## Build the engine from source
 
-```bash
-npm install -g vitna-anchor
-vitna-anchor chat
-```
+The engine is C11 with no dependencies beyond the C library.
 
----
-
-## Key Capabilities
-
-### 1. Direct NVMe DMA Streaming
-Bypasses the OS page cache and host memory bottlenecks with unbuffered `O_DIRECT` direct DMA reads. Paged DMA queues stream active MoE expert weights directly into execution buffers at drive line rate (up to 7,450 MB/s on PCIe Gen4 and >12,000 MB/s on PCIe Gen5).
-
-### 2. Speculative MoE Drafting (>2.5x Speedup)
-Proposes lookahead draft tokens ($K=4$) using lightweight local priors. Parallel target model verification via rejection sampling accepts candidate tokens when:
-$$r \le \min\left(1, \frac{p_{\text{target}}}{p_{\text{draft}}}\right)$$
-Rejection sampling mathematically guarantees zero distributional shift while cutting NVMe roundtrips by over 60%.
-
-### 3. Radix KV Cache Sharing (<1ms TTFT)
-Hierarchical prefix tree stores token key-value activations in host RAM. Common prompt preambles, system prompts, and multi-turn conversation branches skip prefill evaluation entirely, delivering sub-millisecond Time-To-First-Token.
-
-### 4. Kernel Pushdown Grammar Automaton
-A deterministic pushdown automaton directly masks invalid token logits inside the C11 sampling loop. Guarantees 100% compliant JSON schema output with zero syntax retries or model hallucinations.
-
-### 5. Cryptographic SHA-256 Air-Gap Proof
-Every completed response emits a rolling SHA-256 trajectory hash alongside `socket_egress_bytes: 0`, certifying that zero prompt or output bytes were transmitted over external network interfaces.
-
-### 6. Smart Order Router (SOR) Cloud Arbitrage
-When local hardware is capacity-constrained, Anchor analyzes real-time price dispersion across top cloud providers, ranking sellers cheapest-first and capturing spreads up to 58.4% against list median rates:
-
-| Provider | Input / 1M | Output / 1M | Effective Discount | Typical TTFT |
-| :--- | :--- | :--- | :--- | :--- |
-| **DeepInfra** | **$0.55** | **$2.19** | **-58.4% (Cheapest First)** | 142 ms |
-| **Groq** | $0.59 | $0.79 | -45.1% | 88 ms |
-| **Together AI** | $0.88 | $3.50 | -33.3% | 168 ms |
-| **Fireworks** | $0.90 | $3.60 | -31.8% | 155 ms |
-| **OpenRouter** | $1.20 | $4.80 | Baseline (List Median) | 210 ms |
-
----
-
-## OpenAI SDK Drop-in Integration
-
-Anchor's local daemon (`vitna-anchor serve`) is a drop-in replacement for any OpenAI-compatible client library.
-
-### Python
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8765/v1",
-    api_key="vitna-airgap-local"
-)
-
-response = client.chat.completions.create(
-    model="vitna/anchor-moe",
-    messages=[
-        {"role": "system", "content": "You are a sovereign assistant."},
-        {"role": "user", "content": "Explain NVMe DMA direct I/O."}
-    ],
-    temperature=0.2
-)
-
-print(response.choices[0].message.content)
-```
-
-### cURL
-
-```bash
-curl http://127.0.0.1:8765/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "vitna/anchor-moe",
-    "messages": [{"role": "user", "content": "Benchmark local throughput"}]
-  }'
-```
-
----
-
-## Compiling the C11 Engine Core
-
-The C11 sovereign engine has zero external dependencies and compiles with any C11 compiler (`clang`, `gcc`, or MSVC).
-
-### Linux & macOS
+Linux and macOS:
 
 ```bash
 cd engine
 make
-./vitna-anchor --bench
+./vitna-anchor info --model path/to/model.safetensors
 ```
 
-### Windows
-
-Using CMake:
+Windows, with CMake and Visual Studio:
 
 ```powershell
 cmake -B engine/build -S engine
 cmake --build engine/build --config Release
-.\engine\build\Release\vitna-anchor.exe --bench
 ```
 
-Or using PowerShell build script:
+Windows, with any clang, gcc or `zig cc`. Set `VITNA_CC` to the compiler's path if it is not on `PATH`:
 
 ```powershell
 .\engine\build.ps1
-.\engine\vitna-anchor.exe --bench
 ```
 
----
+`vitna-anchor serve` starts the HTTP server, `info` lists the tensors in a SafeTensors file, and `bench` times the int4 matrix-vector kernel on synthetic weights. That timing describes one kernel on one machine, not a model.
 
----
+## The command line
 
-## CLI Subcommands Reference
+From a clone, with Node.js 22 or later:
 
-### 1. Model Quantization (`quantize`)
-Compresses tensor slabs to block-wise INT4 or INT8 with 4096-byte DMA sector alignment:
 ```bash
-# Quantize tensor weights to packed INT4 with 4KB sector padding
-npx vitna-anchor quantize ./models/model.dma.anchor --bits 4 --out ./models/quantized
-
-# Quantize to INT8 with JSON telemetry output
-npx vitna-anchor quantize ./models/model.dma.anchor --bits 8 --json
+node bin/vitna-anchor.mjs --help
 ```
 
-### 2. Async Overlapped Pre-fetching Benchmark (`bench --prefetch`)
-Simulates asynchronous NVMe expert layer pre-fetching and calculates hidden latency:
-```bash
-# Run prefetch benchmark across 32 MoE layers with 7.45 GB/s line rate
-npx vitna-anchor bench --prefetch --layers 32 --bandwidth 7.45
+| Command | What it does |
+|---|---|
+| `pull <model-id-or-path> [--out <dir>] [--dry-run]` | Reads a SafeTensors or GGUF checkpoint, from disk or the Hugging Face Hub, and rewrites it with every tensor at a 4096-byte offset |
+| `quantize <checkpoint> [--bits 4\|8]` | Quantizes a checkpoint's tensors to block-wise INT4 or INT8 |
+| `stripe <file> --drives <d1,d2,...>` | Splits a file round-robin into chunks across several directories |
+| `schema <schema.json>` | Compiles a JSON Schema into the automaton a constrained decoder would use |
+| `serve [--port <port>]` | Starts an HTTP server whose generation endpoints answer 501 |
+| `chat` | Says that no model runs, and exits |
 
-# Output machine-readable JSON metrics
-npx vitna-anchor bench --prefetch --json
-```
+`probe`, `route`, `draft`, `bench`, `tune` and `registry` were removed. Calling one prints why.
 
-### 3. Autonomous Silicon Tuner (`tune`)
-Discovers hardware topology and sweeps I/O queues to recommend optimal cache and sector configurations:
-```bash
-# Run hardware sweep and print recommendations
-npx vitna-anchor tune
-
-# Write persistent hardware profile to file
-npx vitna-anchor tune --out ./anchor-profile.json
-```
-
-### 4. Speculative MoE Drafting (`draft`)
-Runs speculative candidate generation ($K=4$) with parallel rejection sampling verification:
-```bash
-# Run speculative drafting simulation
-npx vitna-anchor draft --prompt "Explain zero-copy NVMe DMA" --window 4
-
-# Output telemetry in JSON format
-npx vitna-anchor draft --json
-```
-
-### 5. Smart Order Router Arbitrage (`route`)
-Evaluates lowest-cost provider across DeepInfra, Together, Fireworks, Groq, and OpenRouter:
-```bash
-# Inspect price dispersion and arbitrage plan for a model SKU
-npx vitna-anchor route meta-llama/llama-3.3-70b-instruct
-```
-
-### 6. Model Ingestion & Checkpoint Slicing (`pull`)
-Ingests SafeTensors or GGUF checkpoints, repacking weights into 4KB DMA aligned slabs:
-```bash
-# Pull model from Hugging Face Hub (dry run)
-npx vitna-anchor pull Qwen/Qwen2.5-Coder-7B-Instruct --dry-run
-
-# Ingest local checkpoint file into DMA slabs
-npx vitna-anchor pull ./checkpoints/model.safetensors --out ./models
-```
-
-### 7. Multi-Drive NVMe DMA Striping (`stripe`)
-Interleaves 4KB sector slabs round-robin across multiple NVMe drives (RAID-0 DMA pooling):
-```bash
-# Stripe checkpoint across dual NVMe drives
-npx vitna-anchor stripe ./models/deepseek-671b.dma.anchor --drives /mnt/nvme0,/mnt/nvme1
-
-# Benchmark multi-drive aggregated read throughput
-npx vitna-anchor bench --stripe 2
-```
-
-### 8. Pushdown Grammar PDA Schema Compiler (`schema`)
-Compiles JSON Schemas into pushdown automaton state machines for deterministic function calling:
-```bash
-# Compile and inspect schema constraints
-npx vitna-anchor schema ./schema.json
-
-# Output PDA transition tables as JSON
-npx vitna-anchor schema ./schema.json --json
-```
-
-### 9. Sovereign Model Hub & Verified Registry (`registry`)
-Lists verified pre-sliced 4KB DMA models with SHA-256 air-gap manifests:
-```bash
-# List verified models and throughput targets
-npx vitna-anchor registry
-```
-
----
-
-## Interactive REPL Slash Commands
-
-When running `vitna-anchor chat`, the interactive Calm Terminal REPL provides developer controls:
-
-* `/help`: Show command reference manual
-* `/json [schema]`: Enable kernel grammar pushdown automaton for zero-retry JSON
-* `/text`: Revert to freeform natural language generation
-* `/probe`: Run live NVMe, RAM, and air-gap attestation benchmark
-* `/registry`: Inspect verified sovereign model catalog and manifests
-* `/stripe`: Run interactive multi-drive NVMe striping benchmark
-* `/schema`: Inspect pushdown grammar state transitions
-* `/quantize [bits]`: Run interactive weight quantizer simulation
-* `/prefetch`: Run interactive async prefetch pipeline benchmark
-* `/tune`: Run interactive autonomous silicon tuner sweep
-* `/draft [prompt]`: Run interactive speculative candidate generation simulation
-* `/route [sku]`: Inspect cloud price arbitrage and cheapest-first execution plan
-* `/connect [url]`: Test and connect to a local or remote Anchor daemon
-* `/stats`: Show session tokens, cache hits, and 0 bytes egress verification
-* `/cache`: Inspect in-memory Radix KV cache efficiency
-* `/clear`: Clear conversation context while retaining system prompt
-* `/exit`: Exit terminal cleanly
-
----
-
-## Running Tests
-
-Run the full automated test suite:
+## Tests
 
 ```bash
 npm test
 ```
 
-Test coverage includes:
-* `tests/anchor-cli.test.mjs`: Hardware probe benchmark, OpenAI daemon streaming SSE, prompt caching, grammar enforcement
-* `tests/arbitrage-router.test.mjs`: Model alias mapping, provider price calculations, lowest-cost selection
-* `tests/speculative-drafting.test.mjs`: Lookahead proposals, rejection sampling verification, speedup multiplier
-* `tests/model-ingestion.test.mjs`: Sharded index parsing, 4KB DMA slab repacking, air-gap attestation
-* `tests/quantization.test.mjs`: Block-wise INT4 and INT8 quantization, SNR calculation, 4KB sector padding
-* `tests/prefetch.test.mjs`: Asynchronous prefetch queue, hidden latency computation, pipeline speedup
-* `tests/tune.test.mjs`: Silicon tuner hardware sweep, queue depth recommendation, profile generation
+`tests/engine-server.test.mjs` runs the built engine when it finds one, and is skipped otherwise. CI builds the engine on Linux, macOS and Windows and requires it.
 
----
+## Measurements
 
-## Architecture & Design Contract
-
-* **Zero External Dependencies:** Built entirely with pure C11 and native Node.js standard libraries.
-* **Calm Terminal Philosophy:** Designed under high-contrast dark terminal conventions with zero glowing animations and quiet operational telemetry.
-* **Air-Gap Invariant:** Local inference generates zero socket egress bytes, verifiable via kernel file descriptor inspections.
-
----
+A performance figure appears in this repository only with the hardware and the command that produced it, and it says whether it was measured or estimated.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE).

@@ -1,217 +1,110 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { request as httpRequest } from "node:http";
+import { fileURLToPath } from "node:url";
 
-import {
-  runProbe,
-  startAnchorServer,
-  runRouteCli,
-  runDraftCli,
-} from "../runtime/anchor-run.mjs";
+import { startAnchorServer, NO_MODEL_MESSAGE, REMOVED_COMMANDS } from "../runtime/anchor-run.mjs";
 
-function httpPost(port, path, data) {
+const BIN = fileURLToPath(new URL("../bin/vitna-anchor.mjs", import.meta.url));
+
+function runBin(...args) {
+  return spawnSync(process.execPath, [BIN, ...args], { encoding: "utf8" });
+}
+
+function httpCall(port, method, path, data) {
   return new Promise((resolve, reject) => {
-    const postBody = typeof data === "string" ? data : JSON.stringify(data);
+    const body = data === undefined ? "" : JSON.stringify(data);
     const req = httpRequest(
       {
         hostname: "127.0.0.1",
         port,
         path,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(postBody),
-        },
+        method,
+        headers: body ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } : {},
       },
       (res) => {
-        let body = "";
-        res.on("data", (chunk) => (body += chunk));
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(body);
-            resolve({ status: res.statusCode, headers: res.headers, body: parsed });
-          } catch {
-            resolve({ status: res.statusCode, headers: res.headers, raw: body });
-          }
-        });
+        let raw = "";
+        res.on("data", (chunk) => (raw += chunk));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(raw) }));
       }
     );
     req.on("error", reject);
-    req.write(postBody);
+    if (body) req.write(body);
     req.end();
   });
 }
 
-function httpGet(port, path) {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path,
-        method: "GET",
-      },
-      (res) => {
-        let body = "";
-        res.on("data", (chunk) => (body += chunk));
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(body);
-            resolve({ status: res.statusCode, headers: res.headers, body: parsed });
-          } catch {
-            resolve({ status: res.statusCode, headers: res.headers, raw: body });
-          }
-        });
-      }
-    );
-    req.on("error", reject);
-    req.end();
-  });
+function listen(server) {
+  return new Promise((resolve) => server.on("listening", () => resolve(server.address().port)));
 }
 
-test("vitna-anchor probe runs direct storage and memory benchmarks with air-gap proof", () => {
-  const result = runProbe(true);
-  assert.ok(result.platform, "platform architecture detected");
-  assert.ok(result.cpu.cores > 0, "logical CPU cores detected");
-  assert.ok(result.storage.sequentialReadMBps > 0, "positive sequential read speed");
-  assert.ok(result.storage.randomRead4kIops >= 0, "random IOPS measured");
-  assert.equal(result.sovereignProof.airgap, true, "strict sovereign air-gap confirmed");
-  assert.equal(result.sovereignProof.socketEgressBytes, 0, "zero bytes socket egress");
-});
-
-test("vitna-anchor serve provides OpenAI-compatible completions, Radix KV cache, and Grammar decoding", async () => {
-  const testPort = 8799;
-  const server = startAnchorServer({
-    host: "127.0.0.1",
-    port: testPort,
-    model: "vitna/anchor-moe",
-  });
-
-  await new Promise((r) => setTimeout(r, 150));
-
+test("serve states that no model runs, and answers generation with 501", async () => {
+  const server = startAnchorServer({ port: 0, quiet: true });
+  const port = await listen(server);
   try {
-    // 1. Health check
-    const health = await httpGet(testPort, "/health");
+    const health = await httpCall(port, "GET", "/v1/health");
     assert.equal(health.status, 200);
-    assert.equal(health.body.engine, "vitna-anchor");
-    assert.equal(health.body.airgap, true);
+    assert.equal(health.body.model, null);
+    assert.equal(health.body.generation, false);
+    assert.equal(health.body.message, NO_MODEL_MESSAGE);
+    assert.equal("airgap" in health.body, false);
 
-    // 2. Models list
-    const models = await httpGet(testPort, "/v1/models");
+    const models = await httpCall(port, "GET", "/v1/models");
     assert.equal(models.status, 200);
-    assert.ok(Array.isArray(models.body.data));
-    assert.ok(models.body.data.some((m) => m.id === "vitna/anchor-moe"));
+    assert.deepEqual(models.body, { object: "list", data: [] });
 
-    // 3. Non-streaming chat completion
-    const comp1 = await httpPost(testPort, "/v1/chat/completions", {
-      model: "vitna/anchor-moe",
-      messages: [
-        { role: "system", content: "You are Vitna Anchor." },
-        { role: "user", content: "Demonstrate local sovereign inference." },
-      ],
-      temperature: 0,
-    });
-
-    assert.equal(comp1.status, 200);
-    assert.ok(comp1.body.choices[0].message.content.length > 0);
-    assert.ok(comp1.headers["x-vitna-trajectory-sha256"], "trajectory SHA-256 header present");
-    assert.equal(comp1.body.proof.airgap, true);
-    assert.equal(comp1.body.proof.socket_egress_bytes, 0);
-
-    // 4. Prompt semantic cache verification (identical query with temperature 0)
-    const comp2 = await httpPost(testPort, "/v1/chat/completions", {
-      model: "vitna/anchor-moe",
-      messages: [
-        { role: "system", content: "You are Vitna Anchor." },
-        { role: "user", content: "Demonstrate local sovereign inference." },
-      ],
-      temperature: 0,
-    });
-
-    assert.equal(comp2.status, 200);
-    assert.equal(comp2.body.cache_hit, true, "prompt cache hit served at <1ms");
-    assert.equal(comp2.body.choices[0].message.content, comp1.body.choices[0].message.content);
-
-    // 5. Grammar-constrained JSON decoding
-    const jsonComp = await httpPost(testPort, "/v1/chat/completions", {
-      model: "vitna/anchor-moe",
-      messages: [
-        { role: "user", content: "Return structured system status in JSON." },
-      ],
-      response_format: { type: "json_object" },
-    });
-
-    assert.equal(jsonComp.status, 200);
-    const parsedJson = JSON.parse(jsonComp.body.choices[0].message.content);
-    assert.equal(parsedJson.status, "success");
-    assert.equal(parsedJson.grammar_enforced, true);
-    assert.ok(jsonComp.body.grammar_tokens_masked > 0, "grammar pushdown automaton masked invalid candidate tokens");
-
-    // 6. Streaming SSE completion
-    const streamRes = await new Promise((resolve, reject) => {
-      const req = httpRequest(
-        {
-          hostname: "127.0.0.1",
-          port: testPort,
-          path: "/v1/chat/completions",
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-          },
-        },
-        (res) => {
-          let chunks = [];
-          res.on("data", (c) => chunks.push(c.toString("utf8")));
-          res.on("end", () => resolve({ status: res.statusCode, output: chunks.join("") }));
-        }
-      );
-      req.on("error", reject);
-      req.write(JSON.stringify({
-        model: "vitna/anchor-moe",
-        messages: [{ role: "user", content: "Streaming test" }],
+    for (const path of ["/v1/chat/completions", "/v1/completions"]) {
+      const res = await httpCall(port, "POST", path, {
+        model: "anything",
+        messages: [{ role: "user", content: "hello" }],
         stream: true,
-      }));
-      req.end();
-    });
+      });
+      assert.equal(res.status, 501, path);
+      assert.equal(res.body.error.code, "no_model");
+      assert.equal(res.body.error.message, NO_MODEL_MESSAGE);
+      assert.equal(res.body.choices, undefined, "no completion is invented");
+      assert.equal(res.body.usage, undefined, "no token count is invented");
+      assert.equal(res.headers["access-control-allow-origin"], undefined, "no page on another origin may call it");
+    }
 
-    assert.equal(streamRes.status, 200);
-    assert.ok(streamRes.output.includes("data: [DONE]"), "SSE stream terminated with [DONE]");
-    assert.ok(streamRes.output.includes("chat.completion.chunk"), "SSE chunks present");
-
+    const missing = await httpCall(port, "GET", "/v1/telemetry");
+    assert.equal(missing.status, 404);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
 });
 
-test("vitna-anchor route calculates lowest-cost provider and arbitrage savings", () => {
-  const result = runRouteCli("meta-llama/llama-3.3-70b-instruct", {
-    inputTokens: 2000,
-    outputTokens: 500,
-    isJson: true,
-  });
-
-  assert.equal(result.ok, true);
-  assert.equal(result.family, "llama-3.3-70b");
-  assert.equal(result.chosenProvider, "deepinfra");
-  assert.ok(result.costUsd > 0);
-  assert.ok(result.savingsUsd > 0);
-  assert.ok(result.savingsPct > 0);
-  assert.ok(result.fallbackChain.length > 0);
+test("chat says that no model runs, and exits non-zero", () => {
+  const result = runBin("chat");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No model runs yet/);
+  assert.equal(result.stdout, "");
 });
 
-test("vitna-anchor draft executes speculative candidate generation and verification", () => {
-  const result = runDraftCli("Benchmark direct NVMe DMA engine", {
-    window: 4,
-    turns: 4,
-    isJson: true,
-  });
+test("a removed command says why it went, and exits non-zero", () => {
+  for (const command of ["probe", "route", "draft", "bench", "tune", "registry"]) {
+    const result = runBin(command);
+    assert.equal(result.status, 1, command);
+    assert.match(result.stderr, new RegExp(`"${command}" was removed: `));
+    assert.ok(result.stderr.includes(REMOVED_COMMANDS[command]), command);
+  }
+});
 
-  assert.equal(result.lookaheadWindow, 4);
-  assert.equal(result.steps.length, 4);
-  assert.ok(result.totalDrafted >= 16);
-  assert.ok(result.totalAccepted > 0);
-  assert.ok(result.acceptanceRate > 0.5);
-  assert.ok(result.speedupFactor >= 1.5);
-  assert.ok(result.generatedText.length > 0);
+test("the bin entry runs the command line and prints no install command", () => {
+  const result = runBin("--help");
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /No model runs yet/);
+  assert.doesNotMatch(result.stdout, /npx|npm install/);
+});
+
+test("schema refuses a path that is neither a file nor JSON, rather than compiling a stand-in", () => {
+  const result = runBin("schema", "./no-such-schema.json");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /neither an existing file nor valid JSON/);
+
+  const inline = runBin("schema", '{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}', "--json");
+  assert.equal(inline.status, 0);
+  const pda = JSON.parse(inline.stdout);
+  assert.equal(pda.requiredCount, 1);
 });

@@ -49,12 +49,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
       - name: Build Engine with Make (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
           cd engine
           make
-      - name: Test Native Engine Benchmark (Linux / macOS)
+      - name: Run the int4 kernel microbenchmark (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
           ./engine/vitna-anchor bench --iterations 5
@@ -63,7 +66,11 @@ jobs:
         run: |
           cmake -B engine/build -S engine
           cmake --build engine/build --config Release
-      - name: Test Native Engine Benchmark (Windows)
+      - name: Run the int4 kernel microbenchmark (Windows)
         if: runner.os == 'Windows'
         run: |
           .\engine\build\Release\vitna-anchor.exe bench --iterations 5
+      - name: Test the engine's server
+        env:
+          VITNA_REQUIRE_ENGINE: "1"
+        run: node --test tests/engine-server.test.mjs

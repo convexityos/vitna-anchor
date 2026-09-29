@@ -1,7 +1,7 @@
 {
   "name": "vitna-anchor",
   "version": "0.1.0",
-  "description": "Sovereign MoE inference engine, direct NVMe DMA streaming, speculative drafting, and Smart Order Router",
+  "description": "An inference engine in C, being built one gate at a time. No model runs yet.",
   "type": "module",
   "bin": {
     "vitna-anchor": "./bin/vitna-anchor.mjs",
@@ -16,18 +16,12 @@
   ],
   "scripts": {
     "test": "node --test \"tests/*.test.mjs\"",
-    "probe": "node runtime/anchor-run.mjs probe",
-    "chat": "node runtime/anchor-run.mjs chat",
     "serve": "node runtime/anchor-run.mjs serve",
+    "chat": "node runtime/anchor-run.mjs chat",
     "pull": "node runtime/anchor-run.mjs pull",
     "quantize": "node runtime/anchor-run.mjs quantize",
-    "tune": "node runtime/anchor-run.mjs tune",
-    "route": "node runtime/anchor-run.mjs route",
-    "draft": "node runtime/anchor-run.mjs draft",
-    "bench": "node runtime/anchor-run.mjs bench",
     "stripe": "node runtime/anchor-run.mjs stripe",
-    "schema": "node runtime/anchor-run.mjs schema",
-    "registry": "node runtime/anchor-run.mjs registry"
+    "schema": "node runtime/anchor-run.mjs schema"
   },
   "repository": {
     "type": "git",
@@ -36,14 +30,10 @@
   "homepage": "https://vitna.ai/anchor",
   "keywords": [
     "inference",
-    "moe",
-    "speculative-decoding",
-    "sovereign",
     "llm",
-    "nvme",
-    "openai-compatible",
     "local-ai",
-    "arbitrage"
+    "safetensors",
+    "gguf"
   ],
   "author": "Convexity <engineering@convexity.com>",
   "license": "Apache-2.0",

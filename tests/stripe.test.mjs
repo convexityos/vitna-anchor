@@ -1,62 +1,63 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import {
-  sliceStripedDmaSlabs,
-  benchmarkStripedReadThroughput,
-  formatStripeSummary,
-} from "../runtime/stripe.mjs";
+import { sliceStripedDmaSlabs, formatStripeSummary } from "../runtime/stripe.mjs";
 
-test("benchmarkStripedReadThroughput scales bandwidth linearly across drive counts", () => {
-  const single = benchmarkStripedReadThroughput(1, 7.45);
-  assert.equal(single.driveCount, 1);
-  assert.equal(single.aggregateGBps, 7.45);
-  assert.equal(single.scalingEfficiencyPct, 100);
-
-  const dual = benchmarkStripedReadThroughput(2, 7.45);
-  assert.equal(dual.driveCount, 2);
-  assert.equal(dual.aggregateGBps, 14.3);
-  assert.equal(dual.scalingEfficiencyPct, 96);
-  assert.ok(dual.projectedToksSec.deepseek671b > single.projectedToksSec.deepseek671b);
-
-  const quad = benchmarkStripedReadThroughput(4, 7.45);
-  assert.equal(quad.driveCount, 4);
-  assert.equal(quad.aggregateGBps, 27.42);
-  assert.equal(quad.scalingEfficiencyPct, 92);
-  assert.ok(quad.projectedToksSec.deepseek671b > dual.projectedToksSec.deepseek671b);
-});
-
-test("sliceStripedDmaSlabs round-robins chunks across drive partitions", () => {
+test("sliceStripedDmaSlabs round-robins chunks across directories", () => {
   const testRoot = join(tmpdir(), "vitna-test-stripe-" + Date.now());
+  const source = join(testRoot, "test-moe.dma.anchor");
   const drive0 = join(testRoot, "nvme0");
   const drive1 = join(testRoot, "nvme1");
 
   try {
-    const manifest = sliceStripedDmaSlabs("test-moe.dma.anchor", [drive0, drive1], {
-      chunkSizeBytes: 4096,
-      syntheticSizeBytes: 32768, // 8 x 4KB sectors total -> 4 sectors per drive
-    });
+    mkdirSync(testRoot, { recursive: true });
+    // 8 chunks of 4096 bytes, each filled with its own index
+    const payload = Buffer.alloc(8 * 4096);
+    for (let c = 0; c < 8; c++) payload.fill(c + 1, c * 4096, (c + 1) * 4096);
+    writeFileSync(source, payload);
+
+    const manifest = sliceStripedDmaSlabs(source, [drive0, drive1], { chunkSizeBytes: 4096 });
 
     assert.equal(manifest.driveCount, 2);
     assert.equal(manifest.chunkSizeBytes, 4096);
     assert.equal(manifest.totalSectorPaddedBytes, 32768);
     assert.equal(manifest.partitions.length, 2);
+    assert.equal("bandwidthScalingFactor" in manifest, false, "no throughput figure is invented");
 
     assert.equal(manifest.partitions[0].sectorCount, 4);
     assert.equal(manifest.partitions[1].sectorCount, 4);
     assert.ok(existsSync(manifest.partitions[0].path));
     assert.ok(existsSync(manifest.partitions[1].path));
-    assert.match(manifest.airgapSha256, /^[0-9a-f]{64}$/);
+    // The source is already a whole number of chunks, so no padding was added
+    // and the striped digest is the source file's own digest.
+    assert.equal(manifest.stripedDataSha256, createHash("sha256").update(payload).digest("hex"));
+
+    // Even chunks land in the first directory and odd chunks in the second
+    const first = readFileSync(manifest.partitions[0].path);
+    const second = readFileSync(manifest.partitions[1].path);
+    assert.deepEqual([...first.subarray(0, 4096 * 4)].filter((_, i) => i % 4096 === 0), [1, 3, 5, 7]);
+    assert.deepEqual([...second.subarray(0, 4096 * 4)].filter((_, i) => i % 4096 === 0), [2, 4, 6, 8]);
 
     const summary = formatStripeSummary(manifest);
-    assert.ok(summary.includes("MULTI-DRIVE NVME STRIPE COMPLETE"));
-    assert.ok(summary.includes("2 Drives Striped"));
+    assert.ok(summary.includes("STRIPE WRITTEN"));
+    assert.ok(summary.includes("chunks written round-robin"));
   } finally {
-    try {
-      rmSync(testRoot, { recursive: true, force: true });
-    } catch {}
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("sliceStripedDmaSlabs refuses a source file that does not exist", () => {
+  const testRoot = join(tmpdir(), "vitna-test-stripe-missing-" + Date.now());
+  try {
+    assert.throws(
+      () => sliceStripedDmaSlabs(join(testRoot, "missing.gguf"), [join(testRoot, "a"), join(testRoot, "b")]),
+      /Source file not found/
+    );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
   }
 });

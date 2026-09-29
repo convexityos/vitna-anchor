@@ -178,7 +178,7 @@ test("sliceDmaAlignedSlabs repacks safetensors with 100% 4KB aligned offsets", (
     assert.equal(realResult.tensorCount, 3);
     assert.ok(existsSync(realResult.alignedFilePath), "DMA aligned file must exist");
     assert.ok(existsSync(realResult.manifestPath), "Index manifest must exist");
-    assert.ok(realResult.airgapHash.length === 64, "SHA-256 hash must be 64 hex chars");
+    assert.match(realResult.tensorDataSha256, /^[0-9a-f]{64}$/, "SHA-256 hash must be 64 hex chars");
 
     const check = verifyDmaAlignment(realResult.manifestPath);
     assert.equal(check.valid, true);
@@ -281,7 +281,7 @@ test("runModelPull executes local checkpoint ingestion, sharded index, and remot
     // 1. Local single-file pull test
     const localResult = await runModelPull(srcFile, { outDir: join(testDir, "out_single") });
     assert.equal(localResult.tensorCount, 3);
-    assert.ok(localResult.airgapHash);
+    assert.match(localResult.tensorDataSha256, /^[0-9a-f]{64}$/);
 
     // 2. Local sharded index pull test
     const shardedResult = await runModelPull(synthSharded.indexPath, { outDir: join(testDir, "out_sharded") });
