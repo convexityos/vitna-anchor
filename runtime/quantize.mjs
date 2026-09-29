@@ -1,13 +1,13 @@
-// quantize.mjs - Dynamic 4KB DMA weight quantizer for sovereign MoE inference.
+// quantize.mjs - Block-wise INT4 and INT8 weight quantizer.
 //
-// Converts raw FP16/BF16/FP32 tensor checkpoints into sector-aligned INT4 or INT8
-// slabs compatible with unbuffered direct I/O (O_DIRECT / FILE_FLAG_NO_BUFFERING)
-// and the C11 engine vitna_quant_type_t contract in engine/include/expert_store.h.
+// Converts FP16, BF16 or FP32 tensors into INT4 or INT8 slabs with every tensor
+// at a 4096-byte offset, following the vitna_quant_type_t values in
+// engine/include/expert_store.h. The alignment is what direct I/O would need;
+// nothing reads these slabs with direct I/O yet, and no model has run on them.
 //
 // Rules:
 // - Zero external runtime dependencies
 // - Strictly zero em-dashes anywhere in comments, code, or strings
-// - 4096-byte DMA sector alignment guaranteed for all slabs and offsets
 
 import { createHash } from "node:crypto";
 import {
@@ -177,7 +177,7 @@ export function quantizeTensorBuffer(floatArray, bits = 4, groupSize = 64) {
  *   quantizedTotalBytes: number,
  *   netCompressionRatio: number,
  *   avgSnrDb: number,
- *   airgapHash: string,
+ *   sha256: string,
  * }}
  */
 export function quantizeSlabFile(inputPath, outputDir, options = {}) {
@@ -310,7 +310,9 @@ export function quantizeSlabFile(inputPath, outputDir, options = {}) {
     }
   }
 
-  const airgapHash = sha256.digest("hex");
+  // The SHA-256 of the slab file, which holds exactly these buffers from
+  // offset 0. A dry run writes no file, so it has no digest.
+  const slabSha256 = dryRun ? null : sha256.digest("hex");
   const netCompressionRatio = Number((originalTotalBytes / Math.max(1, quantizedTotalBytes)).toFixed(2));
   const avgSnrDb = totalTensors > 0 ? Number((snrSum / totalTensors).toFixed(2)) : 0.0;
 
@@ -325,7 +327,7 @@ export function quantizeSlabFile(inputPath, outputDir, options = {}) {
     quantizedTotalBytes,
     netCompressionRatio,
     avgSnrDb,
-    airgapHash,
+    sha256: slabSha256,
     dmaFile: quantSlabName,
     tensors: tensorRecords,
     timestamp: new Date().toISOString(),
@@ -345,6 +347,6 @@ export function quantizeSlabFile(inputPath, outputDir, options = {}) {
     quantizedTotalBytes,
     netCompressionRatio,
     avgSnrDb,
-    airgapHash,
+    sha256: slabSha256,
   };
 }

@@ -1,4 +1,5 @@
-// ingest.mjs - Sovereign model weights ingestion, HuggingFace downloader, and 4KB DMA slab slicing engine.
+// ingest.mjs - Checkpoint ingestion: SafeTensors and GGUF parsing, Hugging Face
+// downloads, and rewriting a checkpoint with every tensor at a 4096-byte offset.
 //
 // Zero external dependencies.
 // Dark Calm Terminal styling. Strictly zero em-dashes.
@@ -453,7 +454,7 @@ export function sliceGgufDmaSlabs(sourcePath, outputDir, options = {}) {
       alignedFilePath,
       tensorCount: records.length,
       totalBytesWritten: currentOffset,
-      airgapHash: "DRY_RUN_ATTESTATION_PENDING",
+      tensorDataSha256: null,
       records,
     };
   }
@@ -500,7 +501,9 @@ export function sliceGgufDmaSlabs(sourcePath, outputDir, options = {}) {
     closeSync(dstFd);
   }
 
-  const airgapHash = hasher.digest("hex");
+  // SHA-256 of the tensors' bytes in file order, padding excluded. It is not
+  // the digest of the file written, which also holds the padding.
+  const tensorDataSha256 = hasher.digest("hex");
 
   const manifest = {
     format: "vitna-anchor-dma-v1",
@@ -509,7 +512,7 @@ export function sliceGgufDmaSlabs(sourcePath, outputDir, options = {}) {
     sourceFile: basename(sourcePath),
     totalTensors: records.length,
     sectorSize: SECTOR_SIZE,
-    airgapSha256: airgapHash,
+    tensorDataSha256,
     createdAt: new Date().toISOString(),
     tensors: records.map((r) => ({
       name: r.name,
@@ -533,7 +536,7 @@ export function sliceGgufDmaSlabs(sourcePath, outputDir, options = {}) {
     alignedFilePath,
     tensorCount: records.length,
     totalBytesWritten: currentOffset,
-    airgapHash,
+    tensorDataSha256,
     records,
   };
 }
@@ -607,7 +610,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
       alignedFilePath,
       tensorCount: records.length,
       totalBytesWritten: currentOffset,
-      airgapHash: "DRY_RUN_ATTESTATION_PENDING",
+      tensorDataSha256: null,
       records,
     };
   }
@@ -654,7 +657,9 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     closeSync(dstFd);
   }
 
-  const airgapHash = hasher.digest("hex");
+  // SHA-256 of the tensors' bytes in file order, padding excluded. It is not
+  // the digest of the file written, which also holds the padding.
+  const tensorDataSha256 = hasher.digest("hex");
 
   const manifest = {
     format: "vitna-anchor-dma-v1",
@@ -662,7 +667,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     sourceFile: basename(sourcePath),
     totalTensors: records.length,
     sectorSize: SECTOR_SIZE,
-    airgapSha256: airgapHash,
+    tensorDataSha256,
     createdAt: new Date().toISOString(),
     tensors: records.map((r) => ({
       name: r.name,
@@ -686,7 +691,7 @@ export function sliceDmaAlignedSlabs(sourcePath, outputDir, options = {}) {
     alignedFilePath,
     tensorCount: records.length,
     totalBytesWritten: currentOffset,
-    airgapHash,
+    tensorDataSha256,
     records,
   };
 }
@@ -820,7 +825,7 @@ export function sliceShardedDmaSlabs(shardPaths, outputDir, options = {}) {
         sourceShard: basename(shardPath),
         tensorCount: shardRecords.length,
         totalBytesWritten: currentOffset,
-        airgapSha256: hasher.digest("hex"),
+        tensorDataSha256: hasher.digest("hex"),
       });
     } else {
       shardSummaries.push({
@@ -829,7 +834,7 @@ export function sliceShardedDmaSlabs(shardPaths, outputDir, options = {}) {
         sourceShard: basename(shardPath),
         tensorCount: shardRecords.length,
         totalBytesWritten: currentOffset,
-        airgapSha256: "DRY_RUN_ATTESTATION_PENDING",
+        tensorDataSha256: null,
       });
     }
   }
@@ -920,30 +925,31 @@ export function verifyDmaAlignment(manifestPath) {
  * @param {string} url
  * @returns {Promise<boolean>}
  */
-export function probeRemoteUrl(url) {
+export function probeRemoteUrl(url, { timeoutMs = 10_000 } = {}) {
   return new Promise((resolve) => {
     const parsedUrl = new URL(url);
     const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
 
+    // agent: false gives this request a connection of its own, closed when it
+    // ends. Through the shared keep-alive agent, with the response never read,
+    // the idle socket held the process open for minutes after a dry run.
     const req = client(
       url,
-      { method: "HEAD", headers: { "User-Agent": "vitna-anchor/0.1.0" } },
+      { method: "HEAD", agent: false, headers: { "User-Agent": "vitna-anchor/0.1.0" } },
       (res) => {
-        if (res.statusCode >= 200 && res.statusCode < 400) {
-          resolve(true);
-        } else {
-          resolve(false);
-        }
+        res.resume();
+        resolve(res.statusCode >= 200 && res.statusCode < 400);
       }
     );
 
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`HEAD ${url} timed out after ${timeoutMs} ms`)));
     req.on("error", () => resolve(false));
     req.end();
   });
 }
 
 /**
- * Stream download a remote URL following redirects with air-gap hash computation.
+ * Stream download a remote URL, following redirects, and compute its SHA-256.
  * @param {string} url
  * @param {string} destPath
  * @param {{ onProgress?: (downloaded: number, total: number) => void }} options
@@ -1097,7 +1103,7 @@ export async function runModelPull(target, options = {}) {
       console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
       console.log(`  Aligned Output    : ${ANSI.bold}${result.alignedFilePath}${ANSI.reset}`);
       console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}`);
-      console.log(`  Air-Gap SHA-256   : ${ANSI.amber}${result.airgapHash.slice(0, 32)}...${ANSI.reset}\n`);
+      console.log(`  Tensor SHA-256    : ${result.tensorDataSha256} (tensor bytes, padding excluded)\n`);
       return result;
     }
 
@@ -1119,7 +1125,7 @@ export async function runModelPull(target, options = {}) {
     console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
     console.log(`  Aligned Output    : ${ANSI.bold}${result.alignedFilePath}${ANSI.reset}`);
     console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}`);
-    console.log(`  Air-Gap SHA-256   : ${ANSI.amber}${result.airgapHash.slice(0, 32)}...${ANSI.reset}\n`);
+    console.log(`  Tensor SHA-256    : ${result.tensorDataSha256} (tensor bytes, padding excluded)\n`);
     return result;
   }
 
@@ -1136,13 +1142,13 @@ export async function runModelPull(target, options = {}) {
   const hasIndex = await probeRemoteUrl(indexManifestUrl);
 
   if (hasIndex) {
-    console.log(`  Architecture Type : ${ANSI.bold}Sharded Frontier Checkpoint (model.safetensors.index.json)${ANSI.reset}`);
+    console.log(`  Architecture Type : ${ANSI.bold}Sharded checkpoint (model.safetensors.index.json)${ANSI.reset}`);
 
     if (dryRun) {
       console.log(`  Dry Run Plan      : ${ANSI.amber}Simulating Multi-Shard Hub Resolution & 4KB Layout${ANSI.reset}`);
       console.log(`  Remote Index URL  : ${indexManifestUrl}`);
       console.log(`  Target Directory  : ${outDir}`);
-      console.log(`  DMA Sector Size   : 4096 bytes (O_DIRECT unbuffered ready)\n`);
+      console.log(`  Tensor Alignment  : 4096-byte offsets\n`);
       return {
         repoId,
         sharded: true,
@@ -1202,7 +1208,7 @@ export async function runModelPull(target, options = {}) {
     console.log(`  Dry Run Plan      : ${ANSI.amber}Simulating Hub resolution & 4KB alignment layout${ANSI.reset}`);
     console.log(`  Target Hub URL    : ${singleSafetensorUrl}`);
     console.log(`  Target Slab File  : ${join(outDir, `${basename(repoId)}.dma.anchor`)}`);
-    console.log(`  DMA Sector Size   : 4096 bytes (O_DIRECT unbuffered ready)\n`);
+    console.log(`  Tensor Alignment  : 4096-byte offsets\n`);
     return {
       repoId,
       sharded: false,
@@ -1238,7 +1244,7 @@ export async function runModelPull(target, options = {}) {
     console.log(`  Tensors Processed : ${ANSI.bold}${result.tensorCount}${ANSI.reset}`);
     console.log(`  Aligned Output    : ${ANSI.bold}${result.alignedFilePath}${ANSI.reset}`);
     console.log(`  Index Manifest    : ${ANSI.bold}${result.manifestPath}${ANSI.reset}`);
-    console.log(`  Air-Gap SHA-256   : ${ANSI.amber}${result.airgapHash.slice(0, 32)}...${ANSI.reset}\n`);
+    console.log(`  Tensor SHA-256    : ${result.tensorDataSha256} (tensor bytes, padding excluded)\n`);
     return result;
   } catch (err) {
     console.error(`\n  ${ANSI.amber}Ingestion aborted: ${err.message}${ANSI.reset}\n`);

@@ -3,6 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -173,18 +174,24 @@ test("sliceGgufDmaSlabs slices GGUF into 100% 4KB DMA aligned slabs with index m
     // 1. Dry run verification
     const dryResult = sliceGgufDmaSlabs(ggufPath, outDir, { dryRun: true });
     assert.equal(dryResult.tensorCount, 2);
-    assert.equal(dryResult.airgapHash, "DRY_RUN_ATTESTATION_PENDING");
+    assert.equal(dryResult.tensorDataSha256, null, "a dry run writes nothing, so it has nothing to hash");
 
     // 2. Real slice execution
     const result = sliceGgufDmaSlabs(ggufPath, outDir);
     assert.equal(result.tensorCount, 2);
     assert.ok(existsSync(result.alignedFilePath));
     assert.ok(existsSync(result.manifestPath));
-    assert.equal(typeof result.airgapHash, "string");
-    assert.equal(result.airgapHash.length, 64);
 
     // 3. Verify manifest contents and 4KB alignment invariant
     const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8"));
+
+    // The digest covers the tensors' bytes in order, padding excluded. Rebuild
+    // it from the file written, at the offsets the manifest gives.
+    const written = readFileSync(result.alignedFilePath);
+    const rebuilt = createHash("sha256");
+    for (const t of manifest.tensors) rebuilt.update(written.subarray(t.offset, t.offset + t.sizeBytes));
+    assert.equal(result.tensorDataSha256, rebuilt.digest("hex"));
+    assert.equal(manifest.tensorDataSha256, result.tensorDataSha256);
     assert.equal(manifest.format, "vitna-anchor-dma-v1");
     assert.equal(manifest.sourceFormat, "gguf");
     assert.equal(manifest.sectorSize, 4096);

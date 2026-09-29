@@ -1,8 +1,9 @@
-// Deterministic Pushdown Automaton (PDA) Schema Compiler for Vitna Anchor.
+// Pushdown automaton (PDA) compiler for JSON Schemas.
 //
-// Compiles JSON Schemas into grammatical transition tables that lock and prune
-// candidate tokens during speculative decoding, guaranteeing 100% syntactically
-// valid structured output with zero cloud egress.
+// Compiles a JSON Schema into transition tables, and checks text against them
+// one character at a time. A constrained decoder would use these tables to mask
+// the logits of tokens the schema forbids. No decoder does yet: there are no
+// logits to mask until a model runs, so this constrains no output today.
 //
 // Zero external dependencies.
 // Dark Calm Terminal styling. Strictly zero em-dashes.

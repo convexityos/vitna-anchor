@@ -1,2 +1,4 @@
 #!/usr/bin/env node
-import "../runtime/anchor-run.mjs";
+import { runCli } from "../runtime/anchor-run.mjs";
+
+runCli();
