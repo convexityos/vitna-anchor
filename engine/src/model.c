@@ -247,9 +247,19 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t n) {
     if (n < m->n_past) m->n_past = n;
 }
 
+void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
+    m->fail_armed = true;
+    m->fail_at = pos;
+}
+
 bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
     if (token < 0 || (size_t)token >= c->vocab || m->n_past >= m->ctx) return false;
+    if (m->fail_armed && m->n_past == m->fail_at) {
+        m->fail_armed = false;
+        fprintf(stderr, "The step at position %zu failed, as a test asked.\n", m->fail_at);
+        return false;
+    }
 
 #if defined(VITNA_CUDA)
     if (m->cuda) {

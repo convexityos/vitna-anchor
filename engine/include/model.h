@@ -80,6 +80,11 @@ typedef struct {
     /* Set by vitna_llama_use_cuda: the forward pass then runs on the GPU,
      * with its own key-value cache there, and k_cache and v_cache go unused. */
     struct vitna_cuda_model* cuda;
+
+    /* For tests, set by vitna_llama_fail_step_once: while fail_armed, the
+     * step at position fail_at fails. */
+    bool fail_armed;
+    size_t fail_at;
 } vitna_llama_t;
 
 /**
@@ -107,9 +112,20 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t n);
  * to the cache. Writes vocab logits to logits unless it is NULL, which skips
  * the output projection. Returns false if the cache is full or the token is
  * out of range, or, on a GPU, if the device reports an error, which is then
- * printed to stderr.
+ * printed to stderr, or when a test asked for this step to fail
+ * (vitna_llama_fail_step_once). A step that returns false leaves m->n_past
+ * where it was.
  */
 bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits);
+
+/**
+ * For tests: make the next step at position pos fail, once, as a step on the
+ * GPU does when the device reports an error, so that what its callers do
+ * then can be tested on a CPU. That step returns false before computing
+ * anything, on either device, and says so on stderr. A later step at pos runs
+ * as usual.
+ */
+void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos);
 
 /** True when this engine was built with the CUDA path (VITNA_CUDA). */
 bool vitna_llama_cuda_built(void);
