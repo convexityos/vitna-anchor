@@ -21,7 +21,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Passed, [#7](https://github.com/convexityos/vitna-anchor/pull/7). CI checks it on every push |
 | A4, one GPU | The A2 comparison passes on CUDA | Not started |
 | A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Not started |
-| A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | This change: reuse of the previous request's cache, and JSON object mode. JSON Schema is not constrained yet |
+| A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Passed, [#9](https://github.com/convexityos/vitna-anchor/pull/9), for reuse of the previous request's cache and for JSON object mode. CI checks it on every push. Constraining output to a JSON Schema is not built |
 
 ## What is in the repository
 
