@@ -27,7 +27,10 @@
   #include <malloc.h>
 #else
   #define VITNA_OS_POSIX 1
-  #define _GNU_SOURCE
+  /* g++, which nvcc hands model_cuda.cu to, defines it already. */
+  #ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+  #endif
   #include <stdlib.h>
   #include <sys/mman.h>
   #include <sys/stat.h>

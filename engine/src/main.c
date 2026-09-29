@@ -22,7 +22,11 @@
 #endif
 
 static void print_usage(const char* prog) {
-    printf("vitna-anchor engine: a dense Llama-architecture model on the CPU, in float32.\n\n");
+    if (vitna_llama_cuda_built()) {
+        printf("vitna-anchor engine: a dense Llama-architecture model in float32, on the CPU or, with --device cuda, on an NVIDIA GPU.\n\n");
+    } else {
+        printf("vitna-anchor engine: a dense Llama-architecture model on the CPU, in float32. This build has no CUDA path.\n\n");
+    }
     printf("Usage:\n");
     printf("  %s run      --model <dir> --prompt <text> [--max-new <n>] [sampling]\n", prog);
     printf("  %s generate --model <dir> (--prompt <text> | --ids <a,b,...>) [--max-new <n>] [sampling]\n", prog);
@@ -33,7 +37,9 @@ static void print_usage(const char* prog) {
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
-    printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n\n");
+    printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
+    printf("--device cpu|cuda runs the model on the CPU (the default) or on the first CUDA device, which needs an\n");
+    printf("engine built with the CUDA path. Asked for a device it cannot use, the engine says why and stops.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab\n");
@@ -56,6 +62,7 @@ typedef struct {
     const char* text;
     const char* model_id;
     const char* host;
+    const char* device;
     size_t max_new;
     size_t ctx;
     int iterations;
@@ -83,6 +90,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--text")) a->text = v;
         else if (TAKE("--model-id")) a->model_id = v;
         else if (TAKE("--host")) a->host = v;
+        else if (TAKE("--device")) a->device = v;
         else if (TAKE("--max-new")) a->max_new = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--ctx")) a->ctx = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--iterations")) a->iterations = atoi(v);
@@ -232,10 +240,20 @@ static int cmd_tokenize(const args_t* a) {
     return rc;
 }
 
+static bool wants_cuda(const args_t* a) {
+    return a->device && strcmp(a->device, "cuda") == 0;
+}
+
 static bool load_model(const args_t* a, vitna_llama_t* m) {
     char err[512];
     if (!vitna_llama_load(m, a->model, a->ctx, err, sizeof(err))) {
         fprintf(stderr, "%s\n", err);
+        return false;
+    }
+    /* Asked for the GPU, the model runs there or not at all. */
+    if (wants_cuda(a) && !vitna_llama_use_cuda(m, err, sizeof(err))) {
+        fprintf(stderr, "--device cuda: %s\n", err);
+        vitna_llama_free(m);
         return false;
     }
     return true;
@@ -513,7 +531,8 @@ static int cmd_serve(const args_t* a) {
         fprintf(stderr, "out of memory\n");
     } else {
         vitna_api_set_prefix_cache(api, !a->no_prefix_cache);
-        printf("Loaded %s: %zu layers, %zu-token context, matvec path %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_matvec_path());
+        char device[400];
+        printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;
         rc = vitna_server_run(&cfg);
         vitna_api_free(api);
@@ -536,6 +555,19 @@ int main(int argc, char** argv) {
     }
     args_t a;
     if (!parse_args(argc, argv, &a)) return 1;
+    /* A device the engine cannot use is refused before anything is loaded,
+     * and nothing falls back to the CPU in its place. */
+    if (a.device && strcmp(a.device, "cpu") != 0) {
+        char err[512];
+        if (!wants_cuda(&a)) {
+            fprintf(stderr, "--device must be cpu or cuda, not %s\n", a.device);
+            return 1;
+        }
+        if (!vitna_llama_cuda_probe(err, sizeof(err))) {
+            fprintf(stderr, "--device cuda: %s\n", err);
+            return 1;
+        }
+    }
 
     if (strcmp(cmd, "run") == 0) return cmd_run(&a);
     if (strcmp(cmd, "generate") == 0) return cmd_generate(&a);
