@@ -39,7 +39,7 @@ function listen(server) {
   return new Promise((resolve) => server.on("listening", () => resolve(server.address().port)));
 }
 
-test("serve says it serves no model yet, and answers generation with 501", async () => {
+test("serve says the engine serves the model, not it, and answers generation with 501", async () => {
   const server = startAnchorServer({ port: 0, quiet: true });
   const port = await listen(server);
   try {
@@ -75,10 +75,10 @@ test("serve says it serves no model yet, and answers generation with 501", async
   }
 });
 
-test("chat says the server serves no model yet, and exits non-zero", () => {
+test("chat says the engine serves the model, and exits non-zero", () => {
   const result = runBin("chat");
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /does not serve a model yet/);
+  assert.match(result.stderr, /does not serve a model\. The C engine does/);
   assert.equal(result.stdout, "");
 });
 
@@ -94,7 +94,7 @@ test("a removed command says why it went, and exits non-zero", () => {
 test("the bin entry runs the command line and prints no install command", () => {
   const result = runBin("--help");
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /does not serve a model yet/);
+  assert.match(result.stdout, /does not serve a model\. The C engine does/);
   assert.doesNotMatch(result.stdout, /npx|npm install/);
 });
 

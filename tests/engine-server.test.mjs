@@ -1,4 +1,4 @@
-// The C engine's HTTP server says that no model runs.
+// The C engine's HTTP server, started without a model, says so.
 //
 // Needs a built engine: engine/vitna-anchor(.exe), engine/build/Release/
 // vitna-anchor.exe, or a path in VITNA_ENGINE. Without one the test is skipped,
@@ -53,11 +53,11 @@ async function call(port, method, path, body) {
   return { status: res.status, headers: res.headers, body: await res.json() };
 }
 
-test("the engine's server says it serves no model yet, and answers generation with 501", { skip: !engine && !required && "no built engine found" }, async () => {
+test("the engine's server, started without a model, says so and answers generation with 501", { skip: !engine && !required && "no built engine found" }, async () => {
   assert.ok(engine, `no built engine found; looked in ${CANDIDATES.join(", ")}`);
   const { child, port, out } = await startEngine();
   try {
-    assert.match(out, /does not serve a model yet/);
+    assert.match(out, /started without a model/);
 
     const health = await call(port, "GET", "/v1/health");
     assert.equal(health.status, 200);

@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // Command line for vitna-anchor.
 //
-// This command line runs no model. The C engine in engine/ does, from its own
-// command line (gate A2); serving it over HTTP is gate A3. Until then `serve`
-// answers every generation request with 501 and `chat` says so and exits.
-// The other commands work on files: they parse, slice, stripe and quantize
-// checkpoints, and compile JSON Schemas.
+// This command line runs no model. The C engine in engine/ does: it runs one
+// from its own command line (gate A2) and serves it over an OpenAI-compatible
+// /v1 (gate A3). This command line's `serve` answers every generation request
+// with 501 and names the engine's, and `chat` says so and exits. The other
+// commands work on files: they parse, slice, stripe and quantize checkpoints,
+// and compile JSON Schemas.
 //
 // Nothing this command line prints is a performance figure or a claim about
 // the machine. A figure appears only once a gate in the README measures it.
@@ -22,8 +23,8 @@ import { sliceStripedDmaSlabs, formatStripeSummary } from "./stripe.mjs";
 import { compileJsonSchemaToPda, formatGrammarSummary } from "./grammar.mjs";
 
 export const NO_MODEL_MESSAGE =
-  "This server does not serve a model yet: that is gate A3 in the README. " +
-  "The engine runs one from its command line: vitna-anchor run --model <dir> --prompt <text>.";
+  "This Node.js server does not serve a model. The C engine does: build engine/ and run " +
+  "vitna-anchor serve --model <dir>, which answers at http://127.0.0.1:8765/v1.";
 
 // Commands earlier versions offered, and why each one went. Calling one prints
 // its reason rather than a bare "unknown command".
