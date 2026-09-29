@@ -12,7 +12,8 @@
  * five kernels:
  *   - RMSNorm into shared memory, then the query, key and value projections,
  *     with the rotary embedding applied as the query and key rows are written;
- *   - attention;
+ *   - attention, its positions split into slices across blocks, the slices
+ *     combined by the last block to finish;
  *   - the output projection, added to the residual;
  *   - RMSNorm into shared memory, then the gate and up projections, with
  *     SiLU(gate) * up formed as their rows are;
@@ -60,6 +61,11 @@
 #define THREADS 256
 #define WARPS (THREADS / 32)
 
+/* Attention splits each key-value head's positions into at most this many
+ * slices, of at least ATTENTION_MIN_SLICE positions each. */
+#define ATTENTION_SPLITS 32
+#define ATTENTION_MIN_SLICE 32
+
 /* Minus infinity, from its bits: MSVC's INFINITY macro overflows a constant to get it. */
 #define NEG_INF __uint_as_float(0xff800000u)
 
@@ -97,7 +103,9 @@ struct vitna_cuda_model {
     const float* sin_t;
     float* k_cache;         /* [n_layers][ctx][n_kv_heads * head_dim] */
     float* v_cache;
-    float *x, *q, *att, *act, *logits, *scores;
+    float *x, *q, *att, *act, *logits;
+    float *part_m, *part_l, *part_o; /* attention's slices: [n_heads][splits], and [.][.][head_dim] */
+    unsigned int* done;              /* per key-value head, the slices finished in this layer */
     step_t* step;
 
     cudaStream_t stream;
@@ -314,60 +322,107 @@ __global__ void attn_in_kernel(const float* __restrict__ x, const float* __restr
     }
 }
 
-/* Attention for one query head per block, as model.c's loop over heads:
- * scores against the cached keys of positions 0 to pos, a softmax, and the
- * weighted sum of the cached values. Query head h reads key-value head
- * h / group (repeat_kv). scores has room for ctx floats per head. */
+/* Attention over positions 0 to pos, split across blocks by position
+ * (flash-decoding). Block (split, kvh) takes key-value head kvh with the
+ * query heads that read it (repeat_kv: query head h reads key-value head
+ * h / group), and one slice of the positions: their scores, a softmax over
+ * the slice alone, and the slice's weighted sum of values, unnormalized.
+ * Only as many slices as the positions need at ATTENTION_MIN_SLICE each are
+ * used, and the other blocks return at once. The last block of a key-value
+ * head to finish combines the slices, in split order, into the softmax over
+ * every position: a slice's sums are scaled by exp(its max - the overall
+ * max). That is model.c's softmax, summed in another order. Dynamic shared
+ * memory holds the group's queries, then the slice's scores: group *
+ * (head_dim + per) floats. */
 __global__ void attention_kernel(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
-                                 float* __restrict__ att, float* __restrict__ scores, const step_t* __restrict__ step,
-                                 int head_dim, int kv_dim, int group, int ctx, float scale) {
-    __shared__ float red[WARPS];
-    __shared__ float part[THREADS];
+                                 float* __restrict__ att, float* __restrict__ part_m, float* __restrict__ part_l,
+                                 float* __restrict__ part_o, unsigned int* __restrict__ done, const step_t* __restrict__ step,
+                                 int head_dim, int kv_dim, int group, float scale) {
+    extern __shared__ float4 shared4[];
+    __shared__ int last;
+    const int split = blockIdx.x, kvh = blockIdx.y;
     const int n = step->pos + 1;
-    const int h = blockIdx.x, kvh = h / group;
+    /* As many slices as n needs at ATTENTION_MIN_SLICE positions each, up
+     * to the grid's width; the blocks past them have nothing to do. */
+    const int splits = min((int)gridDim.x, (n + ATTENTION_MIN_SLICE - 1) / ATTENTION_MIN_SLICE);
+    if (split >= splits) return;
+    const int per = (n + splits - 1) / splits;
+    const int t0 = split * per;
+    const int len = max(0, min(n, t0 + per) - t0);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float* qh = q + (size_t)h * head_dim;
+    const int h0 = kvh * group; /* the first query head that reads this key-value head */
+    const int gd = group * head_dim;
     const float* kh = kc + (size_t)kvh * head_dim;
     const float* vh = vc + (size_t)kvh * head_dim;
-    float* s = scores + (size_t)h * ctx;
+    float* qs = reinterpret_cast<float*>(shared4);
+    float* s = qs + gd; /* s[h * per + t] */
+
+    for (int i = threadIdx.x; i < gd; i += THREADS) qs[i] = q[(size_t)h0 * head_dim + i];
+    __syncthreads();
 
     /* Scores: a warp per position, its lanes across the head's dimensions. */
-    for (int t = warp; t < n; t += WARPS) {
-        const float* kt = kh + (size_t)t * kv_dim;
-        float d = 0.0f;
-        for (int i = lane; i < head_dim; i += 32) d = fmaf(qh[i], kt[i], d);
-        d = warp_sum(d);
-        if (lane == 0) s[t] = d * scale;
+    for (int t = warp; t < len; t += WARPS) {
+        const float* kt = kh + (size_t)(t0 + t) * kv_dim;
+        for (int h = 0; h < group; h++) {
+            float d = 0.0f;
+            for (int i = lane; i < head_dim; i += 32) d = fmaf(qs[h * head_dim + i], kt[i], d);
+            d = warp_sum(d);
+            if (lane == 0) s[h * per + t] = d * scale;
+        }
     }
     __syncthreads();
 
-    float mx = NEG_INF;
-    for (int t = threadIdx.x; t < n; t += THREADS) mx = fmaxf(mx, s[t]);
-    mx = block_max(mx, red);
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < n; t += THREADS) {
-        const float e = expf(s[t] - mx);
-        s[t] = e;
-        sum += e;
+    /* The slice's softmax, left unnormalized, a warp per head: its max,
+     * exp(score - max) and their sum. */
+    for (int h = warp; h < group; h += WARPS) {
+        float mx = NEG_INF;
+        for (int t = lane; t < len; t += 32) mx = fmaxf(mx, s[h * per + t]);
+        mx = warp_max(mx);
+        float sum = 0.0f;
+        for (int t = lane; t < len; t += 32) {
+            const float e = expf(s[h * per + t] - mx);
+            s[h * per + t] = e;
+            sum += e;
+        }
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            part_m[(size_t)(h0 + h) * ATTENTION_SPLITS + split] = mx;  /* minus infinity for an empty slice */
+            part_l[(size_t)(h0 + h) * ATTENTION_SPLITS + split] = sum; /* and 0 */
+        }
     }
-    sum = block_sum(sum, red); /* its barriers also publish every s[t] written above */
-    const float inv = 1.0f / sum;
-
-    /* Values: thread (g, i) sums positions g, g + groups, ... of dimension i,
-     * then the groups' partial sums are added. */
-    const int groups = THREADS / head_dim;
-    const int g = threadIdx.x / head_dim, i = threadIdx.x % head_dim;
-    float acc = 0.0f;
-    if (g < groups) {
-        for (int t = g; t < n; t += groups) acc = fmaf(s[t] * inv, vh[(size_t)t * kv_dim + i], acc);
-    }
-    part[threadIdx.x] = acc;
     __syncthreads();
-    if (threadIdx.x < head_dim) {
-        float o = 0.0f;
-        for (int k = 0; k < groups; k++) o += part[k * head_dim + threadIdx.x];
-        att[(size_t)h * head_dim + threadIdx.x] = o;
+
+    /* The slice's sum of exp-weighted values, thread (h, i) for dimension i of head h. */
+    for (int hi = threadIdx.x; hi < gd; hi += THREADS) {
+        const int h = hi / head_dim, i = hi % head_dim;
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int t = 0; t < len; t++) acc = fmaf(s[h * per + t], vh[(size_t)(t0 + t) * kv_dim + i], acc);
+        part_o[((size_t)(h0 + h) * ATTENTION_SPLITS + split) * head_dim + i] = acc;
     }
+
+    /* Every block publishes its slice; the last of this key-value head's blocks to do so combines. */
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&done[kvh], 1u) == (unsigned int)splits - 1;
+    __syncthreads();
+    if (!last) return;
+    for (int hi = threadIdx.x; hi < gd; hi += THREADS) {
+        const size_t h = (size_t)h0 + hi / head_dim;
+        const int i = hi % head_dim;
+        /* Other blocks wrote these: read them from L2, past this SM's L1. */
+        const size_t row = h * ATTENTION_SPLITS;
+        float mx = NEG_INF;
+        for (int k = 0; k < splits; k++) mx = fmaxf(mx, __ldcg(&part_m[row + k]));
+        float sum = 0.0f, o = 0.0f;
+        for (int k = 0; k < splits; k++) {
+            const float w = expf(__ldcg(&part_m[row + k]) - mx); /* 0 for an empty slice */
+            sum = fmaf(__ldcg(&part_l[row + k]), w, sum);
+            o = fmaf(__ldcg(&part_o[(row + k) * head_dim + i]), w, o);
+        }
+        att[h * head_dim + i] = o / sum;
+    }
+    if (threadIdx.x == 0) done[kvh] = 0; /* ready for the next layer */
 }
 
 /* y += W x, a warp per row: the output and down projections, added to the residual. */
@@ -437,6 +492,16 @@ static unsigned int grid_for(const struct vitna_cuda_model* g, int units) {
     return blocks < (unsigned int)g->max_blocks ? blocks : (unsigned int)g->max_blocks;
 }
 
+/* Attention's dynamic shared memory: the group's queries, and a slice's
+ * scores at the longest. A slice is at most ATTENTION_MIN_SLICE positions
+ * until every split is in use, and ctx / ATTENTION_SPLITS after. */
+static size_t attention_shared(const struct vitna_cuda_model* g) {
+    const size_t group = (size_t)(g->n_heads / g->n_kv_heads);
+    size_t per = ((size_t)g->ctx + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS;
+    if (per < ATTENTION_MIN_SLICE) per = ATTENTION_MIN_SLICE;
+    return group * ((size_t)g->head_dim + per) * sizeof(float);
+}
+
 /* The embedding and every layer, in model.c's order. Captured once, into g->body. */
 static void enqueue_body(const struct vitna_cuda_model* g) {
     const cudaStream_t s = g->stream;
@@ -457,7 +522,8 @@ static void enqueue_body(const struct vitna_cuda_model* g) {
 
         LAUNCH(g->dtype, attn_in_kernel, attn_in_blocks, norm_shared, s, g->x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w,
                g->q, kc, vc, g->cos_t, g->sin_t, g->step, H, g->n_heads, g->n_kv_heads, hd);
-        attention_kernel<<<g->n_heads, THREADS, 0, s>>>(g->q, kc, vc, g->att, g->scores, g->step, hd, kv_dim, group, g->ctx, g->scale);
+        attention_kernel<<<dim3(ATTENTION_SPLITS, g->n_kv_heads), THREADS, attention_shared(g), s>>>(
+            g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->step, hd, kv_dim, group, g->scale);
         LAUNCH(g->dtype, matvec_add_kernel, out_blocks, 0, s, L->o.w, g->att, g->x, H, q_dim);
         LAUNCH(g->dtype, mlp_in_kernel, mlp_in_blocks, norm_shared, s, g->x, L->mlp_norm, g->eps, L->gate.w, L->up.w, g->act, H, g->intermediate);
         LAUNCH(g->dtype, matvec_add_kernel, out_blocks, 0, s, L->down.w, g->act, g->x, H, g->intermediate);
@@ -603,6 +669,11 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     }
     snprintf(g->name, sizeof(g->name), "%s (sm_%d%d)", prop.name, prop.major, prop.minor);
     g->max_blocks = 8 * prop.multiProcessorCount;
+    if (attention_shared(g) > 48 * 1024) {
+        fail(err, err_len, "the GPU path's attention needs --ctx at most %d for this model", (int)(((48 * 1024 / sizeof(float)) / (g->n_heads / g->n_kv_heads) - g->head_dim) * ATTENTION_SPLITS));
+        vitna_cuda_free(g);
+        return NULL;
+    }
 
     /* One allocation: the weights, the rotary tables, the key-value cache and the scratch. */
     const bool tied = m->lm_head.data == m->embed.data;
@@ -618,8 +689,10 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     total += padded(c->hidden * sizeof(float));
     total += 2 * padded(m->ctx * half * sizeof(float));
     total += 2 * padded(cache_floats * sizeof(float));
+    const size_t slices = c->n_heads * ATTENTION_SPLITS;
     total += padded(c->hidden * sizeof(float)) + 2 * padded(q_dim * sizeof(float)) + padded(c->intermediate * sizeof(float)) +
-             padded(c->vocab * sizeof(float)) + padded(c->n_heads * m->ctx * sizeof(float)) + padded(sizeof(step_t));
+             padded(c->vocab * sizeof(float)) + 2 * padded(slices * sizeof(float)) + padded(slices * c->head_dim * sizeof(float)) +
+             padded(c->n_kv_heads * sizeof(unsigned int)) + padded(sizeof(step_t));
 
     e = cudaMalloc(&g->arena, total);
     if (e != cudaSuccess) {
@@ -686,10 +759,15 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         g->att = (float*)carve(&cv, q_dim * sizeof(float));
         g->act = (float*)carve(&cv, c->intermediate * sizeof(float));
         g->logits = (float*)carve(&cv, c->vocab * sizeof(float));
-        g->scores = (float*)carve(&cv, c->n_heads * m->ctx * sizeof(float));
+        g->part_m = (float*)carve(&cv, slices * sizeof(float));
+        g->part_l = (float*)carve(&cv, slices * sizeof(float));
+        g->part_o = (float*)carve(&cv, slices * c->head_dim * sizeof(float));
+        g->done = (unsigned int*)carve(&cv, c->n_kv_heads * sizeof(unsigned int));
         g->step = (step_t*)carve(&cv, sizeof(step_t));
         /* A position is always written before it is read; zeros make a mistake there repeatable. */
         e = cudaMemset(g->k_cache, 0, 2 * padded(cache_floats * sizeof(float)));
+        /* Attention counts finished slices up from zero, and leaves the count at zero. */
+        if (e == cudaSuccess) e = cudaMemset(g->done, 0, c->n_kv_heads * sizeof(unsigned int));
         /* The uploads and the memset ran on the default stream, which the
          * model's non-blocking stream does not wait for: finish them first. */
         if (e == cudaSuccess) e = cudaDeviceSynchronize();
