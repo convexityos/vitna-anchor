@@ -290,9 +290,42 @@ __device__ __forceinline__ float row_dot(const void* w, int r, int cols, const f
     return warp_sum(s);
 }
 
+/* The most elements of a vector norm_to_shared keeps in each thread's registers. */
+#define NORM_REGS 8
+
 /* xs = x / sqrt(mean(x^2) + eps) * w, as kernels.c's vitna_rmsnorm, written
- * to shared memory by the whole block. Every block computes the same values. */
+ * to shared memory by the whole block. Every block computes the same values.
+ * A vector of up to NORM_REGS * THREADS elements is read once, x and w
+ * together, and kept in registers, so the block makes one trip to memory
+ * where reading w only after the sum of squares made two, one after the
+ * other; wider vectors take the loops at the end. The arithmetic is the same
+ * either way, in the same order. */
 __device__ void norm_to_shared(const float* __restrict__ x, const float* __restrict__ w, float* xs, int n, float eps, float* red) {
+    if (n <= NORM_REGS * THREADS) {
+        float xv[NORM_REGS], wv[NORM_REGS];
+#pragma unroll
+        for (int j = 0; j < NORM_REGS; j++) {
+            const int i = threadIdx.x + j * THREADS;
+            if (i < n) {
+                xv[j] = x[i];
+                wv[j] = w[i];
+            }
+        }
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NORM_REGS; j++) {
+            if (threadIdx.x + j * THREADS < n) ss = fmaf(xv[j], xv[j], ss);
+        }
+        ss = block_sum(ss, red);
+        const float inv = 1.0f / sqrtf(ss / (float)n + eps);
+#pragma unroll
+        for (int j = 0; j < NORM_REGS; j++) {
+            const int i = threadIdx.x + j * THREADS;
+            if (i < n) xs[i] = xv[j] * inv * wv[j];
+        }
+        __syncthreads();
+        return;
+    }
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += THREADS) ss = fmaf(x[i], x[i], ss);
     ss = block_sum(ss, red);
