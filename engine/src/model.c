@@ -351,6 +351,43 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
     return true;
 }
 
+size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits, size_t rows) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const size_t start = m->n_past;
+    if (rows > count) rows = count;
+    /* The tokens that can run: those before the first that is out of range,
+     * past the cache or failed by a test. */
+    size_t run = 0;
+    while (run < count && tokens[run] >= 0 && (size_t)tokens[run] < c->vocab && start + run < m->ctx &&
+           !(m->fail_armed && start + run == m->fail_at)) {
+        run++;
+    }
+    /* Logits come only from a batch that runs to its end. */
+    float* out = run == count ? logits : NULL;
+    const size_t first = count - rows; /* the first position whose logits are wanted */
+
+#if defined(VITNA_CUDA)
+    if (m->cuda && run >= vitna_cuda_prompt_min(m->cuda)) {
+        char err[512];
+        if (!vitna_cuda_steps(m->cuda, tokens, run, start, out, out ? rows : 0, err, sizeof(err))) {
+            fprintf(stderr, "CUDA: %s\n", err);
+            return 0;
+        }
+        m->n_past = start + run;
+    } else
+#endif
+    {
+        for (size_t i = 0; i < run; i++) {
+            float* row = (out && i >= first) ? out + (i - first) * c->vocab : NULL;
+            if (!vitna_llama_step(m, tokens[i], row)) return i;
+        }
+    }
+    /* A token a test failed stops the batch as a step there would, with the
+     * same word on stderr: vitna_llama_step gives it, and fails. */
+    if (run < count && m->fail_armed && start + run == m->fail_at) (void)vitna_llama_step(m, tokens[run], NULL);
+    return run;
+}
+
 /* --- The GPU --- */
 
 bool vitna_llama_cuda_built(void) {

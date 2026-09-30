@@ -43,6 +43,16 @@
  * before each replay, so the same graphs serve every position. Everything
  * runs in order on the model's stream. A step that returns no logits does not
  * wait for the device; one that does waits for the copy back.
+ *
+ * A prompt runs up to PREFILL_MAX tokens at a time instead (vitna_cuda_steps), each
+ * layer taking all of them together. The projections become matrix-matrix
+ * products, which read each weight once for the whole chunk rather than once
+ * a token, and RMSNorm, the rotary embedding, attention and SiLU(gate) * up
+ * are kernels of their own. A token's attention reads the cache up to its own
+ * position, which holds the chunk's earlier tokens by then, so it is causal as
+ * a step is. This is the same computation again, its sums in other orders.
+ * The next token's logits come from the head a step uses; when every
+ * position's are asked for, a matrix-matrix product computes them.
  */
 
 #define NOMINMAX
@@ -65,6 +75,35 @@
  * slices, of at least ATTENTION_MIN_SLICE positions each. */
 #define ATTENTION_SPLITS 32
 #define ATTENTION_MIN_SLICE 32
+
+/* A prompt runs in chunks of g->prefill tokens: as many as PREFILL_BYTES of
+ * scratch holds, at most PREFILL_MAX and the cache, at least PREFILL_MIN.
+ * Larger chunks give each kernel more blocks; past 2048 tokens SmolLM2-135M
+ * gained nothing measurable. The logits of every position, when they are
+ * asked for, come LOGIT_ROWS rows at a time. A warp of a
+ * prompt's attention takes up to PROMPT_ROWS query rows, so a model whose
+ * key-value heads each serve more query heads than that runs its prompts a
+ * token at a time. */
+#define PREFILL_MAX 2048
+#define PREFILL_MIN 256
+#define PREFILL_BYTES ((size_t)64 << 20)
+#define LOGIT_ROWS 32
+#define PROMPT_ROWS 8
+
+/* The fewest tokens that run together; fewer are faster a step at a time. */
+#define PROMPT_MIN 2
+
+/* The matrix-matrix product takes a tile of GEMM_BM tokens by GEMM_BN
+ * outputs at a time, over the inner dimension GEMM_BK at a time. */
+#define GEMM_BM 64
+#define GEMM_BN 64
+#define GEMM_BK 16
+
+/* Up to FEW_TOKENS tokens take gemm_few_kernel instead: a block FEW_TB tokens
+ * by WARPS * FEW_MR outputs, a warp FEW_MR outputs. */
+#define FEW_TOKENS 32
+#define FEW_TB 16
+#define FEW_MR 4
 
 /* Minus infinity, from its bits: MSVC's INFINITY macro overflows a constant to get it. */
 #define NEG_INF __uint_as_float(0xff800000u)
@@ -107,6 +146,15 @@ struct vitna_cuda_model {
     float *part_m, *part_l, *part_o; /* attention's slices: [n_heads][splits], and [.][.][head_dim] */
     unsigned int* done;              /* per key-value head, the slices finished in this layer */
     step_t* step;
+
+    /* A prompt's chunk: [prefill][hidden] for p_x and p_xn, [prefill][n_heads
+     * * head_dim] for p_q and p_att, [prefill][intermediate] for p_gate and
+     * p_up, and [LOGIT_ROWS][vocab] for p_logits; p_tokens holds the whole
+     * prompt, [ctx] at most. */
+    float *p_x, *p_xn, *p_q, *p_att, *p_gate, *p_up, *p_logits;
+    int32_t* p_tokens;
+    size_t prefill;         /* the tokens in a prompt's chunk */
+    bool prompt;            /* whether a prompt runs many tokens at once (prompt_batches) */
 
     cudaStream_t stream;
     cudaGraphExec_t body;   /* the embedding and every layer */
@@ -488,6 +536,365 @@ __global__ void head_kernel(const float* __restrict__ x, const float* __restrict
     }
 }
 
+/* --- A prompt, many tokens at once --- */
+
+/* Row t of x is token t's embedding row, widened to float32. */
+template <vitna_dtype_t DT>
+__global__ void embed_rows_kernel(const void* __restrict__ table, const int32_t* __restrict__ tokens, int hidden, float* __restrict__ x) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < hidden) x[(size_t)t * hidden + i] = widen<DT>(table, (size_t)tokens[t] * hidden + i);
+}
+
+/* Row t of y is x's row t through RMSNorm, as kernels.c's vitna_rmsnorm: a block a row. */
+__global__ void rmsnorm_rows_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y, int n, float eps) {
+    __shared__ float red[WARPS];
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* yr = y + (size_t)blockIdx.x * n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += THREADS) ss = fmaf(xr[i], xr[i], ss);
+    ss = block_sum(ss, red);
+    const float inv = 1.0f / sqrtf(ss / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += THREADS) yr[i] = xr[i] * inv * w[i];
+}
+
+/* Weights i to i + 3 of a matrix, widened to float32 exactly; i is a multiple of 4. */
+template <vitna_dtype_t DT>
+__device__ __forceinline__ void load4(const void* w, size_t i, float out[4]);
+
+template <>
+__device__ __forceinline__ void load4<VITNA_DTYPE_F32>(const void* w, size_t i, float out[4]) {
+    const float4 p = static_cast<const float4*>(w)[i / 4];
+    out[0] = p.x; out[1] = p.y; out[2] = p.z; out[3] = p.w;
+}
+
+template <>
+__device__ __forceinline__ void load4<VITNA_DTYPE_BF16>(const void* w, size_t i, float out[4]) {
+    const uint2 p = static_cast<const uint2*>(w)[i / 4];
+    out[0] = bf16_low(p.x); out[1] = bf16_high(p.x);
+    out[2] = bf16_low(p.y); out[3] = bf16_high(p.y);
+}
+
+template <>
+__device__ __forceinline__ void load4<VITNA_DTYPE_F16>(const void* w, size_t i, float out[4]) {
+    const uint2 p = static_cast<const uint2*>(w)[i / 4];
+    out[0] = half_to_float((unsigned short)(p.x & 0xffffu)); out[1] = half_to_float((unsigned short)(p.x >> 16));
+    out[2] = half_to_float((unsigned short)(p.y & 0xffffu)); out[3] = half_to_float((unsigned short)(p.y >> 16));
+}
+
+/* Y = X W^T for T rows of X: y[t][n] is the sum over k of x[t][k] * W[n][k],
+ * W's rows being its outputs, as the checkpoint stores it. With add, the sums
+ * are added to Y instead: the residual add after a projection. Row t of X is
+ * at X + t * ldx and of Y at Y + t * ldy. A block computes a GEMM_BM x
+ * GEMM_BN tile of Y, each of its 256 threads 4 x 4 of it, taking GEMM_BK of
+ * the inner dimension at a time through shared memory, and loading the next
+ * GEMM_BK into registers while it multiplies the last. Every output sums its
+ * products in order of k, whatever T is. K is a multiple of GEMM_BK. */
+template <vitna_dtype_t DT>
+__global__ void gemm_kernel(const float* __restrict__ X, int ldx, const void* __restrict__ W, float* __restrict__ Y, int ldy,
+                            int T, int N, int K, int add) {
+    __shared__ __align__(16) float xs[GEMM_BK][GEMM_BM + 4];
+    __shared__ __align__(16) float ws[GEMM_BK][GEMM_BN + 4];
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int t0 = blockIdx.y * GEMM_BM, n0 = blockIdx.x * GEMM_BN;
+    const int lr = tid >> 2, lk = (tid & 3) * 4; /* the row and the four k this thread loads */
+    const bool xrow = t0 + lr < T, wrow = n0 + lr < N;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+    }
+    float4 xv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float wv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (xrow) xv = *reinterpret_cast<const float4*>(X + (size_t)(t0 + lr) * ldx + lk);
+    if (wrow) load4<DT>(W, (size_t)(n0 + lr) * K + lk, wv);
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+        xs[lk][lr] = xv.x;
+        xs[lk + 1][lr] = xv.y;
+        xs[lk + 2][lr] = xv.z;
+        xs[lk + 3][lr] = xv.w;
+        ws[lk][lr] = wv[0];
+        ws[lk + 1][lr] = wv[1];
+        ws[lk + 2][lr] = wv[2];
+        ws[lk + 3][lr] = wv[3];
+        __syncthreads();
+        if (k0 + GEMM_BK < K) {
+            if (xrow) xv = *reinterpret_cast<const float4*>(X + (size_t)(t0 + lr) * ldx + k0 + GEMM_BK + lk);
+            if (wrow) load4<DT>(W, (size_t)(n0 + lr) * K + k0 + GEMM_BK + lk, wv);
+        }
+#pragma unroll
+        for (int kk = 0; kk < GEMM_BK; kk++) {
+            const float4 a = *reinterpret_cast<const float4*>(&xs[kk][ty * 4]);
+            const float4 b = *reinterpret_cast<const float4*>(&ws[kk][tx * 4]);
+            const float av[4] = { a.x, a.y, a.z, a.w };
+            const float bv[4] = { b.x, b.y, b.z, b.w };
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int t = t0 + ty * 4 + i;
+        if (t >= T) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int n = n0 + tx * 4 + j;
+            if (n < N) {
+                float* y = Y + (size_t)t * ldy + n;
+                *y = add ? *y + acc[i][j] : acc[i][j];
+            }
+        }
+    }
+}
+
+/* Y = X W^T for a few tokens, each output summed exactly as row_dot sums it
+ * for one token: lane l takes chunks l, l + 32, ... of eight weights, and the
+ * warp adds its lanes in warp_sum's tree. So each output is, bit for bit,
+ * the one a step's projection gives for the same input row. Block (x, y) takes TB tokens from x * TB and warp w
+ * the MR outputs from (y * WARPS + w) * MR. X comes through shared memory 32
+ * chunks at a time, in two planes of float4 so that the lanes read
+ * consecutive addresses, and each lane keeps MR * TB partial sums, reduced at
+ * the end 32 at a time by a transposing butterfly: after it, lane l holds sum
+ * l of the group, added in warp_sum's order. add = 1 adds into Y. */
+template <vitna_dtype_t DT, int MR, int TB>
+__global__ void gemm_few_kernel(const float* __restrict__ X, int ldx, const void* __restrict__ W, float* __restrict__ Y, int ldy,
+                                int T, int N, int K, int add) {
+    __shared__ float4 lo[TB][32], hi[TB][32];
+    const size_t bytes = DT == VITNA_DTYPE_F32 ? 4 : 2;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int t0 = blockIdx.x * TB, n0 = (blockIdx.y * WARPS + warp) * MR;
+    const int chunks = K / 8;
+    float acc[MR * TB];
+#pragma unroll
+    for (int i = 0; i < MR * TB; i++) acc[i] = 0.0f;
+    for (int c0 = 0; c0 < chunks; c0 += 32) {
+        __syncthreads(); /* the previous chunks have been read */
+        for (int i = threadIdx.x; i < TB * 32; i += THREADS) {
+            const int t = i / 32, c = i % 32;
+            float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f), b = a;
+            if (t0 + t < T && c0 + c < chunks) {
+                const float4* xp = reinterpret_cast<const float4*>(X + (size_t)(t0 + t) * ldx) + 2 * (c0 + c);
+                a = xp[0];
+                b = xp[1];
+            }
+            lo[t][c] = a;
+            hi[t][c] = b;
+        }
+        __syncthreads();
+        const int c = c0 + lane;
+        if (c < chunks) {
+#pragma unroll
+            for (int r = 0; r < MR; r++) {
+                float wv[8];
+                const int n = min(n0 + r, N - 1);
+                load8<DT>(static_cast<const char*>(W) + (size_t)n * K * bytes, c, wv);
+#pragma unroll
+                for (int t = 0; t < TB; t++) {
+                    const float4 a = lo[t][lane], b = hi[t][lane];
+                    float s = acc[r * TB + t];
+                    s = fmaf(wv[0], a.x, s);
+                    s = fmaf(wv[1], a.y, s);
+                    s = fmaf(wv[2], a.z, s);
+                    s = fmaf(wv[3], a.w, s);
+                    s = fmaf(wv[4], b.x, s);
+                    s = fmaf(wv[5], b.y, s);
+                    s = fmaf(wv[6], b.z, s);
+                    s = fmaf(wv[7], b.w, s);
+                    acc[r * TB + t] = s;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < MR * TB; g += 32) {
+        float v[32];
+#pragma unroll
+        for (int i = 0; i < 32; i++) v[i] = g + i < MR * TB ? acc[g + i] : 0.0f;
+#pragma unroll
+        for (int s = 16, cnt = 32; s > 0; s >>= 1, cnt >>= 1) {
+            const bool upper = lane & s;
+#pragma unroll
+            for (int i = 0; i < cnt / 2; i++) {
+                const float send = upper ? v[i] : v[i + cnt / 2];
+                const float keep = upper ? v[i + cnt / 2] : v[i];
+                v[i] = keep + __shfl_xor_sync(0xffffffffu, send, s);
+            }
+        }
+        const int idx = g + lane;
+        if (idx < MR * TB) {
+            const int r = idx / TB, t = idx % TB;
+            if (t0 + t < T && n0 + r < N) {
+                float* y = Y + (size_t)(t0 + t) * ldy + n0 + r;
+                *y = add ? *y + v[0] : v[0];
+            }
+        }
+    }
+}
+
+/* The half-split rotary embedding for T tokens at positions p0 onwards, as
+ * rope in attn_in_kernel: every query head of row t of q, and every key head
+ * of the cache's row p0 + t. */
+__global__ void rope_rows_kernel(float* __restrict__ q, float* __restrict__ kc, const float* __restrict__ cos_all,
+                                 const float* __restrict__ sin_all, int p0, int T, int n_heads, int n_kv_heads, int head_dim) {
+    const int half = head_dim / 2;
+    const int per_token = (n_heads + n_kv_heads) * half;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * per_token) return;
+    const int t = idx / per_token, i = idx % per_token;
+    const int h = i / half, j = i % half;
+    const size_t pos = (size_t)p0 + t;
+    const float c = cos_all[pos * half + j];
+    const float s = sin_all[pos * half + j];
+    float* v = h < n_heads ? q + (size_t)t * n_heads * head_dim + (size_t)h * head_dim
+                           : kc + pos * n_kv_heads * head_dim + (size_t)(h - n_heads) * head_dim;
+    const float a = v[j];
+    const float b = v[j + half];
+    v[j] = a * c - b * s;
+    v[j + half] = b * c + a * s;
+}
+
+/* gate[i] = silu(gate[i]) * up[i] over n elements, as ops.c's vitna_silu_mul. */
+__global__ void silu_mul_rows_kernel(float* __restrict__ gate, const float* __restrict__ up, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float g = gate[i];
+        gate[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+
+/* Causal attention for a prompt's tokens, as flash attention computes it.
+ * Block (b, kvh) takes key-value head kvh and WARPS of the chunk's tokens, a
+ * warp a token: its rows are the RW = group query heads that read kvh
+ * (repeat_kv). Positions go by in tiles of 32, whose keys and values the
+ * block stages in shared memory once for every row, the values transposed.
+ * In a tile, lane j scores position t0 + j against each row, masked after
+ * the row's own position, and each row keeps its softmax as it goes: a
+ * running max and sum, with the sum and the weighted values scaled by
+ * exp(old max - new max) when the max moves. The tile's weights go to shared
+ * memory, and lane l then adds dimensions l, l + 32, ... of each row's
+ * weighted values, four positions at a time. That is model.c's softmax,
+ * summed in another order; a row's sums run the same way whatever else the
+ * block holds, so a token's result does not depend on the chunk it came in.
+ * DS is head_dim / 32 rounded up: the dimensions a lane keeps. */
+template <int RW, int DS>
+__global__ void attention_prompt_kernel(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
+                                        float* __restrict__ att, int p0, int T, int head_dim, int kv_dim, int q_dim, float scale) {
+    extern __shared__ float4 shared4[];
+    const int kvh = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int kstride = head_dim + 4; /* padded, so that eight lanes reading eight rows sixteen bytes each hit distinct banks */
+    float* ks = reinterpret_cast<float*>(shared4);   /* [32][kstride] */
+    float* vt = ks + 32 * kstride;                   /* [head_dim][36]: values, transposed */
+    float* pw = vt + head_dim * 36 + warp * RW * 32; /* [RW][32]: this warp's weights for the tile */
+    const int tb = blockIdx.x * WARPS;               /* the block's first token */
+    const int t = tb + warp;                         /* this warp's token */
+    const int n = p0 + min(T, tb + WARPS);           /* the positions the block reads */
+    const int c4 = head_dim / 4;
+    /* The warp's token's position, or -1 past the chunk's last token, whose rows score nothing. */
+    const int pos = t < T ? p0 + t : -1;
+    const float* qw = q + (size_t)(t < T ? t : 0) * q_dim + (size_t)kvh * RW * head_dim;
+
+    float m[RW], l[RW], o[RW][DS];
+#pragma unroll
+    for (int i = 0; i < RW; i++) {
+        m[i] = NEG_INF;
+        l[i] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < DS; k++) o[i][k] = 0.0f;
+    }
+
+    for (int t0 = 0; t0 < n; t0 += 32) {
+        const int len = min(32, n - t0);
+        __syncthreads(); /* the previous tile has been read */
+        for (int idx = threadIdx.x; idx < 32 * c4; idx += THREADS) {
+            const int j = idx / c4, c = idx % c4;
+            float4 kv = make_float4(0.0f, 0.0f, 0.0f, 0.0f), vv = kv; /* zeros past the end: a weight of 0 times them is 0 */
+            if (j < len) {
+                const size_t src = (size_t)(t0 + j) * kv_dim + (size_t)kvh * head_dim + 4 * c;
+                kv = *reinterpret_cast<const float4*>(kc + src);
+                vv = *reinterpret_cast<const float4*>(vc + src);
+            }
+            *reinterpret_cast<float4*>(ks + j * kstride + 4 * c) = kv;
+            vt[(4 * c) * 36 + j] = vv.x;
+            vt[(4 * c + 1) * 36 + j] = vv.y;
+            vt[(4 * c + 2) * 36 + j] = vv.z;
+            vt[(4 * c + 3) * 36 + j] = vv.w;
+        }
+        __syncthreads();
+
+        /* Scores: lane j against position t0 + j, every lane reading the same sixteen bytes of the queries at once. */
+        float s[RW];
+#pragma unroll
+        for (int i = 0; i < RW; i++) s[i] = 0.0f;
+        const float4* k4 = reinterpret_cast<const float4*>(ks + lane * kstride);
+        for (int c = 0; c < c4; c++) {
+            const float4 kv = k4[c];
+#pragma unroll
+            for (int i = 0; i < RW; i++) {
+                const float4 qv = reinterpret_cast<const float4*>(qw + i * head_dim)[c];
+                s[i] = fmaf(qv.x, kv.x, s[i]);
+                s[i] = fmaf(qv.y, kv.y, s[i]);
+                s[i] = fmaf(qv.z, kv.z, s[i]);
+                s[i] = fmaf(qv.w, kv.w, s[i]);
+            }
+        }
+        /* The running softmax. A row with nothing valid yet keeps a max of
+         * minus infinity, and its scale is then 1, not exp(nan). */
+        const bool valid = lane < len && t0 + lane <= pos;
+#pragma unroll
+        for (int i = 0; i < RW; i++) {
+            const float sc = valid ? s[i] * scale : NEG_INF;
+            const float mnew = fmaxf(m[i], warp_max(sc));
+            const float e = valid ? expf(sc - mnew) : 0.0f;
+            const float a = mnew == NEG_INF ? 1.0f : expf(m[i] - mnew); /* 0 at a row's first tile */
+            l[i] = l[i] * a + warp_sum(e);
+            m[i] = mnew;
+#pragma unroll
+            for (int k = 0; k < DS; k++) o[i][k] *= a;
+            pw[i * 32 + lane] = e;
+        }
+        __syncwarp();
+        /* The weighted values: lane l keeps dimensions l, l + 32, ..., four positions at a time. */
+#pragma unroll
+        for (int j = 0; j < 32; j += 4) {
+            float4 v[DS];
+#pragma unroll
+            for (int k = 0; k < DS; k++) {
+                const int d = lane + 32 * k;
+                v[k] = d < head_dim ? *reinterpret_cast<const float4*>(vt + d * 36 + j) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+#pragma unroll
+            for (int i = 0; i < RW; i++) {
+                const float4 p = *reinterpret_cast<const float4*>(pw + i * 32 + j);
+#pragma unroll
+                for (int k = 0; k < DS; k++) {
+                    o[i][k] = fmaf(p.x, v[k].x, o[i][k]);
+                    o[i][k] = fmaf(p.y, v[k].y, o[i][k]);
+                    o[i][k] = fmaf(p.z, v[k].z, o[i][k]);
+                    o[i][k] = fmaf(p.w, v[k].w, o[i][k]);
+                }
+            }
+        }
+        __syncwarp(); /* the weights have been read before the next tile's are written */
+    }
+    if (pos < 0) return;
+    float* out = att + (size_t)t * q_dim + (size_t)kvh * RW * head_dim;
+#pragma unroll
+    for (int i = 0; i < RW; i++) {
+#pragma unroll
+        for (int k = 0; k < DS; k++) {
+            const int d = lane + 32 * k;
+            if (d < head_dim) out[i * head_dim + d] = o[i][k] / l[i];
+        }
+    }
+}
+
 /* --- Launches --- */
 
 /* KERNEL<DT><<<...>>>(...), for the dtype every weight matrix shares. */
@@ -549,10 +956,111 @@ static void enqueue_body(const struct vitna_cuda_model* g) {
     }
 }
 
-/* The final RMSNorm and the output projection. Captured once, into g->head. */
-static void enqueue_head(const struct vitna_cuda_model* g) {
+/* The final RMSNorm and the output projection of the row at x, into g->logits. */
+static void enqueue_head_of(const struct vitna_cuda_model* g, const float* x) {
     LAUNCH(g->dtype, head_kernel, grid_for(g, g->vocab), (size_t)g->hidden * sizeof(float), g->stream,
-           g->x, g->final_norm, g->eps, g->lm_head.w, g->logits, g->hidden, g->vocab);
+           x, g->final_norm, g->eps, g->lm_head.w, g->logits, g->hidden, g->vocab);
+}
+
+/* The head of a step. Captured once, into g->head. */
+static void enqueue_head(const struct vitna_cuda_model* g) {
+    enqueue_head_of(g, g->x);
+}
+
+/* Y = X W^T for T rows, on the model's stream: gemm_few_kernel for up to
+ * FEW_TOKENS rows, which a tile of GEMM_BM would mostly leave empty, and
+ * gemm_kernel for more. */
+static void gemm(const struct vitna_cuda_model* g, const float* X, int ldx, const void* W, float* Y, int ldy, int T, int N, int K,
+                 int add) {
+    if (T <= FEW_TOKENS) {
+        const dim3 few(blocks_for((size_t)T, FEW_TB), blocks_for((size_t)N, WARPS * FEW_MR));
+        switch (g->dtype) {
+            case VITNA_DTYPE_BF16: gemm_few_kernel<VITNA_DTYPE_BF16, FEW_MR, FEW_TB><<<few, THREADS, 0, g->stream>>>(X, ldx, W, Y, ldy, T, N, K, add); break;
+            case VITNA_DTYPE_F16: gemm_few_kernel<VITNA_DTYPE_F16, FEW_MR, FEW_TB><<<few, THREADS, 0, g->stream>>>(X, ldx, W, Y, ldy, T, N, K, add); break;
+            default: gemm_few_kernel<VITNA_DTYPE_F32, FEW_MR, FEW_TB><<<few, THREADS, 0, g->stream>>>(X, ldx, W, Y, ldy, T, N, K, add); break;
+        }
+        return;
+    }
+    const dim3 grid(blocks_for((size_t)N, GEMM_BN), blocks_for((size_t)T, GEMM_BM));
+    LAUNCH(g->dtype, gemm_kernel, grid, 0, g->stream, X, ldx, W, Y, ldy, T, N, K, add);
+}
+
+/* A prompt's attention's dynamic shared memory: a tile's keys, padded, its
+ * values, transposed and padded, and each warp's weights for the tile. */
+static size_t prompt_attention_shared(const struct vitna_cuda_model* g) {
+    const size_t group = (size_t)(g->n_heads / g->n_kv_heads), hd = (size_t)g->head_dim;
+    return (32 * (hd + 4) + hd * 36 + WARPS * group * 32) * sizeof(float);
+}
+
+/* Whether a prompt can run many tokens at once: widths the matrix-matrix
+ * product's GEMM_BK divides, and an attention kernel for this shape, which
+ * needs a key-value head's query heads to be at most PROMPT_ROWS, head_dim at
+ * most 128, and a tile's keys, values and weights within 48 KB of shared
+ * memory. A model that fails runs its prompts a token at a time. */
+static bool prompt_batches(const struct vitna_cuda_model* g) {
+    const int group = g->n_heads / g->n_kv_heads;
+    return g->hidden % GEMM_BK == 0 && g->intermediate % GEMM_BK == 0 && (g->n_heads * g->head_dim) % GEMM_BK == 0 &&
+           group <= PROMPT_ROWS && g->head_dim <= 128 && prompt_attention_shared(g) <= 48 * 1024;
+}
+
+/* A prompt's attention, for T tokens at positions p0 onwards: a warp a token. */
+static void enqueue_prompt_attention(const struct vitna_cuda_model* g, const float* kc, const float* vc, int p0, int T) {
+    const int hd = g->head_dim, group = g->n_heads / g->n_kv_heads;
+    const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
+    const dim3 grid(blocks_for((size_t)T, WARPS), g->n_kv_heads);
+    const size_t shared = prompt_attention_shared(g);
+#define PROMPT_ATTENTION(RW, DS) \
+    attention_prompt_kernel<RW, DS><<<grid, THREADS, shared, g->stream>>>(g->p_q, kc, vc, g->p_att, p0, T, hd, kv_dim, q_dim, g->scale)
+#define PROMPT_ATTENTION_RW(RW)                  \
+    switch ((hd + 31) / 32) {                    \
+        case 1: PROMPT_ATTENTION(RW, 1); break;  \
+        case 2: PROMPT_ATTENTION(RW, 2); break;  \
+        case 3: PROMPT_ATTENTION(RW, 3); break;  \
+        default: PROMPT_ATTENTION(RW, 4); break; \
+    }
+    switch (group) {
+        case 1: PROMPT_ATTENTION_RW(1); break;
+        case 2: PROMPT_ATTENTION_RW(2); break;
+        case 3: PROMPT_ATTENTION_RW(3); break;
+        case 4: PROMPT_ATTENTION_RW(4); break;
+        case 5: PROMPT_ATTENTION_RW(5); break;
+        case 6: PROMPT_ATTENTION_RW(6); break;
+        case 7: PROMPT_ATTENTION_RW(7); break;
+        default: PROMPT_ATTENTION_RW(8); break;
+    }
+#undef PROMPT_ATTENTION_RW
+#undef PROMPT_ATTENTION
+}
+
+/* The embedding and every layer for T tokens of a prompt, g->p_tokens[c0]
+ * onwards, at positions p0 onwards, in model.c's order, leaving the last
+ * layer's output in g->p_x. Their keys and values go into the cache. */
+static void enqueue_chunk(const struct vitna_cuda_model* g, size_t c0, int p0, int T) {
+    const cudaStream_t s = g->stream;
+    const int H = g->hidden, I = g->intermediate, hd = g->head_dim;
+    const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
+    const unsigned int rope_blocks = blocks_for((size_t)T * (g->n_heads + g->n_kv_heads) * (hd / 2), THREADS);
+    const unsigned int silu_blocks = blocks_for((size_t)T * I, THREADS);
+
+    LAUNCH(g->dtype, embed_rows_kernel, dim3(blocks_for((size_t)H, THREADS), T), 0, s, g->embed.w, g->p_tokens + c0, H, g->p_x);
+    for (int l = 0; l < g->n_layers; l++) {
+        const dlayer_t* L = &g->layers[l];
+        float* kc = g->k_cache + (size_t)l * g->ctx * kv_dim;
+        float* vc = g->v_cache + (size_t)l * g->ctx * kv_dim;
+
+        rmsnorm_rows_kernel<<<T, THREADS, 0, s>>>(g->p_x, L->attn_norm, g->p_xn, H, g->eps);
+        gemm(g, g->p_xn, H, L->q.w, g->p_q, q_dim, T, q_dim, H, 0);
+        gemm(g, g->p_xn, H, L->k.w, kc + (size_t)p0 * kv_dim, kv_dim, T, kv_dim, H, 0);
+        gemm(g, g->p_xn, H, L->v.w, vc + (size_t)p0 * kv_dim, kv_dim, T, kv_dim, H, 0);
+        rope_rows_kernel<<<rope_blocks, THREADS, 0, s>>>(g->p_q, kc, g->cos_t, g->sin_t, p0, T, g->n_heads, g->n_kv_heads, hd);
+        enqueue_prompt_attention(g, kc, vc, p0, T);
+        gemm(g, g->p_att, q_dim, L->o.w, g->p_x, H, T, H, q_dim, 1);
+        rmsnorm_rows_kernel<<<T, THREADS, 0, s>>>(g->p_x, L->mlp_norm, g->p_xn, H, g->eps);
+        gemm(g, g->p_xn, H, L->gate.w, g->p_gate, I, T, I, H, 0);
+        gemm(g, g->p_xn, H, L->up.w, g->p_up, I, T, I, H, 0);
+        silu_mul_rows_kernel<<<silu_blocks, THREADS, 0, s>>>(g->p_gate, g->p_up, (size_t)T * I);
+        gemm(g, g->p_gate, I, L->down.w, g->p_x, H, T, H, I, 1);
+    }
 }
 
 static cudaError_t capture(struct vitna_cuda_model* g, void (*enqueue)(const struct vitna_cuda_model*), cudaGraphExec_t* out) {
@@ -675,6 +1183,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     g->eps = c->rms_eps;
     g->scale = 1.0f / sqrtf((float)c->head_dim); /* as model.c */
     g->dtype = m->embed.dtype;
+    g->prompt = prompt_batches(g);
 
     cudaError_t e = cudaSetDevice(g->device);
     cudaDeviceProp prop;
@@ -712,6 +1221,19 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     total += padded(c->hidden * sizeof(float)) + 2 * padded(q_dim * sizeof(float)) + padded(c->intermediate * sizeof(float)) +
              padded(c->vocab * sizeof(float)) + 2 * padded(slices * sizeof(float)) + padded(slices * c->head_dim * sizeof(float)) +
              padded(c->n_kv_heads * sizeof(unsigned int)) + padded(sizeof(step_t));
+    /* A prompt's chunk, its logits and its tokens. */
+    size_t P = 0;
+    if (g->prompt) {
+        const size_t per_token = (2 * c->hidden + 2 * q_dim + 2 * c->intermediate) * sizeof(float);
+        P = PREFILL_BYTES / per_token;
+        if (P > PREFILL_MAX) P = PREFILL_MAX;
+        if (P < PREFILL_MIN) P = PREFILL_MIN;
+        if (P > m->ctx) P = m->ctx;
+    }
+    g->prefill = P;
+    if (g->prompt) total += 2 * padded(P * c->hidden * sizeof(float)) + 2 * padded(P * q_dim * sizeof(float)) +
+             2 * padded(P * c->intermediate * sizeof(float)) + padded((size_t)LOGIT_ROWS * c->vocab * sizeof(float)) +
+             padded(m->ctx * sizeof(int32_t));
 
     e = cudaMalloc(&g->arena, total);
     if (e != cudaSuccess) {
@@ -783,6 +1305,16 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         g->part_o = (float*)carve(&cv, slices * c->head_dim * sizeof(float));
         g->done = (unsigned int*)carve(&cv, c->n_kv_heads * sizeof(unsigned int));
         g->step = (step_t*)carve(&cv, sizeof(step_t));
+        if (g->prompt) {
+            g->p_x = (float*)carve(&cv, P * c->hidden * sizeof(float));
+            g->p_xn = (float*)carve(&cv, P * c->hidden * sizeof(float));
+            g->p_q = (float*)carve(&cv, P * q_dim * sizeof(float));
+            g->p_att = (float*)carve(&cv, P * q_dim * sizeof(float));
+            g->p_gate = (float*)carve(&cv, P * c->intermediate * sizeof(float));
+            g->p_up = (float*)carve(&cv, P * c->intermediate * sizeof(float));
+            g->p_logits = (float*)carve(&cv, (size_t)LOGIT_ROWS * c->vocab * sizeof(float));
+            g->p_tokens = (int32_t*)carve(&cv, m->ctx * sizeof(int32_t));
+        }
         /* A position is always written before it is read; zeros make a mistake there repeatable. */
         e = cudaMemset(g->k_cache, 0, 2 * padded(cache_floats * sizeof(float)));
         /* Attention counts finished slices up from zero, and leaves the count at zero. */
@@ -842,5 +1374,55 @@ bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, floa
         if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
         memcpy(logits, g->host_logits, bytes);
     }
+    return true;
+}
+
+/* The logits of the n rows at x (n at most LOGIT_ROWS), copied to out, n x vocab. */
+static cudaError_t logits_rows(struct vitna_cuda_model* g, const float* x, int n, float* out) {
+    rmsnorm_rows_kernel<<<n, THREADS, 0, g->stream>>>(x, g->final_norm, g->p_xn, g->hidden, g->eps);
+    gemm(g, g->p_xn, g->hidden, g->lm_head.w, g->p_logits, g->vocab, n, g->vocab, g->hidden, 0);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) {
+        e = cudaMemcpyAsync(out, g->p_logits, (size_t)n * g->vocab * sizeof(float), cudaMemcpyDeviceToHost, g->stream);
+    }
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+    return e;
+}
+
+size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g) {
+    return g->prompt ? PROMPT_MIN : SIZE_MAX;
+}
+
+bool vitna_cuda_steps(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, size_t rows,
+                      char* err, size_t err_len) {
+    if (!g->prompt) return fail(err, err_len, "this model's prompts cannot run many tokens at once on the GPU");
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
+    if (!logits) rows = 0;
+    const size_t first = count - rows; /* the first position whose logits are wanted */
+
+    /* From pageable memory, so tokens may change as soon as this returns. */
+    e = cudaMemcpyAsync(g->p_tokens, tokens, count * sizeof(int32_t), cudaMemcpyHostToDevice, g->stream);
+    int T = 0;
+    for (size_t c0 = 0; e == cudaSuccess && c0 < count; c0 += g->prefill) {
+        T = (int)(count - c0 < g->prefill ? count - c0 : g->prefill);
+        enqueue_chunk(g, c0, (int)(pos + c0), T);
+        e = cudaGetLastError();
+        /* The wanted logits among this chunk's rows, when more than the last are wanted. */
+        for (size_t r = first > c0 ? first : c0; e == cudaSuccess && rows > 1 && r < c0 + T; r += LOGIT_ROWS) {
+            const size_t n = c0 + T - r < LOGIT_ROWS ? c0 + T - r : LOGIT_ROWS;
+            e = logits_rows(g, g->p_x + (r - c0) * g->hidden, (int)n, logits + (r - first) * g->vocab);
+        }
+    }
+    /* The next token's logits alone come from the head a step uses, on the last row. */
+    if (e == cudaSuccess && rows == 1) {
+        const size_t bytes = (size_t)g->vocab * sizeof(float);
+        enqueue_head_of(g, g->p_x + (size_t)(T - 1) * g->hidden);
+        e = cudaGetLastError();
+        if (e == cudaSuccess) e = cudaMemcpyAsync(g->host_logits, g->logits, bytes, cudaMemcpyDeviceToHost, g->stream);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+        if (e == cudaSuccess) memcpy(logits, g->host_logits, bytes);
+    }
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
     return true;
 }

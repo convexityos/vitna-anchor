@@ -119,6 +119,26 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t n);
 bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits);
 
 /**
+ * Run count tokens at positions m->n_past to m->n_past + count - 1, as count
+ * calls to vitna_llama_step would, and return how many ran: count, unless one
+ * could not, in which case the tokens before it ran and stay in the cache, it
+ * did not, and m->n_past is left after the last that ran. A token fails as a
+ * step does: out of range, past the cache, failed by a test, or, on a GPU, a
+ * device error, which also leaves out every token of the batch that had not
+ * yet been confirmed.
+ *
+ * If logits is not NULL and every token ran, it receives vocab logits for
+ * each of the last rows positions (rows at most count), rows x vocab, in
+ * position order: 1 for the next token, count for every position.
+ *
+ * On the CPU this is those steps one at a time. On a GPU the tokens run
+ * together, as matrix-matrix products that read each weight once for many
+ * tokens, and causal attention among them; the results are the same up to
+ * float32 rounding.
+ */
+size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits, size_t rows);
+
+/**
  * For tests: make the next step at position pos fail, once, as a step on the
  * GPU does when the device reports an error, so that what its callers do
  * then can be tested on a CPU. That step returns false before computing
