@@ -678,6 +678,16 @@ static int cmd_serve(const args_t* a) {
             vitna_api_set_mask_cache(api, false);
             fprintf(stderr, "VITNA_TEST_NO_MASK_CACHE is set, for a test: JSON mode finds every mask anew.\n");
         }
+        /* For tests only: VITNA_TEST_LOGITS=1 makes each response that is
+         * not streamed name a hash of the logits its tokens were taken from,
+         * so tests/parallel-serve.test.mjs can check that requests at once
+         * leave every logit as it is alone, where the replies would hide a
+         * change too small to move a token. */
+        const char* test_logits = getenv("VITNA_TEST_LOGITS");
+        if (test_logits && *test_logits) {
+            vitna_api_set_test_logits(api, true);
+            fprintf(stderr, "VITNA_TEST_LOGITS is set, for a test: each response names a hash of its logits.\n");
+        }
         char device[400];
         printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;

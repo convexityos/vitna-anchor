@@ -34,6 +34,15 @@
  * own among them (take_all). */
 #define TAKE_THREADS 8
 
+/* While other requests decode, a prompt runs a piece at a time between their
+ * rounds, so none of them waits long for it: PROMPT_PIECE tokens where a
+ * prompt's tokens run together (on a GPU), PROMPT_PIECE_STEPS where they run
+ * a step at a time (on the CPU). With nothing decoding, a prompt runs whole.
+ * Either way its keys, values and logits are the same, bit for bit
+ * (vitna_llama_prompt_piece_min). */
+#define PROMPT_PIECE 512
+#define PROMPT_PIECE_STEPS 8
+
 typedef struct {
     vitna_jsonpfx_t key; /* the state, with the stack's slots past its depth cleared */
     uint32_t* allowed;   /* bit (id & 31) of word id >> 5: whether token id can follow */
@@ -59,6 +68,7 @@ struct vitna_api {
     long long created;
     bool prefix_cache;
     bool mask_cache;                /* whether JSON mode's masks are kept (vitna_api_set_mask_cache) */
+    bool test_logits;               /* for tests: responses name their logits' hash (vitna_api_set_test_logits) */
     size_t speculate;               /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
 
     /* The scheduler's alone, on its thread. */
@@ -797,6 +807,8 @@ struct job {
     vitna_sink_t sink;      /* writes to out (job_write) */
     size_t seq;             /* the sequence of the model's cache lent to it */
     bool begun, ended;
+    bool prompting;         /* its prompt has more to run (job_prompt) */
+    size_t prompt_at;       /* the prompt tokens its sequence holds */
     gen_t g;
     take_t tk;
     vitna_sampling_t cfg;
@@ -813,6 +825,7 @@ struct job {
     int32_t* pass;          /* with speculation: t and the tokens drafted after it */
     size_t d, row0, start;  /* this round: drafts, the job's first row, its sequence's position before */
     size_t passes, drafted, taken;
+    uint64_t logits_hash;   /* for tests: FNV-1a over every row a token was taken from */
 };
 
 /* The job's sink: out, for the connection to send. Once the client has gone
@@ -835,6 +848,14 @@ static bool job_write(void* ctx, const void* data, size_t len) {
  * request's state: each request draws from its own stream, as it would
  * alone, whichever thread takes its tokens. */
 static int take(job_t* j, vitna_sampler_t* sampler, float* row, int32_t* chosen) {
+    if (j->api->test_logits) {
+        /* The row as the model gave it, before JSON mode masks it. */
+        const unsigned char* b = (const unsigned char*)row;
+        const size_t n = j->api->model->cfg.vocab * sizeof(float);
+        uint64_t h = j->logits_hash;
+        for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ULL;
+        j->logits_hash = h;
+    }
     sampler->state = j->rng;
     const int st = take_token(&j->tk, sampler, row, chosen);
     j->rng = sampler->state;
@@ -940,16 +961,13 @@ static void job_begin(vitna_api_t* api, job_t* j) {
     q->cached.count = reuse;
     j->r.cached_tokens = reuse;
 
-    /* Prefill the rest together, then a token at a time. ok stays true
-     * while every step runs. A step that fails, as one on a GPU does when the
-     * device reports an error, ends the request with an error rather than
-     * with the reply so far, and its token never joins the sequence's cached
-     * list; the prompt tokens that ran before it do. */
+    /* The rest of the prompt runs next (job_prompt), then a token at a time.
+     * ok stays true while every step runs. */
     j->finish = "length";
-    const size_t todo = ids->count - reuse;
-    const size_t ran = vitna_llama_steps(m, j->seq, ids->ids + reuse, todo, api->row, 1);
-    for (size_t t = 0; t < ran; t++) vitna_token_list_push(&q->cached, ids->ids[reuse + t]);
-    j->ok = ran == todo;
+    j->prompt_at = reuse;
+    j->prompting = true;
+    j->logits_hash = 0xcbf29ce484222325ULL;
+    j->ok = true;
     j->tk.api = api;
     j->tk.g = g;
     j->tk.p = p;
@@ -975,6 +993,44 @@ static void job_begin(vitna_api_t* api, job_t* j) {
         }
     }
     vitna_drafter_init(&j->drafter, j->text ? spec : 0);
+}
+
+/* The next piece of a request's prompt: the rest of it when whole, or when
+ * too little is left to split; otherwise PROMPT_PIECE tokens, leaving at
+ * least half that and never fewer than vitna_llama_prompt_piece_min, so the
+ * pieces run exactly as the prompt would in one call. After the last, the
+ * request takes its first token.
+ *
+ * A step that fails, as one on a GPU does when the device reports an error,
+ * ends the request with an error rather than with the reply so far, and its
+ * token never joins the sequence's cached list; the prompt tokens that ran
+ * before it do. */
+static void job_prompt(vitna_api_t* api, job_t* j, bool whole) {
+    vitna_llama_t* m = api->model;
+    const vitna_token_list_t* ids = j->ids;
+    seq_t* q = &api->seqs[j->seq];
+    const size_t left = ids->count - j->prompt_at;
+    size_t n = left;
+    if (!whole) {
+        const size_t min = vitna_llama_prompt_piece_min(m);
+        const size_t piece = min > 1 ? PROMPT_PIECE : PROMPT_PIECE_STEPS;
+        /* A piece only when what is left after it is at least half one, so
+         * a prompt a little longer than a piece is not split for nothing. */
+        const size_t after = piece / 2 > min ? piece / 2 : min;
+        if (left >= piece + after) n = piece;
+    }
+    const bool last = n == left;
+    const size_t ran = vitna_llama_steps(m, j->seq, ids->ids + j->prompt_at, n, last ? api->row : NULL, last ? 1 : 0);
+    for (size_t t = 0; t < ran; t++) vitna_token_list_push(&q->cached, ids->ids[j->prompt_at + t]);
+    j->prompt_at += ran;
+    if (ran < n) {
+        j->ok = false;
+        j->prompting = false;
+        j->ended = true;
+        return;
+    }
+    if (!last) return;
+    j->prompting = false;
 
     /* Every token is taken as one step at a time takes it, and a token taken
      * then needs the logits after it: from a step, or from a pass over it and
@@ -982,9 +1038,9 @@ static void job_begin(vitna_api_t* api, job_t* j) {
      * agree with the drafts. So a reply is the one without drafts, and the
      * cache ends holding what it would hold: every token fed that one step at
      * a time would have fed, and no other. */
-    j->st = j->ok && j->max_new > 0 && !j->sink.failed ? take(j, &api->samplers[0], api->row, &j->t) : TAKE_END;
+    j->st = j->max_new > 0 && !j->sink.failed ? take(j, &api->samplers[0], api->row, &j->t) : TAKE_END;
     if (j->text && j->st != TAKE_END_NONE) j->text[j->text_len++] = j->t;
-    j->ended = !(j->ok && j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
+    j->ended = !(j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
 }
 
 /* After a round's rows ran: the request takes the tokens its rows give, as a
@@ -1104,17 +1160,17 @@ static void start_workers(vitna_api_t* api) {
 static void take_all(vitna_api_t* api, job_t* running, size_t live) {
     size_t costly = 0, n = 0;
     for (job_t* j = running; j; j = j->next) {
-        if (!j->ended) costly += j->p->temperature > 0.0f || j->p->json;
+        if (!j->ended && !j->prompting) costly += j->p->temperature > 0.0f || j->p->json;
     }
     if (live < 2 || costly < 2 || api->takers < 2) {
         for (job_t* j = running; j; j = j->next) {
-            if (!j->ended) job_take(api, j, &api->samplers[0]);
+            if (!j->ended && !j->prompting) job_take(api, j, &api->samplers[0]);
         }
         return;
     }
     if (api->workers_started + 1 < api->takers) start_workers(api);
     for (job_t* j = running; j; j = j->next) {
-        if (!j->ended) api->pool_jobs[n++] = j;
+        if (!j->ended && !j->prompting) api->pool_jobs[n++] = j;
     }
     vitna_mutex_lock(&api->pool_lock);
     api->pool_n = n;
@@ -1141,13 +1197,13 @@ static void take_all(vitna_api_t* api, job_t* running, size_t live) {
 static void run_round(vitna_api_t* api, job_t* running) {
     vitna_llama_t* m = api->model;
     size_t live = 0;
-    for (job_t* j = running; j; j = j->next) live += !j->ended;
+    for (job_t* j = running; j; j = j->next) live += !j->ended && !j->prompting;
     if (live == 0) return;
     const size_t cap = vitna_llama_exact_max(m);
     size_t spare = live == 1 ? api->speculate : (live + cap - 1) / cap * cap - live;
     size_t n = 0;
     for (job_t* j = running; j; j = j->next) {
-        if (j->ended) continue;
+        if (j->ended || j->prompting) continue;
         const size_t past = m->past[j->seq];
         size_t d = 0;
         if (j->text && spare > 0) {
@@ -1223,6 +1279,7 @@ static void job_end(vitna_api_t* api, job_t* j) {
         vitna_sb_printf(&b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", j->finish);
         usage_json(&b, &j->r);
         vitna_sb_puts(&b, "}");
+        if (api->test_logits) vitna_sb_printf(&j->headers, "x-vitna-test-logits: %016llx\r\n", (unsigned long long)j->logits_hash);
         respond(&j->sink, 200, j->headers.data, b.data, b.len);
         vitna_sb_free(&b);
     }
@@ -1262,6 +1319,15 @@ static void scheduler(void* arg) {
 
         for (job_t* j = running; j; j = j->next) {
             if (!j->begun) job_begin(api, j);
+        }
+        /* Prompts run whole while no request is decoding, since then no one
+         * waits for them; otherwise a piece of the oldest between rounds. */
+        bool decoding = false;
+        for (job_t* j = running; j; j = j->next) decoding = decoding || (!j->ended && !j->prompting);
+        for (job_t* j = running; j; j = j->next) {
+            if (j->ended || !j->prompting) continue;
+            job_prompt(api, j, !decoding);
+            if (decoding) break;
         }
         run_round(api, running);
 
@@ -1405,6 +1471,10 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
 
 size_t vitna_api_parallel(const vitna_api_t* api) {
     return api ? api->model->seqs : 0;
+}
+
+void vitna_api_set_test_logits(vitna_api_t* api, bool on) {
+    api->test_logits = on;
 }
 
 void vitna_api_set_mask_cache(vitna_api_t* api, bool on) {

@@ -1915,6 +1915,10 @@ static cudaError_t logits_rows(struct vitna_cuda_model* g, const float* x, int n
     return e;
 }
 
+size_t vitna_cuda_prompt_piece_min(const struct vitna_cuda_model* g) {
+    return g->prompt ? FEW_TOKENS + 1 : 1;
+}
+
 size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g) {
     return g->prompt ? PROMPT_MIN : SIZE_MAX;
 }
@@ -1930,8 +1934,17 @@ bool vitna_cuda_steps(struct vitna_cuda_model* g, size_t seq, const int32_t* tok
     /* From pageable memory, so tokens may change as soon as this returns. */
     e = cudaMemcpyAsync(g->p_tokens, tokens, count * sizeof(int32_t), cudaMemcpyHostToDevice, g->stream);
     int T = 0;
-    for (size_t c0 = 0; e == cudaSuccess && c0 < count; c0 += g->prefill) {
-        T = (int)(count - c0 < g->prefill ? count - c0 : g->prefill);
+    for (size_t c0 = 0; e == cudaSuccess && c0 < count; c0 += (size_t)T) {
+        /* Chunks of g->prefill tokens, but no chunk of FEW_TOKENS or fewer
+         * after one: those go through gemm_few_kernel, whose sums round
+         * differently, so a prompt split anywhere into pieces of more than
+         * FEW_TOKENS runs exactly as it does in one call
+         * (vitna_cuda_prompt_piece_min). The chunk before such a remainder
+         * leaves FEW_TOKENS + 1 for the last. */
+        const size_t rest = count - c0;
+        size_t t = rest < g->prefill ? rest : g->prefill;
+        if (rest > t && rest - t <= FEW_TOKENS) t = rest - (FEW_TOKENS + 1);
+        T = (int)t;
         enqueue_chunk(g, (int)seq, c0, (int)(pos + c0), T);
         e = cudaGetLastError();
         /* The wanted logits among this chunk's rows, when more than the last are wanted. */

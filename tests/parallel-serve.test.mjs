@@ -8,7 +8,10 @@
 // text, the finish reason, the usage, every event of a stream, JSON mode's
 // objects, a seeded sample and a failed step. The servers compared run
 // without prefix reuse, which on a GPU can move logits by float32 rounding
-// (see the README); reuse across sequences is checked by its counts.
+// (see the README); reuse across sequences is checked by its counts. They
+// run with VITNA_TEST_LOGITS=1, so a response that is not streamed also names
+// a hash of the logits its tokens came from, and those must agree too: a
+// change too small to move a token would leave the replies alike.
 //
 // On the CPU the requests' rows run a step at a time, so this checks how the
 // server takes turns; with VITNA_DEVICE=cuda they run in passes that mix the
@@ -51,7 +54,7 @@ const servers = {};
 function start(args, env = {}) {
   const child = spawn(engine, ["serve", "--model", modelDir, "--port", "0", "--ctx", "1024", ...onDevice, ...args], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env },
+    env: { ...process.env, VITNA_TEST_LOGITS: "1", ...env },
   });
   const server = { child, stdout: "", stderr: "" };
   child.stderr.on("data", (chunk) => (server.stderr += chunk));
@@ -87,7 +90,7 @@ async function post(server, path, body) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  return { status: res.status, text: await res.text() };
+  return { status: res.status, logits: res.headers.get("x-vitna-test-logits"), text: await res.text() };
 }
 
 // A response without what differs from one run to another: its id and its time.
@@ -117,6 +120,7 @@ async function sameAtOnce(alone, together, requests) {
     const label = `request ${i}, ${JSON.stringify(requests[i][1]).slice(0, 80)}`;
     assert.equal(g.status, want[i].status, `${label}: the status`);
     assert.deepEqual(normalize(g.text), normalize(want[i].text), `${label}: the response`);
+    assert.equal(g.logits, want[i].logits, `${label}: the logits`);
   });
   return got;
 }
@@ -173,6 +177,49 @@ test("a request is answered while another is still streaming", PAR, async () => 
   assert.equal(JSON.parse(shortDone.r.text).usage.completion_tokens, 4);
   assert.ok(shortDone.at < streamEnded, "the short request waited for the stream to end, as with one request at a time");
   assert.ok(events.join("").includes("[DONE]"), "the stream ran to its end");
+});
+
+// A stream to a server: first settles when its first bytes arrive, done with the whole response.
+function stream(server, body) {
+  let firstArrived;
+  const first = new Promise((resolve) => (firstArrived = resolve));
+  const done = new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ ...body, stream: true });
+    const url = new URL(server.base + "/v1/completions");
+    const req = httpRequest({ hostname: url.hostname, port: url.port, path: url.pathname, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } }, (res) => {
+      let text = "";
+      res.on("data", (d) => {
+        text += d;
+        firstArrived();
+      });
+      res.on("end", () => resolve({ status: res.statusCode, text }));
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+  return { first, done };
+}
+
+test("a long prompt that comes while others decode runs in pieces between their rounds, and every response is as alone", PAR, async () => {
+  // On a GPU 882 tokens, a piece of 512 and one of 370; on the CPU, where any
+  // split runs as the whole, the 147 of the long prompt in pieces of 8.
+  const longPrompt = DEVICE === "cuda" ? Array.from({ length: 6 }, () => ids("long")).flat() : ids("long");
+  const longer = { prompt: longPrompt, max_tokens: 12, temperature: 0 };
+  const decoding = [ids("capital"), ids("science")].map((prompt) => ({ prompt, max_tokens: 120, temperature: 0 }));
+  const want = await post(servers.alone, "/v1/completions", longer);
+  const wantStreams = [];
+  for (const body of decoding) wantStreams.push(await post(servers.alone, "/v1/completions", { ...body, stream: true }));
+  const streams = decoding.map((body) => stream(servers.together, body));
+  await Promise.all(streams.map((s) => s.first));
+  const got = await post(servers.together, "/v1/completions", longer);
+  assert.equal(got.status, want.status, got.text);
+  assert.deepEqual(normalize(got.text), normalize(want.text), "the long prompt's response");
+  assert.ok(want.logits, "the server names its logits' hash");
+  assert.equal(got.logits, want.logits, "the long prompt's logits");
+  for (let i = 0; i < streams.length; i++) {
+    const r = await streams[i].done;
+    assert.deepEqual(normalize(r.text), normalize(wantStreams[i].text), `stream ${i}`);
+  }
 });
 
 test("each request keeps a sequence of its own, so two clients taking turns reuse their own prefixes", PAR, async () => {

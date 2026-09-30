@@ -392,6 +392,14 @@ size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, si
     return run;
 }
 
+size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) return vitna_cuda_prompt_piece_min(m->cuda);
+#endif
+    (void)m;
+    return 1;
+}
+
 size_t vitna_llama_exact_max(const vitna_llama_t* m) {
 #if defined(VITNA_CUDA)
     if (m->cuda) {

@@ -181,6 +181,16 @@ size_t vitna_llama_step_rows(vitna_llama_t* m, const vitna_llama_row_t* rows, si
 size_t vitna_llama_exact_max(const vitna_llama_t* m);
 
 /**
+ * The fewest tokens each piece of a prompt must have for vitna_llama_steps
+ * to run the pieces, one call after another, exactly as it runs them in one
+ * call: the same keys, values and logits, bit for bit, however the prompt is
+ * split. 1 on the CPU, where a prompt runs a step at a time. On a GPU a
+ * piece of fewer tokens runs through other kernels, whose sums round
+ * differently.
+ */
+size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
+
+/**
  * For tests: make the next step at position pos fail, once, in whichever
  * sequence reaches it first, as a step on the GPU does when the device
  * reports an error, so that what its callers do then can be tested on a CPU.

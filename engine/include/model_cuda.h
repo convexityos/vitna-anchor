@@ -44,6 +44,14 @@ bool vitna_cuda_step(struct vitna_cuda_model* g, size_t seq, int32_t token, size
 size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g);
 
 /**
+ * The fewest tokens a piece of a prompt may have for vitna_cuda_steps to run
+ * it exactly as the same tokens run in one call: pieces of fewer take other
+ * kernels, whose sums round differently. 1 for a model whose prompts run a
+ * step at a time.
+ */
+size_t vitna_cuda_prompt_piece_min(const struct vitna_cuda_model* g);
+
+/**
  * The most rows vitna_cuda_rows takes at once for this model, 0 for a model
  * that takes none.
  */
