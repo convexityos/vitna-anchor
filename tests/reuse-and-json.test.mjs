@@ -10,6 +10,8 @@
 //
 // Needs a built engine and the model files; skipped with the reason
 // otherwise, unless VITNA_REQUIRE_REFERENCE=1 (as in CI), where it fails.
+// VITNA_DEVICE=cuda runs both servers on the GPU, for an engine built with
+// the CUDA path, so reuse is checked against the device's own cache.
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
@@ -36,11 +38,14 @@ const missing = !engine
     ? `no model in ${modelDir}; run node scripts/fetch-model.mjs`
     : null;
 const A6 = { skip: process.env.VITNA_REQUIRE_REFERENCE === "1" ? false : missing ?? false };
+const DEVICE = process.env.VITNA_DEVICE ?? "";
+assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
+const onDevice = DEVICE ? ["--device", DEVICE] : [];
 
 const servers = {};
 
 function start(args) {
-  const child = spawn(engine, ["serve", "--model", modelDir, "--port", "0", "--ctx", "1024", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(engine, ["serve", "--model", modelDir, "--port", "0", "--ctx", "1024", ...onDevice, ...args], { stdio: ["ignore", "pipe", "pipe"] });
   return new Promise((resolve, reject) => {
     let out = "";
     const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}`)), 30_000);

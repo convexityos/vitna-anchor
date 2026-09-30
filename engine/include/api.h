@@ -12,7 +12,10 @@
  * and completion_tokens the number it generated, counting the end-of-text or
  * other special token it stopped on. Parameters this API does not implement
  * are refused with a 400 that names them, never ignored in silence; fields it
- * does not know are ignored and named in an x-vitna-ignored header.
+ * does not know are ignored and named in an x-vitna-ignored header. A step the
+ * model fails to run ends the request with an error, never with the reply so
+ * far: a 500 of type server_error or, once a stream's 200 has gone out, an
+ * event carrying that error, with no final chunk or [DONE] after it.
  */
 
 #ifndef VITNA_API_H

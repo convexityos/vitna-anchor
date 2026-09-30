@@ -1,5 +1,6 @@
 /**
- * model.c - A dense Llama-architecture model on the CPU, in float32.
+ * model.c - A dense Llama-architecture model on the CPU, in float32, and the
+ * switch that moves its forward pass to a GPU in an engine built with CUDA.
  */
 
 #include "model.h"
@@ -10,6 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(VITNA_CUDA)
+  #include "model_cuda.h"
+#endif
+
+#define NO_CUDA "this engine was built without CUDA, so it cannot use a GPU. Build it with the CUDA path: make VITNA_CUDA=1, or cmake -DVITNA_CUDA=ON"
 
 static bool fail(char* err, size_t err_len, const char* fmt, const char* a, const char* b) {
     if (err && err_len > 0) snprintf(err, err_len, fmt, a ? a : "", b ? b : "");
@@ -225,6 +232,9 @@ void vitna_llama_free(vitna_llama_t* m) {
     free(m->v_cache);
     free(m->x); free(m->xn); free(m->q); free(m->k); free(m->v); free(m->att);
     free(m->proj); free(m->gate); free(m->up); free(m->scores); free(m->cos_t); free(m->sin_t);
+#if defined(VITNA_CUDA)
+    vitna_cuda_free(m->cuda);
+#endif
     vitna_safetensors_close(&m->st);
     memset(m, 0, sizeof(*m));
 }
@@ -237,9 +247,31 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t n) {
     if (n < m->n_past) m->n_past = n;
 }
 
+void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
+    m->fail_armed = true;
+    m->fail_at = pos;
+}
+
 bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
     if (token < 0 || (size_t)token >= c->vocab || m->n_past >= m->ctx) return false;
+    if (m->fail_armed && m->n_past == m->fail_at) {
+        m->fail_armed = false;
+        fprintf(stderr, "The step at position %zu failed, as a test asked.\n", m->fail_at);
+        return false;
+    }
+
+#if defined(VITNA_CUDA)
+    if (m->cuda) {
+        char err[512];
+        if (!vitna_cuda_step(m->cuda, token, m->n_past, logits, err, sizeof(err))) {
+            fprintf(stderr, "CUDA: %s\n", err);
+            return false;
+        }
+        m->n_past++;
+        return true;
+    }
+#endif
 
     const size_t pos = m->n_past;
     const size_t H = c->hidden, hd = c->head_dim, half = hd / 2;
@@ -317,4 +349,80 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
         vitna_matvec(m->lm_head.data, m->lm_head.dtype, m->xn, logits, m->lm_head.rows, m->lm_head.cols);
     }
     return true;
+}
+
+/* --- The GPU --- */
+
+bool vitna_llama_cuda_built(void) {
+#if defined(VITNA_CUDA)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool vitna_llama_cuda_probe(char* err, size_t err_len) {
+#if defined(VITNA_CUDA)
+    return vitna_cuda_probe(err, err_len);
+#else
+    return fail(err, err_len, "%s%s", NO_CUDA, NULL);
+#endif
+}
+
+#if defined(VITNA_CUDA)
+/* The rotary cos and sin of every position the cache holds, [ctx][head_dim / 2],
+ * with the float32 formula vitna_llama_step uses for one position. */
+static bool rope_tables(const vitna_llama_t* m, float** cos_out, float** sin_out) {
+    const size_t half = m->cfg.head_dim / 2;
+    float* ct = (float*)malloc(m->ctx * half * sizeof(float));
+    float* st = (float*)malloc(m->ctx * half * sizeof(float));
+    if (!ct || !st) {
+        free(ct);
+        free(st);
+        return false;
+    }
+    for (size_t pos = 0; pos < m->ctx; pos++) {
+        for (size_t j = 0; j < half; j++) {
+            float angle = (float)pos * m->inv_freq[j];
+            ct[pos * half + j] = cosf(angle);
+            st[pos * half + j] = sinf(angle);
+        }
+    }
+    *cos_out = ct;
+    *sin_out = st;
+    return true;
+}
+#endif
+
+bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) return true;
+    float *ct = NULL, *st = NULL;
+    if (!rope_tables(m, &ct, &st)) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    m->cuda = vitna_cuda_create(m, ct, st, err, err_len);
+    free(ct);
+    free(st);
+    if (!m->cuda) return false;
+    /* The device holds the key-value cache from here on. */
+    free(m->k_cache);
+    free(m->v_cache);
+    m->k_cache = NULL;
+    m->v_cache = NULL;
+    return true;
+#else
+    (void)m;
+    return fail(err, err_len, "%s%s", NO_CUDA, NULL);
+#endif
+}
+
+const char* vitna_llama_device(const vitna_llama_t* m, char* buf, size_t len) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) {
+        snprintf(buf, len, "on CUDA device 0, %s", vitna_cuda_device_name(m->cuda));
+        return buf;
+    }
+#endif
+    (void)m;
+    snprintf(buf, len, "matvec path %s", vitna_matvec_path());
+    return buf;
 }
