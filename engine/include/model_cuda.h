@@ -36,6 +36,23 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
  */
 bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, float* logits, char* err, size_t err_len);
 
+/**
+ * The fewest tokens worth giving vitna_cuda_steps: fewer run faster a step at
+ * a time. SIZE_MAX for a model whose prompts cannot run together.
+ */
+size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g);
+
+/**
+ * Run count tokens at positions pos to pos + count - 1 together, writing
+ * their keys and values into the device's cache. If logits is not NULL, it
+ * receives vocab logits for each of the last rows positions, rows x vocab.
+ * The caller has checked the tokens and the room in the cache. Returns
+ * false, with the reason in err, if the device reports an error, or if the
+ * model's prompts cannot run together (vitna_cuda_prompt_min).
+ */
+bool vitna_cuda_steps(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, size_t rows,
+                      char* err, size_t err_len);
+
 /** The device, for a person to read: its name and compute capability. */
 const char* vitna_cuda_device_name(const struct vitna_cuda_model* g);
 

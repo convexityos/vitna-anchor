@@ -270,24 +270,28 @@ static int cmd_logits(const args_t* a) {
     int rc = 1;
     vitna_llama_t m;
     if (prompt_ids(a, tok, &ids) && load_model(a, &m)) {
+        /* Every position's logits, up to 256 positions at a time. */
+        const size_t chunk = 256, V = m.cfg.vocab;
         FILE* f = fopen(a->out, "wb");
-        float* row = (float*)malloc(m.cfg.vocab * sizeof(float));
-        if (!f || !row) {
+        float* rows = (float*)malloc(chunk * V * sizeof(float));
+        if (!f || !rows) {
             fprintf(stderr, "cannot write %s\n", a->out);
         } else {
             rc = 0;
-            for (size_t t = 0; t < ids.count && rc == 0; t++) {
-                if (!vitna_llama_step(&m, ids.ids[t], row)) {
-                    fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", ids.ids[t], t);
+            for (size_t t = 0; t < ids.count && rc == 0; t += chunk) {
+                const size_t n = ids.count - t < chunk ? ids.count - t : chunk;
+                const size_t ran = vitna_llama_steps(&m, ids.ids + t, n, rows, n);
+                if (ran < n) {
+                    fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", ids.ids[t + ran], t + ran);
                     rc = 1;
-                } else if (fwrite(row, sizeof(float), m.cfg.vocab, f) != m.cfg.vocab) {
+                } else if (fwrite(rows, sizeof(float), n * V, f) != n * V) {
                     fprintf(stderr, "cannot write %s\n", a->out);
                     rc = 1;
                 }
             }
         }
         if (f) fclose(f);
-        free(row);
+        free(rows);
         vitna_llama_free(&m);
     }
     vitna_token_list_free(&ids);
@@ -309,11 +313,10 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
     }
     int rc = 0;
     const double t_prompt = vitna_time_ms();
-    for (size_t t = 0; t < prompt->count && rc == 0; t++) {
-        if (!vitna_llama_step(m, prompt->ids[t], t + 1 == prompt->count ? row : NULL)) {
-            fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", prompt->ids[t], t);
-            rc = 1;
-        }
+    const size_t ran = vitna_llama_steps(m, prompt->ids, prompt->count, row, 1);
+    if (ran < prompt->count) {
+        fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", prompt->ids[ran], ran);
+        rc = 1;
     }
     const double t_first = vitna_time_ms();
     double t_after_first = t_first;

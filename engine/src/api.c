@@ -611,16 +611,16 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
     api->cached.count = reuse;
     r.cached_tokens = reuse;
 
-    /* Prefill the rest, then one token at a time. ok stays true while every
-     * step runs. A step that fails, as one on a GPU does when the device
-     * reports an error, ends the request with an error rather than with the
-     * reply so far, and its token never joins api->cached. */
+    /* Prefill the rest together, then one token at a time. ok stays true
+     * while every step runs. A step that fails, as one on a GPU does when the
+     * device reports an error, ends the request with an error rather than
+     * with the reply so far, and its token never joins api->cached; the
+     * prompt tokens that ran before it do. */
     const char* finish = "length";
-    bool ok = true;
-    for (size_t t = reuse; t < ids->count && ok; t++) {
-        ok = vitna_llama_step(m, ids->ids[t], t + 1 == ids->count ? api->row : NULL);
-        if (ok) vitna_token_list_push(&api->cached, ids->ids[t]);
-    }
+    const size_t todo = ids->count - reuse;
+    const size_t ran = vitna_llama_steps(m, ids->ids + reuse, todo, api->row, 1);
+    for (size_t t = 0; t < ran; t++) vitna_token_list_push(&api->cached, ids->ids[reuse + t]);
+    bool ok = ran == todo;
     vitna_jsonpfx_t json_state;
     vitna_jsonpfx_init(&json_state);
     for (size_t s = 0; ok && s < max_new && !sink->failed; s++) {

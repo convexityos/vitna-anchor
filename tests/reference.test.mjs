@@ -216,3 +216,46 @@ test("the engine's greedy decoding matches the reference token for token", A2, (
   }
   t.diagnostic(`on ${DEVICE || "cpu"}, ${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${worst.toExponential(2)}`);
 });
+
+// The logits command gives the model a prompt 256 tokens at a time, and every
+// fixture prompt is shorter than that, so no fixture prompt runs on a GPU
+// whose cache already holds earlier positions of its own. So the engine runs
+// one longer prompt, the fixture's prompts and corpus end to end (565
+// tokens, in three pieces), on both devices,
+// and every position's logits must agree within the tolerance, choosing the
+// same token wherever the CPU's top two are further apart than that.
+test("on the GPU, a prompt run in pieces gives the CPU's logits at every position", {
+  skip: A2.skip || (DEVICE !== "cuda" && "VITNA_DEVICE is not cuda"),
+}, (t) => {
+  const ids = [...fixture.prompts.flatMap((p) => p.ids), ...fixture.corpus.flatMap((c) => c.tokenizer_json_ids ?? c.ids)];
+  assert.ok(ids.length > 512, `${ids.length} tokens do not cross two chunks`);
+  const dir = mkdtempSync(join(tmpdir(), "vitna-chunks-"));
+  let worst = 0;
+  try {
+    const rows = {};
+    for (const device of ["cpu", "cuda"]) {
+      const out = join(dir, `${device}.f32`);
+      runEngine(["logits", "--model", modelDir, "--ids", ids.join(","), "--out", out, "--device", device]);
+      rows[device] = readF32(out);
+      assert.equal(rows[device].length, ids.length * VOCAB, device);
+    }
+    for (let p = 0; p < ids.length; p++) {
+      const o = p * VOCAB;
+      let d = 0, cpuTop = 0, cudaTop = 0;
+      for (let i = 0; i < VOCAB; i++) {
+        d = Math.max(d, Math.abs(rows.cpu[o + i] - rows.cuda[o + i]));
+        if (rows.cpu[o + i] > rows.cpu[o + cpuTop]) cpuTop = i;
+        if (rows.cuda[o + i] > rows.cuda[o + cudaTop]) cudaTop = i;
+      }
+      assert.ok(d <= LOGIT_ATOL, `position ${p}: logits differ by ${d}`);
+      if (cpuTop !== cudaTop) {
+        const gap = rows.cpu[o + cpuTop] - rows.cpu[o + cudaTop];
+        assert.ok(gap <= LOGIT_ATOL, `position ${p}: the GPU chose ${cudaTop}, the CPU ${cpuTop}, ${gap} apart`);
+      }
+      worst = Math.max(worst, d);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  t.diagnostic(`${ids.length} positions; largest |cuda - cpu| ${worst.toExponential(2)}; tolerance ${LOGIT_ATOL}`);
+});
