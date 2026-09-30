@@ -92,6 +92,16 @@ bool vitna_api_set_speculate(vitna_api_t* api, size_t k);
 void vitna_api_set_mask_cache(vitna_api_t* api, bool on);
 
 /**
+ * For tests: whether a response that is not streamed names, in an
+ * x-vitna-test-logits header, an FNV-1a hash of the bytes of every row of
+ * logits its tokens were taken from, in order, as the model gave them (off
+ * by default). Two servers' hashes for a request agree only if their logits
+ * did, bit for bit, where the replies alone would agree through any change
+ * too small to move a token.
+ */
+void vitna_api_set_test_logits(vitna_api_t* api, bool on);
+
+/**
  * Drafts for speculative decoding, by prompt lookup: the tokens that followed
  * the latest earlier place in the text where its last three, or two, tokens
  * occur. A match of one token drafts nothing, and after a pass takes none of
