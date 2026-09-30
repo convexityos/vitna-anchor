@@ -32,6 +32,9 @@ struct vitna_api {
     float* row;
     bool prefix_cache;
     vitna_token_list_t cached;  /* the tokens whose keys and values are in the model's cache, in order */
+    size_t speculate;           /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
+    float* rows;                /* speculate + 1 rows of logits, from a pass over a token and its drafts */
+    int32_t* pass;              /* that token and its drafts */
 };
 
 typedef struct {
@@ -538,7 +541,7 @@ static void stream_ready(gen_t* g, bool final) {
  * object to minus infinity, so neither greedy decoding nor sampling can
  * choose it. Special tokens are masked too; the object's closing brace ends
  * the reply instead. Returns false when no token is left. */
-static bool mask_json(vitna_api_t* api, const vitna_jsonpfx_t* state) {
+static bool mask_json(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state) {
     uint8_t allowed[32];
     vitna_jsonpfx_next_bytes(state, allowed);
     size_t left = 0;
@@ -548,9 +551,104 @@ static bool mask_json(vitna_api_t* api, const vitna_jsonpfx_t* state) {
         bool ok = b && n > 0 && !vitna_tokenizer_is_special(api->tok, (int32_t)id) &&
                   (allowed[b[0] >> 3] & (1u << (b[0] & 7))) && vitna_jsonpfx_accepts(state, b, n);
         if (ok) left++;
-        else api->row[id] = -INFINITY;
+        else row[id] = -INFINITY;
     }
     return left > 0;
+}
+
+/* What taking a token needs, for take_token. */
+typedef struct {
+    vitna_api_t* api;
+    gen_t* g;
+    const params_t* p;
+    const vitna_sampling_t* cfg;
+    vitna_api_result_t* r;
+    const char** finish;
+    vitna_jsonpfx_t json;   /* JSON mode: the object so far */
+} take_t;
+
+enum { TAKE_GO, TAKE_END, TAKE_END_NONE };
+
+/* One token from a row of logits, as a reply takes every one: the JSON mask,
+ * the choice, the text, the stop checks and the stream. TAKE_GO to go on;
+ * TAKE_END when the reply ends with this token (a special token, a stop
+ * sequence or a closed JSON object), with *finish set; TAKE_END_NONE when the
+ * JSON mask left no token to take. */
+static int take_token(take_t* tk, float* row, int32_t* chosen) {
+    const params_t* p = tk->p;
+    gen_t* g = tk->g;
+    if (p->json && !mask_json(tk->api, row, &tk->json)) {
+        /* No token can continue the object. The pinned model's vocabulary
+         * never gets here: the 21 bytes it lacks are control characters,
+         * which JSON escapes, and UTF-8 lead bytes a string can do without. */
+        *tk->finish = "stop";
+        return TAKE_END_NONE;
+    }
+    const int32_t next = vitna_sample(&tk->api->sampler, row, tk->cfg);
+    *chosen = next;
+    tk->r->completion_tokens++;
+    if (vitna_tokenizer_is_special(tk->api->tok, next)) {
+        *tk->finish = "stop";
+        return TAKE_END;
+    }
+    size_t n = 0;
+    const unsigned char* bytes = vitna_tokenizer_token_bytes(tk->api->tok, next, &n);
+    size_t before = g->text.len;
+    if (bytes) {
+        vitna_sb_append(&g->text, bytes, n);
+        if (p->json) vitna_jsonpfx_feed(&tk->json, bytes, n);
+    }
+    long long cut = find_stop(p, g->text.data ? g->text.data : "", g->text.len, before);
+    if (cut >= 0) {
+        g->text.len = (size_t)cut;
+        *tk->finish = "stop";
+        return TAKE_END;
+    }
+    if (p->json && vitna_jsonpfx_complete(&tk->json)) {
+        *tk->finish = "stop"; /* the object has closed, and nothing may follow it */
+        return TAKE_END;
+    }
+    if (p->stream) stream_ready(g, false);
+    return TAKE_GO;
+}
+
+/* --- Drafting (vitna_drafter_t) --- */
+
+void vitna_drafter_init(vitna_drafter_t* d, size_t k) {
+    d->k = k;
+    d->skip = 0;
+    d->backoff = 1;
+}
+
+size_t vitna_drafter_draft(vitna_drafter_t* d, const int32_t* text, size_t len, int32_t* out) {
+    if (!d->k) return 0;
+    if (d->skip) {
+        d->skip--;
+        return 0;
+    }
+    for (size_t n = 3; n >= 2; n--) {
+        if (len <= n) continue;
+        const int32_t* key = text + len - n;
+        for (size_t i = len - n; i-- > 0;) {
+            if (memcmp(text + i, key, n * sizeof(int32_t)) != 0) continue;
+            size_t got = 0;
+            while (got < d->k && i + n + got < len) {
+                out[got] = text[i + n + got];
+                got++;
+            }
+            if (got > 0) return got;
+        }
+    }
+    return 0;
+}
+
+void vitna_drafter_taken(vitna_drafter_t* d, size_t taken) {
+    if (taken == 0) {
+        d->skip = d->backoff;
+        d->backoff = d->backoff < 16 ? 2 * d->backoff : 16;
+    } else {
+        d->backoff = 1;
+    }
 }
 
 static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const params_t* p, const vitna_token_list_t* ids, const char* ignored) {
@@ -621,45 +719,89 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
     const size_t ran = vitna_llama_steps(m, ids->ids + reuse, todo, api->row, 1);
     for (size_t t = 0; t < ran; t++) vitna_token_list_push(&api->cached, ids->ids[reuse + t]);
     bool ok = ran == todo;
-    vitna_jsonpfx_t json_state;
-    vitna_jsonpfx_init(&json_state);
-    for (size_t s = 0; ok && s < max_new && !sink->failed; s++) {
-        if (p->json && !mask_json(api, &json_state)) {
-            /* No token can continue the object. The pinned model's vocabulary
-             * never gets here: the 21 bytes it lacks are control characters,
-             * which JSON escapes, and UTF-8 lead bytes a string can do without. */
-            finish = "stop";
-            break;
-        }
-        int32_t next = vitna_sample(&api->sampler, api->row, &cfg);
-        r.completion_tokens++;
-        if (vitna_tokenizer_is_special(api->tok, next)) {
-            finish = "stop";
-            break;
-        }
-        size_t n = 0;
-        const unsigned char* bytes = vitna_tokenizer_token_bytes(api->tok, next, &n);
-        size_t before = g.text.len;
-        if (bytes) {
-            vitna_sb_append(&g.text, bytes, n);
-            if (p->json) vitna_jsonpfx_feed(&json_state, bytes, n);
-        }
-        long long cut = find_stop(p, g.text.data ? g.text.data : "", g.text.len, before);
-        if (cut >= 0) {
-            g.text.len = (size_t)cut;
-            finish = "stop";
-            break;
-        }
-        if (p->json && vitna_jsonpfx_complete(&json_state)) {
-            finish = "stop"; /* the object has closed, and nothing may follow it */
-            break;
-        }
-        if (p->stream) stream_ready(&g, false);
-        if (s + 1 < max_new) {
-            ok = vitna_llama_step(m, next, api->row);
-            if (ok) vitna_token_list_push(&api->cached, next);
-        }
+    take_t tk = { api, &g, p, &cfg, &r, &finish, { 0 } };
+    vitna_jsonpfx_init(&tk.json);
+
+    /* With speculation, the text so far, for drafting: the prompt, then each
+     * token taken. */
+    const size_t spec = api->speculate;
+    int32_t* text = spec ? (int32_t*)malloc((ids->count + max_new) * sizeof(int32_t)) : NULL;
+    size_t text_len = 0;
+    if (text) {
+        memcpy(text, ids->ids, ids->count * sizeof(int32_t));
+        text_len = ids->count;
     }
+    vitna_drafter_t drafter;
+    size_t passes = 0, drafted = 0, taken = 0; /* for the log line below */
+    vitna_drafter_init(&drafter, text ? spec : 0);
+
+    /* Every token is taken as one step at a time takes it, and a token taken
+     * then needs the logits after it: from a step, or from a pass over it and
+     * the tokens drafted after it, whose rows serve while the tokens taken
+     * agree with the drafts. So a reply is the one without drafts, and the
+     * cache ends holding what it would hold: every token fed that one step at
+     * a time would have fed, and no other. */
+    int32_t t = 0;
+    int st = ok && max_new > 0 && !sink->failed ? take_token(&tk, api->row, &t) : TAKE_END;
+    if (text && st != TAKE_END_NONE) text[text_len++] = t;
+    while (ok && st == TAKE_GO && r.completion_tokens < max_new) {
+        size_t d = text ? vitna_drafter_draft(&drafter, text, text_len, api->pass + 1) : 0;
+        if (d) {
+            const size_t left = max_new - r.completion_tokens; /* tokens still to take, 1 or more */
+            if (d > left - 1) d = left - 1;
+            if (m->n_past + d + 1 > m->ctx) d = m->n_past + 1 < m->ctx ? m->ctx - m->n_past - 1 : 0;
+            /* A step a test makes fail (vitna_llama_fail_step_once) fails
+             * only where one step at a time would have run it: a pass stops
+             * short of it, and the step itself runs alone. */
+            if (m->fail_armed && m->fail_at >= m->n_past && m->fail_at <= m->n_past + d) d = m->fail_at > m->n_past ? m->fail_at - m->n_past - 1 : 0;
+        }
+        if (d == 0) {
+            ok = vitna_llama_step(m, t, api->row);
+            if (!ok) break;
+            vitna_token_list_push(&api->cached, t);
+            if (sink->failed) break;
+            st = take_token(&tk, api->row, &t);
+            if (text && st != TAKE_END_NONE) text[text_len++] = t;
+            continue;
+        }
+        api->pass[0] = t;
+        const size_t start = m->n_past;
+        passes++;
+        drafted += d;
+        const size_t fed = vitna_llama_steps_exact(m, api->pass, d + 1, api->rows);
+        if (fed < d + 1) {
+            /* As a step that fails: the tokens before it stay, it does not. */
+            for (size_t i = 0; i < fed; i++) vitna_token_list_push(&api->cached, api->pass[i]);
+            ok = false;
+            break;
+        }
+        /* Row i holds the logits after api->pass[i], with api->pass[0..i]
+         * fed. keep says how many of the pass's tokens one step at a time
+         * would have fed by the time it stops using the pass. */
+        size_t keep = 0;
+        for (size_t i = 0;; i++) {
+            if (sink->failed) {
+                keep = i + 1;
+                break;
+            }
+            int32_t u = 0;
+            st = take_token(&tk, api->rows + i * api->model->cfg.vocab, &u);
+            if (st != TAKE_END_NONE && text) text[text_len++] = u;
+            if (st == TAKE_GO && r.completion_tokens < max_new && i < d && u == api->pass[i + 1]) continue;
+            keep = i + 1;
+            t = u;
+            break;
+        }
+        taken += keep - 1;
+        vitna_drafter_taken(&drafter, keep - 1);
+        vitna_llama_truncate(m, start + keep);
+        for (size_t i = 0; i < keep; i++) vitna_token_list_push(&api->cached, api->pass[i]);
+        if (sink->failed) break;
+    }
+    /* One line a request on stderr while drafting is on, as generate --timing
+     * prints it: what drafting did, which never changes the response. */
+    if (text) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", passes, drafted, taken);
+    free(text);
 
     if (!ok) {
         set_error(&e, 500, "server_error", NULL, NULL, "The model failed to run a step, so the reply could not be completed.");
@@ -734,10 +876,34 @@ void vitna_api_set_prefix_cache(vitna_api_t* api, bool on) {
     api->prefix_cache = on;
 }
 
+bool vitna_api_set_speculate(vitna_api_t* api, size_t k) {
+    const size_t pass_max = vitna_llama_exact_max(api->model);
+    if (k && pass_max > 1 && k > pass_max - 1) k = pass_max - 1;
+    free(api->rows);
+    free(api->pass);
+    api->rows = NULL;
+    api->pass = NULL;
+    api->speculate = 0;
+    if (!k) return true;
+    api->rows = (float*)malloc((k + 1) * api->model->cfg.vocab * sizeof(float));
+    api->pass = (int32_t*)malloc((k + 1) * sizeof(int32_t));
+    if (!api->rows || !api->pass) {
+        free(api->rows);
+        free(api->pass);
+        api->rows = NULL;
+        api->pass = NULL;
+        return false;
+    }
+    api->speculate = k;
+    return true;
+}
+
 void vitna_api_free(vitna_api_t* api) {
     if (!api) return;
     vitna_sampler_free(&api->sampler);
     vitna_token_list_free(&api->cached);
+    free(api->rows);
+    free(api->pass);
     free(api->row);
     free(api->model_id);
     free(api);
