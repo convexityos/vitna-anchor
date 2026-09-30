@@ -360,28 +360,35 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     for (int i = threadIdx.x; i < gd; i += THREADS) qs[i] = q[(size_t)h0 * head_dim + i];
     __syncthreads();
 
-    /* Scores: a warp per position, its lanes across the head's dimensions. */
-    for (int t = warp; t < len; t += WARPS) {
-        const float* kt = kh + (size_t)(t0 + t) * kv_dim;
-        for (int h = 0; h < group; h++) {
-            float d = 0.0f;
-            for (int i = lane; i < head_dim; i += 32) d = fmaf(qs[h * head_dim + i], kt[i], d);
-            d = warp_sum(d);
-            if (lane == 0) s[h * per + t] = d * scale;
-        }
-    }
-    __syncthreads();
-
-    /* The slice's softmax, left unnormalized, a warp per head: its max,
-     * exp(score - max) and their sum. */
+    /* Scores, a warp per query head, its lanes across the positions: lane l
+     * takes positions l, l + 32, ..., each a whole dot product of its own,
+     * read sixteen bytes at a time. Then, in the same warp, the slice's
+     * softmax left unnormalized: its max, exp(score - max) and their sum. */
     for (int h = warp; h < group; h += WARPS) {
+        const float4* q4 = reinterpret_cast<const float4*>(qs + h * head_dim);
+        float* sh = s + h * per;
         float mx = NEG_INF;
-        for (int t = lane; t < len; t += 32) mx = fmaxf(mx, s[h * per + t]);
+        for (int t = lane; t < len; t += 32) {
+            const float4* k4 = reinterpret_cast<const float4*>(kh + (size_t)(t0 + t) * kv_dim);
+            float d = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < head_dim / 4; i++) {
+                const float4 kv = k4[i];
+                const float4 qv = q4[i];
+                d = fmaf(qv.x, kv.x, d);
+                d = fmaf(qv.y, kv.y, d);
+                d = fmaf(qv.z, kv.z, d);
+                d = fmaf(qv.w, kv.w, d);
+            }
+            d *= scale;
+            sh[t] = d;
+            mx = fmaxf(mx, d);
+        }
         mx = warp_max(mx);
         float sum = 0.0f;
         for (int t = lane; t < len; t += 32) {
-            const float e = expf(s[h * per + t] - mx);
-            s[h * per + t] = e;
+            const float e = expf(sh[t] - mx);
+            sh[t] = e;
             sum += e;
         }
         sum = warp_sum(sum);
@@ -392,12 +399,24 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     }
     __syncthreads();
 
-    /* The slice's sum of exp-weighted values, thread (h, i) for dimension i of head h. */
+    /* The slice's sum of exp-weighted values, thread (h, i) for dimension i
+     * of head h, its loads issued sixteen positions at a time. */
     for (int hi = threadIdx.x; hi < gd; hi += THREADS) {
         const int h = hi / head_dim, i = hi % head_dim;
+        const float* p = s + h * per;
+        const float* vcol = vh + (size_t)t0 * kv_dim + i;
         float acc = 0.0f;
-#pragma unroll 4
-        for (int t = 0; t < len; t++) acc = fmaf(s[h * per + t], vh[(size_t)(t0 + t) * kv_dim + i], acc);
+        for (int tb = 0; tb < len; tb += 16) {
+            float v[16];
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (tb + j < len) v[j] = vcol[(size_t)(tb + j) * kv_dim];
+            }
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (tb + j < len) acc = fmaf(p[tb + j], v[j], acc);
+            }
+        }
         part_o[((size_t)(h0 + h) * ATTENTION_SPLITS + split) * head_dim + i] = acc;
     }
 
@@ -622,8 +641,8 @@ static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {
 struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, char* err, size_t err_len) {
     const vitna_llama_config_t* c = &m->cfg;
     if (!vitna_cuda_probe(err, err_len)) return NULL;
-    if (c->head_dim > THREADS || c->head_dim % 2 != 0) {
-        fail(err, err_len, "head_dim %zu is not supported on the GPU: it must be even and at most %d", c->head_dim, THREADS);
+    if (c->head_dim > THREADS || c->head_dim % 4 != 0) {
+        fail(err, err_len, "head_dim %zu is not supported on the GPU: it must be a multiple of 4 and at most %d", c->head_dim, THREADS);
         return NULL;
     }
     if (!check_shapes(m, err, err_len)) return NULL;

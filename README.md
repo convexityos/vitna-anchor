@@ -182,7 +182,7 @@ node --test --test-reporter=spec tests/reference.test.mjs
 
 All five tests passed. Every compared logit was within the tolerance of 1e-2, which A1 fixed before the engine existed and A4 left alone: the largest difference was 2.30e-4, and 1.48e-4 for logsumexp. 192 of 192 greedy tokens were equal, and the top logits at each step differed by at most 5.53e-5. On the same machine the CPU path's largest difference is 3.01e-4, with 192 of 192 greedy tokens equal. `tests/serving.test.mjs` and `tests/reuse-and-json.test.mjs` passed with `VITNA_DEVICE=cuda` as well, so serving and prefix reuse work over the cache on the device.
 
-The GPU kernels were then rewritten for speed: CUDA graphs, fused kernels, and attention split across blocks by position. The same commands on the same machine, on the same day, passed again, with a largest difference of 2.25e-4, 1.65e-4 for logsumexp, 192 of 192 greedy tokens equal, and at most 4.58e-5 between the top logits at a step.
+The GPU kernels were then rewritten for speed: CUDA graphs, fused kernels, and attention split across blocks by position, each position scored by a lane of its own. The same commands on the same machine, on the same day, passed again, with a largest difference of 2.25e-4, 1.65e-4 for logsumexp, 192 of 192 greedy tokens equal, and at most 5.15e-5 between the top logits at a step.
 
 On the GPU the arithmetic is float32 on CUDA cores. No tensor cores are used, so TF32 does not apply, and the build does not pass `--use_fast_math`, so division, square root and `expf` keep their accurate forms. nvcc's default fused multiply-add is on; the CPU path's AVX2 matrix-vector product uses FMA too.
 
