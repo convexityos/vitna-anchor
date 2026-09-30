@@ -80,15 +80,11 @@
  * scratch holds, at most PREFILL_MAX and the cache, at least PREFILL_MIN.
  * Larger chunks give each kernel more blocks; past 2048 tokens SmolLM2-135M
  * gained nothing measurable. The logits of every position, when they are
- * asked for, come LOGIT_ROWS rows at a time. A warp of a
- * prompt's attention takes up to PROMPT_ROWS query rows, so a model whose
- * key-value heads each serve more query heads than that runs its prompts a
- * token at a time. */
+ * asked for, come LOGIT_ROWS rows at a time. */
 #define PREFILL_MAX 2048
 #define PREFILL_MIN 256
 #define PREFILL_BYTES ((size_t)64 << 20)
 #define LOGIT_ROWS 32
-#define PROMPT_ROWS 8
 
 /* The fewest tokens that run together; fewer are faster a step at a time. */
 #define PROMPT_MIN 2
@@ -768,129 +764,215 @@ __global__ void silu_mul_rows_kernel(float* __restrict__ gate, const float* __re
     }
 }
 
-/* Causal attention for a prompt's tokens, as flash attention computes it.
- * Block (b, kvh) takes key-value head kvh and WARPS of the chunk's tokens, a
- * warp a token: its rows are the RW = group query heads that read kvh
- * (repeat_kv). Positions go by in tiles of 32, whose keys and values the
- * block stages in shared memory once for every row, the values transposed.
- * In a tile, lane j scores position t0 + j against each row, masked after
- * the row's own position, and each row keeps its softmax as it goes: a
- * running max and sum, with the sum and the weighted values scaled by
- * exp(old max - new max) when the max moves. The tile's weights go to shared
- * memory, and lane l then adds dimensions l, l + 32, ... of each row's
- * weighted values, four positions at a time. That is model.c's softmax,
- * summed in another order; a row's sums run the same way whatever else the
- * block holds, so a token's result does not depend on the chunk it came in.
- * DS is head_dim / 32 rounded up: the dimensions a lane keeps. */
-template <int RW, int DS>
-__global__ void attention_prompt_kernel(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
-                                        float* __restrict__ att, int p0, int T, int head_dim, int kv_dim, int q_dim, float scale) {
-    extern __shared__ float4 shared4[];
-    const int kvh = blockIdx.y;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int kstride = head_dim + 4; /* padded, so that eight lanes reading eight rows sixteen bytes each hit distinct banks */
-    float* ks = reinterpret_cast<float*>(shared4);   /* [32][kstride] */
-    float* vt = ks + 32 * kstride;                   /* [head_dim][36]: values, transposed */
-    float* pw = vt + head_dim * 36 + warp * RW * 32; /* [RW][32]: this warp's weights for the tile */
-    const int tb = blockIdx.x * WARPS;               /* the block's first token */
-    const int t = tb + warp;                         /* this warp's token */
-    const int n = p0 + min(T, tb + WARPS);           /* the positions the block reads */
-    const int c4 = head_dim / 4;
-    /* The warp's token's position, or -1 past the chunk's last token, whose rows score nothing. */
-    const int pos = t < T ? p0 + t : -1;
-    const float* qw = q + (size_t)(t < T ? t : 0) * q_dim + (size_t)kvh * RW * head_dim;
+/* Causal attention for a prompt's tokens, tiled as a matrix product is, for
+ * head_dim ATT_D. Block (x, h) takes query head h and ATT_BQ of the chunk's
+ * tokens, the last tokens first, since they read the most positions. It goes
+ * through the positions ATT_BK at a time, staging each tile's keys
+ * (transposed) and values in shared memory once for all its rows, and reads
+ * the next tile into registers while this one computes. Thread
+ * (ty, tx) scores the ATT_RM rows from ATT_RM ty against the ATT_PX
+ * positions from ATT_PX tx, masked after each row's own position, and keeps
+ * dimensions 4 tx to 4 tx + 3 of those rows' weighted values. Each row keeps
+ * its softmax as it goes, a running max and sum across the 16 threads that
+ * share it, with the sum and the weighted values scaled by exp(old max - new
+ * max) when the max moves, and the tile's weights go through shared memory to
+ * the values' product. That is model.c's softmax, summed in another order,
+ * and a row's sums run the same way whatever chunk it came in. */
+#define ATT_D 64
+#define ATT_RM 4
+#define ATT_PX 2
+#define ATT_BQ (16 * ATT_RM)
+#define ATT_BK (16 * ATT_PX)
+static_assert(THREADS == 256 && ATT_D == 64 && ATT_RM % 4 == 0 && (ATT_PX == 2 || ATT_PX == 4),
+              "16 by 16 threads, each 4 dimensions, rows four at a time, positions two or four at a time");
 
-    float m[RW], l[RW], o[RW][DS];
+/* The dynamic shared memory: the queries, transposed, ATT_D rows of ATT_BQ +
+ * 4; a tile's keys, transposed, ATT_D rows of ATT_BK + 4; its values, ATT_BK
+ * rows of ATT_D + 4; and its weights, ATT_BQ rows of ATT_BK + 4. */
+#define ATT_SHARED \
+    ((size_t)(ATT_D * (ATT_BQ + 4) + ATT_D * (ATT_BK + 4) + ATT_BK * (ATT_D + 4) + ATT_BQ * (ATT_BK + 4)) * sizeof(float))
+static_assert(ATT_SHARED <= 48 * 1024, "within what a block gets without asking for more");
+
+/* ATT_PX floats from shared memory, in one load. */
+__device__ __forceinline__ void load_px(const float* p, float out[ATT_PX]) {
+#if ATT_PX == 4
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    out[0] = v.x;
+    out[1] = v.y;
+    out[2] = v.z;
+    out[3] = v.w;
+#else
+    const float2 v = *reinterpret_cast<const float2*>(p);
+    out[0] = v.x;
+    out[1] = v.y;
+#endif
+}
+
+__device__ __forceinline__ void store_px(float* p, const float in[ATT_PX]) {
+#if ATT_PX == 4
+    *reinterpret_cast<float4*>(p) = make_float4(in[0], in[1], in[2], in[3]);
+#else
+    *reinterpret_cast<float2*>(p) = make_float2(in[0], in[1]);
+#endif
+}
+
+/* A tile's keys and values come ATT_SLOTS float4s of each to a thread. */
+#define ATT_SLOTS (ATT_BK * (ATT_D / 4) / THREADS)
+static_assert(ATT_BK * (ATT_D / 4) % THREADS == 0, "a tile's float4s divide among the threads");
+
+/* This thread's share of the tile at position k0, zeros past end: masked, and a weight of 0. */
+__device__ __forceinline__ void fetch_tile(const float* __restrict__ kc, const float* __restrict__ vc, int k0, int end, int kv_dim,
+                                           int kvh, int tid, float4 kr[ATT_SLOTS], float4 vr[ATT_SLOTS]) {
 #pragma unroll
-    for (int i = 0; i < RW; i++) {
+    for (int u = 0; u < ATT_SLOTS; u++) {
+        const int i = tid + u * THREADS;
+        const int j = i / (ATT_D / 4), c = i % (ATT_D / 4);
+        kr[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        vr[u] = kr[u];
+        if (k0 + j < end) {
+            const size_t src = (size_t)(k0 + j) * kv_dim + (size_t)kvh * ATT_D + 4 * c;
+            kr[u] = *reinterpret_cast<const float4*>(kc + src);
+            vr[u] = *reinterpret_cast<const float4*>(vc + src);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* __restrict__ q, const float* __restrict__ kc,
+                                                                  const float* __restrict__ vc, float* __restrict__ att, int p0,
+                                                                  int T, int kv_dim, int q_dim, int group, float scale) {
+    extern __shared__ float4 shared4[];
+    const int QS = ATT_BQ + 4, KS = ATT_BK + 4, VS = ATT_D + 4;
+    float* qs = reinterpret_cast<float*>(shared4); /* [ATT_D][QS] */
+    float* ks = qs + ATT_D * QS;                   /* [ATT_D][KS] */
+    float* vs = ks + ATT_D * KS;                   /* [ATT_BK][VS] */
+    float* ps = vs + ATT_BK * VS;                  /* [ATT_BQ][KS] */
+    const int h = blockIdx.y, kvh = h / group;
+    const int t0 = (gridDim.x - 1 - blockIdx.x) * ATT_BQ; /* the block's first token in the chunk */
+    const int rows = min(ATT_BQ, T - t0);
+    const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
+    const int r0 = ty * ATT_RM;     /* the thread's first row */
+    const int end = p0 + t0 + rows; /* the positions the block reads: 0 to end - 1 */
+
+    float4 kr[ATT_SLOTS], vr[ATT_SLOTS];
+    fetch_tile(kc, vc, 0, end, kv_dim, kvh, tid, kr, vr); /* the first tile, read while the queries are staged */
+
+    for (int i = tid; i < ATT_BQ * (ATT_D / 4); i += THREADS) {
+        const int r = i / (ATT_D / 4), c = i % (ATT_D / 4);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r < rows) v = *reinterpret_cast<const float4*>(q + (size_t)(t0 + r) * q_dim + (size_t)h * ATT_D + 4 * c);
+        qs[(4 * c) * QS + r] = v.x;
+        qs[(4 * c + 1) * QS + r] = v.y;
+        qs[(4 * c + 2) * QS + r] = v.z;
+        qs[(4 * c + 3) * QS + r] = v.w;
+    }
+
+    float m[ATT_RM], l[ATT_RM], o[ATT_RM][4];
+#pragma unroll
+    for (int i = 0; i < ATT_RM; i++) {
         m[i] = NEG_INF;
         l[i] = 0.0f;
 #pragma unroll
-        for (int k = 0; k < DS; k++) o[i][k] = 0.0f;
+        for (int k = 0; k < 4; k++) o[i][k] = 0.0f;
     }
-
-    for (int t0 = 0; t0 < n; t0 += 32) {
-        const int len = min(32, n - t0);
-        __syncthreads(); /* the previous tile has been read */
-        for (int idx = threadIdx.x; idx < 32 * c4; idx += THREADS) {
-            const int j = idx / c4, c = idx % c4;
-            float4 kv = make_float4(0.0f, 0.0f, 0.0f, 0.0f), vv = kv; /* zeros past the end: a weight of 0 times them is 0 */
-            if (j < len) {
-                const size_t src = (size_t)(t0 + j) * kv_dim + (size_t)kvh * head_dim + 4 * c;
-                kv = *reinterpret_cast<const float4*>(kc + src);
-                vv = *reinterpret_cast<const float4*>(vc + src);
-            }
-            *reinterpret_cast<float4*>(ks + j * kstride + 4 * c) = kv;
-            vt[(4 * c) * 36 + j] = vv.x;
-            vt[(4 * c + 1) * 36 + j] = vv.y;
-            vt[(4 * c + 2) * 36 + j] = vv.z;
-            vt[(4 * c + 3) * 36 + j] = vv.w;
+    for (int k0 = 0; k0 < end; k0 += ATT_BK) {
+        __syncthreads(); /* the previous tile has been read, and the queries written */
+#pragma unroll
+        for (int u = 0; u < ATT_SLOTS; u++) {
+            const int i = tid + u * THREADS;
+            const int j = i / (ATT_D / 4), c = i % (ATT_D / 4);
+            ks[(4 * c) * KS + j] = kr[u].x;
+            ks[(4 * c + 1) * KS + j] = kr[u].y;
+            ks[(4 * c + 2) * KS + j] = kr[u].z;
+            ks[(4 * c + 3) * KS + j] = kr[u].w;
+            *reinterpret_cast<float4*>(vs + j * VS + 4 * c) = vr[u];
         }
         __syncthreads();
+        /* The next tile, in flight while this one computes. */
+        if (k0 + ATT_BK < end) fetch_tile(kc, vc, k0 + ATT_BK, end, kv_dim, kvh, tid, kr, vr);
 
-        /* Scores: lane j against position t0 + j, every lane reading the same sixteen bytes of the queries at once. */
-        float s[RW];
+        float s[ATT_RM][ATT_PX];
 #pragma unroll
-        for (int i = 0; i < RW; i++) s[i] = 0.0f;
-        const float4* k4 = reinterpret_cast<const float4*>(ks + lane * kstride);
-        for (int c = 0; c < c4; c++) {
-            const float4 kv = k4[c];
+        for (int i = 0; i < ATT_RM; i++) {
 #pragma unroll
-            for (int i = 0; i < RW; i++) {
-                const float4 qv = reinterpret_cast<const float4*>(qw + i * head_dim)[c];
-                s[i] = fmaf(qv.x, kv.x, s[i]);
-                s[i] = fmaf(qv.y, kv.y, s[i]);
-                s[i] = fmaf(qv.z, kv.z, s[i]);
-                s[i] = fmaf(qv.w, kv.w, s[i]);
-            }
+            for (int jj = 0; jj < ATT_PX; jj++) s[i][jj] = 0.0f;
         }
-        /* The running softmax. A row with nothing valid yet keeps a max of
-         * minus infinity, and its scale is then 1, not exp(nan). */
-        const bool valid = lane < len && t0 + lane <= pos;
+#pragma unroll 8
+        for (int d = 0; d < ATT_D; d++) {
+            float b[ATT_PX];
+            load_px(ks + d * KS + ATT_PX * tx, b);
 #pragma unroll
-        for (int i = 0; i < RW; i++) {
-            const float sc = valid ? s[i] * scale : NEG_INF;
-            const float mnew = fmaxf(m[i], warp_max(sc));
-            const float e = valid ? expf(sc - mnew) : 0.0f;
-            const float a = mnew == NEG_INF ? 1.0f : expf(m[i] - mnew); /* 0 at a row's first tile */
-            l[i] = l[i] * a + warp_sum(e);
-            m[i] = mnew;
+            for (int i4 = 0; i4 < ATT_RM; i4 += 4) {
+                const float4 a = *reinterpret_cast<const float4*>(qs + d * QS + r0 + i4);
+                const float av[4] = { a.x, a.y, a.z, a.w };
 #pragma unroll
-            for (int k = 0; k < DS; k++) o[i][k] *= a;
-            pw[i * 32 + lane] = e;
-        }
-        __syncwarp();
-        /* The weighted values: lane l keeps dimensions l, l + 32, ..., four positions at a time. */
+                for (int i = 0; i < 4; i++) {
 #pragma unroll
-        for (int j = 0; j < 32; j += 4) {
-            float4 v[DS];
-#pragma unroll
-            for (int k = 0; k < DS; k++) {
-                const int d = lane + 32 * k;
-                v[k] = d < head_dim ? *reinterpret_cast<const float4*>(vt + d * 36 + j) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            }
-#pragma unroll
-            for (int i = 0; i < RW; i++) {
-                const float4 p = *reinterpret_cast<const float4*>(pw + i * 32 + j);
-#pragma unroll
-                for (int k = 0; k < DS; k++) {
-                    o[i][k] = fmaf(p.x, v[k].x, o[i][k]);
-                    o[i][k] = fmaf(p.y, v[k].y, o[i][k]);
-                    o[i][k] = fmaf(p.z, v[k].z, o[i][k]);
-                    o[i][k] = fmaf(p.w, v[k].w, o[i][k]);
+                    for (int jj = 0; jj < ATT_PX; jj++) s[i4 + i][jj] = fmaf(av[i], b[jj], s[i4 + i][jj]);
                 }
             }
         }
-        __syncwarp(); /* the weights have been read before the next tile's are written */
+
+        /* The running softmax of each row. A row with nothing valid yet keeps
+         * a max of minus infinity, and its scale is then 1, not exp(nan). */
+#pragma unroll
+        for (int i = 0; i < ATT_RM; i++) {
+            const int r = r0 + i;
+            const int pos = p0 + t0 + r; /* the row's own position */
+            float sc[ATT_PX];
+            float mt = NEG_INF;
+#pragma unroll
+            for (int jj = 0; jj < ATT_PX; jj++) {
+                const int kp = k0 + ATT_PX * tx + jj;
+                sc[jj] = (r < rows && kp <= pos) ? s[i][jj] * scale : NEG_INF;
+                mt = fmaxf(mt, sc[jj]);
+            }
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+            const float mnew = fmaxf(m[i], mt);
+            float e[ATT_PX], sum = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < ATT_PX; jj++) {
+                e[jj] = sc[jj] == NEG_INF ? 0.0f : expf(sc[jj] - mnew);
+                sum += e[jj];
+            }
+            store_px(ps + r * KS + ATT_PX * tx, e);
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+            const float a = mnew == m[i] ? 1.0f : expf(m[i] - mnew); /* 1 while the max stays, 0 at a row's first valid tile */
+            l[i] = l[i] * a + sum;
+            m[i] = mnew;
+#pragma unroll
+            for (int k = 0; k < 4; k++) o[i][k] *= a;
+        }
+        __syncthreads();
+
+        /* The weighted values, four positions at a time: each row's four
+         * weights in one load, the same for all 16 threads of the row. */
+#pragma unroll 2
+        for (int j = 0; j < ATT_BK; j += 4) {
+            float4 v[4];
+#pragma unroll
+            for (int jj = 0; jj < 4; jj++) v[jj] = *reinterpret_cast<const float4*>(vs + (j + jj) * VS + tx * 4);
+#pragma unroll
+            for (int i = 0; i < ATT_RM; i++) {
+                const float4 p = *reinterpret_cast<const float4*>(ps + (r0 + i) * KS + j);
+                const float pv[4] = { p.x, p.y, p.z, p.w };
+#pragma unroll
+                for (int jj = 0; jj < 4; jj++) {
+                    o[i][0] = fmaf(pv[jj], v[jj].x, o[i][0]);
+                    o[i][1] = fmaf(pv[jj], v[jj].y, o[i][1]);
+                    o[i][2] = fmaf(pv[jj], v[jj].z, o[i][2]);
+                    o[i][3] = fmaf(pv[jj], v[jj].w, o[i][3]);
+                }
+            }
+        }
     }
-    if (pos < 0) return;
-    float* out = att + (size_t)t * q_dim + (size_t)kvh * RW * head_dim;
 #pragma unroll
-    for (int i = 0; i < RW; i++) {
-#pragma unroll
-        for (int k = 0; k < DS; k++) {
-            const int d = lane + 32 * k;
-            if (d < head_dim) out[i * head_dim + d] = o[i][k] / l[i];
+    for (int i = 0; i < ATT_RM; i++) {
+        const int r = r0 + i;
+        if (r < rows) {
+            const float4 out = make_float4(o[i][0] / l[i], o[i][1] / l[i], o[i][2] / l[i], o[i][3] / l[i]);
+            *reinterpret_cast<float4*>(att + (size_t)(t0 + r) * q_dim + (size_t)h * ATT_D + tx * 4) = out;
         }
     }
 }
@@ -985,51 +1067,20 @@ static void gemm(const struct vitna_cuda_model* g, const float* X, int ldx, cons
     LAUNCH(g->dtype, gemm_kernel, grid, 0, g->stream, X, ldx, W, Y, ldy, T, N, K, add);
 }
 
-/* A prompt's attention's dynamic shared memory: a tile's keys, padded, its
- * values, transposed and padded, and each warp's weights for the tile. */
-static size_t prompt_attention_shared(const struct vitna_cuda_model* g) {
-    const size_t group = (size_t)(g->n_heads / g->n_kv_heads), hd = (size_t)g->head_dim;
-    return (32 * (hd + 4) + hd * 36 + WARPS * group * 32) * sizeof(float);
-}
-
 /* Whether a prompt can run many tokens at once: widths the matrix-matrix
- * product's GEMM_BK divides, and an attention kernel for this shape, which
- * needs a key-value head's query heads to be at most PROMPT_ROWS, head_dim at
- * most 128, and a tile's keys, values and weights within 48 KB of shared
- * memory. A model that fails runs its prompts a token at a time. */
+ * product's GEMM_BK divides, and head_dim ATT_D, the attention kernel's. A
+ * model that fails runs its prompts a token at a time. */
 static bool prompt_batches(const struct vitna_cuda_model* g) {
-    const int group = g->n_heads / g->n_kv_heads;
     return g->hidden % GEMM_BK == 0 && g->intermediate % GEMM_BK == 0 && (g->n_heads * g->head_dim) % GEMM_BK == 0 &&
-           group <= PROMPT_ROWS && g->head_dim <= 128 && prompt_attention_shared(g) <= 48 * 1024;
+           g->head_dim == ATT_D;
 }
 
-/* A prompt's attention, for T tokens at positions p0 onwards: a warp a token. */
+/* A prompt's attention, for T tokens at positions p0 onwards. */
 static void enqueue_prompt_attention(const struct vitna_cuda_model* g, const float* kc, const float* vc, int p0, int T) {
-    const int hd = g->head_dim, group = g->n_heads / g->n_kv_heads;
-    const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
-    const dim3 grid(blocks_for((size_t)T, WARPS), g->n_kv_heads);
-    const size_t shared = prompt_attention_shared(g);
-#define PROMPT_ATTENTION(RW, DS) \
-    attention_prompt_kernel<RW, DS><<<grid, THREADS, shared, g->stream>>>(g->p_q, kc, vc, g->p_att, p0, T, hd, kv_dim, q_dim, g->scale)
-#define PROMPT_ATTENTION_RW(RW)                  \
-    switch ((hd + 31) / 32) {                    \
-        case 1: PROMPT_ATTENTION(RW, 1); break;  \
-        case 2: PROMPT_ATTENTION(RW, 2); break;  \
-        case 3: PROMPT_ATTENTION(RW, 3); break;  \
-        default: PROMPT_ATTENTION(RW, 4); break; \
-    }
-    switch (group) {
-        case 1: PROMPT_ATTENTION_RW(1); break;
-        case 2: PROMPT_ATTENTION_RW(2); break;
-        case 3: PROMPT_ATTENTION_RW(3); break;
-        case 4: PROMPT_ATTENTION_RW(4); break;
-        case 5: PROMPT_ATTENTION_RW(5); break;
-        case 6: PROMPT_ATTENTION_RW(6); break;
-        case 7: PROMPT_ATTENTION_RW(7); break;
-        default: PROMPT_ATTENTION_RW(8); break;
-    }
-#undef PROMPT_ATTENTION_RW
-#undef PROMPT_ATTENTION
+    const int group = g->n_heads / g->n_kv_heads;
+    const int q_dim = g->n_heads * g->head_dim, kv_dim = g->n_kv_heads * g->head_dim;
+    const dim3 tiles(blocks_for((size_t)T, ATT_BQ), g->n_heads);
+    attention_tiled_kernel<<<tiles, THREADS, ATT_SHARED, g->stream>>>(g->p_q, kc, vc, g->p_att, p0, T, kv_dim, q_dim, group, g->scale);
 }
 
 /* The embedding and every layer for T tokens of a prompt, g->p_tokens[c0]
