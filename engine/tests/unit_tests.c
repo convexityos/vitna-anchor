@@ -533,6 +533,132 @@ static void test_sampler(void) {
     vitna_sampler_free(&s);
 }
 
+/* The sampler as it was before its radix sort, kept as the statement of what
+ * it must draw: the same arithmetic, with qsort ordering the ids by
+ * probability, largest first, lower id first on ties. u is the uniform draw
+ * the sampler would take from its generator. */
+static const float* g_ref_probs;
+static int ref_by_prob_desc(const void* a, const void* b) {
+    int32_t ia = *(const int32_t*)a, ib = *(const int32_t*)b;
+    if (g_ref_probs[ia] > g_ref_probs[ib]) return -1;
+    if (g_ref_probs[ia] < g_ref_probs[ib]) return 1;
+    return (ia > ib) - (ia < ib);
+}
+
+static int32_t ref_sample(float* probs, int32_t* order, size_t n, const float* logits, const vitna_sampling_t* cfg, double u01) {
+    float max = logits[0];
+    for (size_t i = 1; i < n; i++) if (logits[i] > max) max = logits[i];
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        probs[i] = expf((logits[i] - max) / cfg->temperature);
+        sum += probs[i];
+        order[i] = (int32_t)i;
+    }
+    for (size_t i = 0; i < n; i++) probs[i] = (float)(probs[i] / sum);
+    g_ref_probs = probs;
+    qsort(order, n, sizeof(int32_t), ref_by_prob_desc);
+    size_t keep = (cfg->top_k > 0 && cfg->top_k < n) ? cfg->top_k : n;
+    double kept_mass = 0.0;
+    for (size_t i = 0; i < keep; i++) kept_mass += probs[order[i]];
+    if (cfg->top_p > 0.0f && cfg->top_p < 1.0f) {
+        double cum = 0.0;
+        size_t cut = keep;
+        for (size_t i = 0; i < keep; i++) {
+            cum += probs[order[i]] / kept_mass;
+            if (cum >= cfg->top_p) {
+                cut = i + 1;
+                break;
+            }
+        }
+        keep = cut;
+        kept_mass = 0.0;
+        for (size_t i = 0; i < keep; i++) kept_mass += probs[order[i]];
+    }
+    double u = u01 * kept_mass;
+    double cum = 0.0;
+    for (size_t i = 0; i < keep; i++) {
+        cum += probs[order[i]];
+        if (u < cum) return order[i];
+    }
+    return order[keep - 1];
+}
+
+/* Draws from vitna_sample against the reference, the same generator state
+ * each time; returns how many differed. */
+static int sample_mismatches(const float* logits, size_t n, const vitna_sampling_t* cfg, int draws, uint64_t seed) {
+    vitna_sampler_t s, rng;
+    float* probs = (float*)malloc(n * sizeof(float));
+    int32_t* order = (int32_t*)malloc(n * sizeof(int32_t));
+    if (!probs || !order || !vitna_sampler_init(&s, n, seed) || !vitna_sampler_init(&rng, 1, seed)) {
+        free(probs);
+        free(order);
+        return draws;
+    }
+    int bad = 0;
+    for (int d = 0; d < draws; d++) {
+        const int32_t got = vitna_sample(&s, logits, cfg);
+        const int32_t want = ref_sample(probs, order, n, logits, cfg, vitna_sampler_uniform(&rng));
+        bad += got != want;
+    }
+    vitna_sampler_free(&s);
+    vitna_sampler_free(&rng);
+    free(probs);
+    free(order);
+    return bad;
+}
+
+static void test_sampler_matches_reference(void) {
+    const float temps[] = { 0.7f, 1.0f, 1.5f };
+    const size_t ks[] = { 0, 1, 5, 50 };
+    const float ps[] = { 1.0f, 0.99f, 0.9f, 0.5f };
+
+    /* A vocabulary of SmolLM2's size, logits spread as a model's are. */
+    const size_t big = 49152;
+    float* logits = (float*)malloc(big * sizeof(float));
+    for (size_t i = 0; i < big; i++) logits[i] = rnd_f(-12.0f, 8.0f);
+    for (int t = 0; t < 3; t++) {
+        const vitna_sampling_t cfg = { temps[t], t == 1 ? 50u : 0u, t == 2 ? 0.9f : 1.0f, 0 };
+        const int bad = sample_mismatches(logits, big, &cfg, 12, 100 + t);
+        CHECK(bad == 0, "49,152 logits, temperature %.1f: %d of 12 draws differ from the qsort sampler", temps[t], bad);
+    }
+
+    /* Many exact ties: logits from a handful of values, so equal
+     * probabilities are everywhere and the lower id must come first. */
+    const size_t mid = 3000;
+    for (size_t i = 0; i < mid; i++) logits[i] = (float)(rnd_u32() % 7) * 0.5f;
+    /* Probabilities that underflow to zero, and subnormal ones. */
+    float* extreme = (float*)malloc(mid * sizeof(float));
+    for (size_t i = 0; i < mid; i++) {
+        const uint32_t r = rnd_u32() % 5;
+        extreme[i] = r == 0 ? -1.0e4f : r == 1 ? rnd_f(-104.0f, -86.0f) : r == 2 ? 0.0f : rnd_f(-20.0f, 2.0f);
+    }
+    int configs = 0, bad_ties = 0, bad_extreme = 0;
+    for (int t = 0; t < 3; t++) {
+        for (int k = 0; k < 4; k++) {
+            for (int p = 0; p < 4; p++) {
+                const vitna_sampling_t cfg = { temps[t], ks[k], ps[p], 0 };
+                bad_ties += sample_mismatches(logits, mid, &cfg, 40, 1000 + configs);
+                bad_extreme += sample_mismatches(extreme, mid, &cfg, 40, 2000 + configs);
+                configs++;
+            }
+        }
+    }
+    CHECK(bad_ties == 0, "logits with many ties: %d of %d draws differ from the qsort sampler", bad_ties, configs * 40);
+    CHECK(bad_extreme == 0, "zero and subnormal probabilities: %d of %d draws differ from the qsort sampler", bad_extreme, configs * 40);
+
+    /* All equal: every setting that keeps one token keeps the lowest id. */
+    for (size_t i = 0; i < 10; i++) logits[i] = 1.25f;
+    vitna_sampler_t s;
+    vitna_sampler_init(&s, 10, 5);
+    const vitna_sampling_t top1 = { 1.0f, 1, 1.0f, 0 };
+    bool lowest = true;
+    for (int d = 0; d < 20; d++) lowest = lowest && vitna_sample(&s, logits, &top1) == 0;
+    CHECK(lowest, "equal logits, top-k 1: the lowest id every time");
+    vitna_sampler_free(&s);
+    free(extreme);
+    free(logits);
+}
+
 /* --- JSON output, UTF-8 boundaries and ChatML, for the HTTP API --- */
 
 static void test_api_helpers(void) {
@@ -763,6 +889,7 @@ int main(void) {
     test_sha256();
     test_clock();
     test_sampler();
+    test_sampler_matches_reference();
     printf("%d checks, %d failed (matvec path: %s, Unicode %s)\n", g_checks, g_failures, vitna_matvec_path(), vitna_uni_version());
     return g_failures == 0 ? 0 : 1;
 }

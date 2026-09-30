@@ -30,6 +30,8 @@ typedef struct {
     size_t n;
     float* probs;        /* n */
     int32_t* order;      /* n */
+    int32_t* spare;      /* n: the sort's second buffer of ids */
+    uint32_t* keys;      /* 2n: the sort's keys, and their second buffer */
 } vitna_sampler_t;
 
 bool vitna_sampler_init(vitna_sampler_t* s, size_t vocab, uint64_t seed);
