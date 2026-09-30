@@ -768,7 +768,8 @@ __global__ void silu_mul_rows_kernel(float* __restrict__ gate, const float* __re
  * head_dim ATT_D. Block (x, h) takes query head h and ATT_BQ of the chunk's
  * tokens, the last tokens first, since they read the most positions. It goes
  * through the positions ATT_BK at a time, staging each tile's keys
- * (transposed) and values in shared memory once for all its rows. Thread
+ * (transposed) and values in shared memory once for all its rows, and reads
+ * the next tile into registers while this one computes. Thread
  * (ty, tx) scores the ATT_RM rows from ATT_RM ty against the ATT_PX
  * positions from ATT_PX tx, masked after each row's own position, and keeps
  * dimensions 4 tx to 4 tx + 3 of those rows' weighted values. Each row keeps
@@ -815,6 +816,27 @@ __device__ __forceinline__ void store_px(float* p, const float in[ATT_PX]) {
 #endif
 }
 
+/* A tile's keys and values come ATT_SLOTS float4s of each to a thread. */
+#define ATT_SLOTS (ATT_BK * (ATT_D / 4) / THREADS)
+static_assert(ATT_BK * (ATT_D / 4) % THREADS == 0, "a tile's float4s divide among the threads");
+
+/* This thread's share of the tile at position k0, zeros past end: masked, and a weight of 0. */
+__device__ __forceinline__ void fetch_tile(const float* __restrict__ kc, const float* __restrict__ vc, int k0, int end, int kv_dim,
+                                           int kvh, int tid, float4 kr[ATT_SLOTS], float4 vr[ATT_SLOTS]) {
+#pragma unroll
+    for (int u = 0; u < ATT_SLOTS; u++) {
+        const int i = tid + u * THREADS;
+        const int j = i / (ATT_D / 4), c = i % (ATT_D / 4);
+        kr[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        vr[u] = kr[u];
+        if (k0 + j < end) {
+            const size_t src = (size_t)(k0 + j) * kv_dim + (size_t)kvh * ATT_D + 4 * c;
+            kr[u] = *reinterpret_cast<const float4*>(kc + src);
+            vr[u] = *reinterpret_cast<const float4*>(vc + src);
+        }
+    }
+}
+
 __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* __restrict__ q, const float* __restrict__ kc,
                                                                   const float* __restrict__ vc, float* __restrict__ att, int p0,
                                                                   int T, int kv_dim, int q_dim, int group, float scale) {
@@ -830,6 +852,9 @@ __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* _
     const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
     const int r0 = ty * ATT_RM;     /* the thread's first row */
     const int end = p0 + t0 + rows; /* the positions the block reads: 0 to end - 1 */
+
+    float4 kr[ATT_SLOTS], vr[ATT_SLOTS];
+    fetch_tile(kc, vc, 0, end, kv_dim, kvh, tid, kr, vr); /* the first tile, read while the queries are staged */
 
     for (int i = tid; i < ATT_BQ * (ATT_D / 4); i += THREADS) {
         const int r = i / (ATT_D / 4), c = i % (ATT_D / 4);
@@ -851,21 +876,19 @@ __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* _
     }
     for (int k0 = 0; k0 < end; k0 += ATT_BK) {
         __syncthreads(); /* the previous tile has been read, and the queries written */
-        for (int i = tid; i < ATT_BK * (ATT_D / 4); i += THREADS) {
+#pragma unroll
+        for (int u = 0; u < ATT_SLOTS; u++) {
+            const int i = tid + u * THREADS;
             const int j = i / (ATT_D / 4), c = i % (ATT_D / 4);
-            float4 kv = make_float4(0.0f, 0.0f, 0.0f, 0.0f), vv = kv; /* zeros past the end: masked, and a weight of 0 */
-            if (k0 + j < end) {
-                const size_t src = (size_t)(k0 + j) * kv_dim + (size_t)kvh * ATT_D + 4 * c;
-                kv = *reinterpret_cast<const float4*>(kc + src);
-                vv = *reinterpret_cast<const float4*>(vc + src);
-            }
-            ks[(4 * c) * KS + j] = kv.x;
-            ks[(4 * c + 1) * KS + j] = kv.y;
-            ks[(4 * c + 2) * KS + j] = kv.z;
-            ks[(4 * c + 3) * KS + j] = kv.w;
-            *reinterpret_cast<float4*>(vs + j * VS + 4 * c) = vv;
+            ks[(4 * c) * KS + j] = kr[u].x;
+            ks[(4 * c + 1) * KS + j] = kr[u].y;
+            ks[(4 * c + 2) * KS + j] = kr[u].z;
+            ks[(4 * c + 3) * KS + j] = kr[u].w;
+            *reinterpret_cast<float4*>(vs + j * VS + 4 * c) = vr[u];
         }
         __syncthreads();
+        /* The next tile, in flight while this one computes. */
+        if (k0 + ATT_BK < end) fetch_tile(kc, vc, k0 + ATT_BK, end, kv_dim, kvh, tid, kr, vr);
 
         float s[ATT_RM][ATT_PX];
 #pragma unroll
