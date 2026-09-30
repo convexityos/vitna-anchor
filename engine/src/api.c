@@ -30,6 +30,10 @@
  * MASK_CACHE states are kept, a bit a token (mask_json). */
 #define MASK_CACHE 32
 
+/* The most threads a round's requests take their tokens on, the scheduler's
+ * own among them (take_all). */
+#define TAKE_THREADS 8
+
 typedef struct {
     vitna_jsonpfx_t key; /* the state, with the stack's slots past its depth cleared */
     uint32_t* allowed;   /* bit (id & 31) of word id >> 5: whether token id can follow */
@@ -59,16 +63,34 @@ struct vitna_api {
 
     /* The scheduler's alone, on its thread. */
     uint64_t counter;
-    vitna_sampler_t sampler;        /* its state is each request's in turn (take) */
     float* row;                     /* a prompt's last logits */
-    mask_entry_t masks[MASK_CACHE]; /* JSON mode's masks by state (mask_json) */
-    uint64_t mask_clock;
     seq_t* seqs;                    /* one per sequence of the model's cache */
     uint64_t seq_clock;
     size_t rows_cap;                /* the rows a round can hold (round_capacity) */
     vitna_llama_row_t* rows;        /* a round's rows, */
     float* logits;                  /* their logits, rows_cap x vocab, */
     bool* ran;                      /* and which ran */
+
+    /* The threads a round's requests take their tokens on: the scheduler's,
+     * sampler 0, and workers 1 to takers - 1, each with a sampler of its own,
+     * whose state is each request's in turn (take). */
+    size_t takers;
+    vitna_sampler_t* samplers;
+    vitna_thread_t* workers;
+    size_t workers_started;
+    vitna_mutex_t pool_lock;
+    vitna_cond_t pool_work;         /* signalled when a round's requests are ready to take */
+    vitna_cond_t pool_done;         /* signalled when the last of them is taken */
+    job_t** pool_jobs;              /* the round's requests */
+    size_t pool_n, pool_next, pool_pending;
+    uint64_t pool_round;            /* counts rounds handed out, so a worker knows a new one */
+    bool pool_stop;
+
+    /* JSON mode's masks by state (mask_json), under mask_lock: requests
+     * taking their tokens at once share them. */
+    vitna_mutex_t mask_lock;
+    mask_entry_t masks[MASK_CACHE];
+    uint64_t mask_clock;
 
     /* Under lock. */
     vitna_mutex_t lock;
@@ -589,7 +611,7 @@ static void stream_ready(gen_t* g, bool final) {
  * Which tokens can follow depends only on the automaton's state, so a
  * state's answer is kept (MASK_CACHE) and serves again when the state comes
  * round again: the same tokens masked, found once. */
-static bool mask_json(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state) {
+static bool mask_json_locked(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state) {
     const size_t V = api->model->cfg.vocab;
     const size_t words = (V + 31) / 32;
     vitna_jsonpfx_t key = *state;
@@ -646,6 +668,16 @@ static bool mask_json(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state
     return e->left > 0;
 }
 
+/* mask_json_locked, holding the lock the masks are kept under. A kept mask
+ * is a function of its state alone, so which thread found it, and which
+ * masks are kept, never change what is masked. */
+static bool mask_json(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state) {
+    vitna_mutex_lock(&api->mask_lock);
+    const bool left = mask_json_locked(api, row, state);
+    vitna_mutex_unlock(&api->mask_lock);
+    return left;
+}
+
 /* What taking a token needs, for take_token. */
 typedef struct {
     vitna_api_t* api;
@@ -664,7 +696,7 @@ enum { TAKE_GO, TAKE_END, TAKE_END_NONE };
  * TAKE_END when the reply ends with this token (a special token, a stop
  * sequence or a closed JSON object), with *finish set; TAKE_END_NONE when the
  * JSON mask left no token to take. */
-static int take_token(take_t* tk, float* row, int32_t* chosen) {
+static int take_token(take_t* tk, vitna_sampler_t* sampler, float* row, int32_t* chosen) {
     const params_t* p = tk->p;
     gen_t* g = tk->g;
     if (p->json && !mask_json(tk->api, row, &tk->json)) {
@@ -674,7 +706,7 @@ static int take_token(take_t* tk, float* row, int32_t* chosen) {
         *tk->finish = "stop";
         return TAKE_END_NONE;
     }
-    const int32_t next = vitna_sample(&tk->api->sampler, row, tk->cfg);
+    const int32_t next = vitna_sample(sampler, row, tk->cfg);
     *chosen = next;
     tk->r->completion_tokens++;
     if (vitna_tokenizer_is_special(tk->api->tok, next)) {
@@ -799,12 +831,13 @@ static bool job_write(void* ctx, const void* data, size_t len) {
     return ok;
 }
 
-/* take_token with this request's sampler state: requests take their tokens in
- * turn, and each draws from its own stream, as it would alone. */
-static int take(vitna_api_t* api, job_t* j, float* row, int32_t* chosen) {
-    api->sampler.state = j->rng;
-    const int st = take_token(&j->tk, row, chosen);
-    j->rng = api->sampler.state;
+/* take_token with the sampler of the thread taking it, holding this
+ * request's state: each request draws from its own stream, as it would
+ * alone, whichever thread takes its tokens. */
+static int take(job_t* j, vitna_sampler_t* sampler, float* row, int32_t* chosen) {
+    sampler->state = j->rng;
+    const int st = take_token(&j->tk, sampler, row, chosen);
+    j->rng = sampler->state;
     return st;
 }
 
@@ -949,14 +982,16 @@ static void job_begin(vitna_api_t* api, job_t* j) {
      * agree with the drafts. So a reply is the one without drafts, and the
      * cache ends holding what it would hold: every token fed that one step at
      * a time would have fed, and no other. */
-    j->st = j->ok && j->max_new > 0 && !j->sink.failed ? take(api, j, api->row, &j->t) : TAKE_END;
+    j->st = j->ok && j->max_new > 0 && !j->sink.failed ? take(j, &api->samplers[0], api->row, &j->t) : TAKE_END;
     if (j->text && j->st != TAKE_END_NONE) j->text[j->text_len++] = j->t;
     j->ended = !(j->ok && j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
 }
 
 /* After a round's rows ran: the request takes the tokens its rows give, as a
- * token at a time would. */
-static void job_take(vitna_api_t* api, job_t* j) {
+ * token at a time would. It touches only its own request, its own sequence
+ * and the masks under their lock, so a round's requests can take their
+ * tokens at once, each with a sampler of its own. */
+static void job_take(vitna_api_t* api, job_t* j, vitna_sampler_t* sampler) {
     vitna_llama_t* m = api->model;
     seq_t* q = &api->seqs[j->seq];
     const size_t V = m->cfg.vocab;
@@ -973,7 +1008,7 @@ static void job_take(vitna_api_t* api, job_t* j) {
             j->ended = true;
             return;
         }
-        j->st = take(api, j, rows, &j->t);
+        j->st = take(j, sampler, rows, &j->t);
         if (j->text && j->st != TAKE_END_NONE) j->text[j->text_len++] = j->t;
     } else {
         j->passes++;
@@ -997,7 +1032,7 @@ static void job_take(vitna_api_t* api, job_t* j) {
                 break;
             }
             int32_t u = 0;
-            j->st = take(api, j, rows + i * V, &u);
+            j->st = take(j, sampler, rows + i * V, &u);
             if (j->st != TAKE_END_NONE && j->text) j->text[j->text_len++] = u;
             if (j->st == TAKE_GO && j->r.completion_tokens < j->max_new && i < j->d && u == j->pass[i + 1]) continue;
             keep = i + 1;
@@ -1014,6 +1049,88 @@ static void job_take(vitna_api_t* api, job_t* j) {
         }
     }
     j->ended = !(j->ok && j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
+}
+
+/* A worker thread: it takes the requests of each round handed out, one at a
+ * time, until none is left. */
+typedef struct {
+    vitna_api_t* api;
+    size_t index; /* its sampler */
+} worker_t;
+
+static void worker(void* arg) {
+    worker_t w = *(worker_t*)arg;
+    free(arg);
+    vitna_api_t* api = w.api;
+    uint64_t seen = 0;
+    vitna_mutex_lock(&api->pool_lock);
+    for (;;) {
+        while (!api->pool_stop && api->pool_round == seen) vitna_cond_wait(&api->pool_work, &api->pool_lock);
+        if (api->pool_stop) break;
+        seen = api->pool_round;
+        while (api->pool_next < api->pool_n) {
+            job_t* j = api->pool_jobs[api->pool_next++];
+            vitna_mutex_unlock(&api->pool_lock);
+            job_take(api, j, &api->samplers[w.index]);
+            vitna_mutex_lock(&api->pool_lock);
+            if (--api->pool_pending == 0) vitna_cond_signal(&api->pool_done);
+        }
+    }
+    vitna_mutex_unlock(&api->pool_lock);
+}
+
+/* Start the workers, once; fewer than asked if threads run short, and none
+ * is needed: the scheduler takes whatever they do not. */
+static void start_workers(vitna_api_t* api) {
+    while (api->workers_started + 1 < api->takers) {
+        worker_t* w = (worker_t*)malloc(sizeof(worker_t));
+        if (!w) break;
+        w->api = api;
+        w->index = api->workers_started + 1;
+        if (!vitna_thread_start(&api->workers[api->workers_started], worker, w, false)) {
+            free(w);
+            break;
+        }
+        api->workers_started++;
+    }
+}
+
+/* The round's requests take the tokens its rows gave them. A token taken by
+ * sampling costs about as much as a step of the model (sorting the
+ * vocabulary by probability), so when more than one request samples, or
+ * masks for JSON mode, they take theirs on several threads at once; greedy
+ * tokens cost little, and go in turn on the scheduler's. Which thread takes
+ * a request's tokens changes nothing: its state is its own (take). */
+static void take_all(vitna_api_t* api, job_t* running, size_t live) {
+    size_t costly = 0, n = 0;
+    for (job_t* j = running; j; j = j->next) {
+        if (!j->ended) costly += j->p->temperature > 0.0f || j->p->json;
+    }
+    if (live < 2 || costly < 2 || api->takers < 2) {
+        for (job_t* j = running; j; j = j->next) {
+            if (!j->ended) job_take(api, j, &api->samplers[0]);
+        }
+        return;
+    }
+    if (api->workers_started + 1 < api->takers) start_workers(api);
+    for (job_t* j = running; j; j = j->next) {
+        if (!j->ended) api->pool_jobs[n++] = j;
+    }
+    vitna_mutex_lock(&api->pool_lock);
+    api->pool_n = n;
+    api->pool_next = 0;
+    api->pool_pending = n;
+    api->pool_round++;
+    vitna_cond_broadcast(&api->pool_work);
+    while (api->pool_next < api->pool_n) {
+        job_t* j = api->pool_jobs[api->pool_next++];
+        vitna_mutex_unlock(&api->pool_lock);
+        job_take(api, j, &api->samplers[0]);
+        vitna_mutex_lock(&api->pool_lock);
+        api->pool_pending--;
+    }
+    while (api->pool_pending > 0) vitna_cond_wait(&api->pool_done, &api->pool_lock);
+    vitna_mutex_unlock(&api->pool_lock);
 }
 
 /* One round: every running request's next token, and any drafts after it,
@@ -1059,9 +1176,7 @@ static void run_round(vitna_api_t* api, job_t* running) {
         }
     }
     vitna_llama_step_rows(m, api->rows, n, api->logits, api->ran);
-    for (job_t* j = running; j; j = j->next) {
-        if (!j->ended) job_take(api, j);
-    }
+    take_all(api, running, live);
 }
 
 /* A request's end: the rest of its response. */
@@ -1262,11 +1377,21 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
     api->created = (long long)time(NULL);
     vitna_mutex_init(&api->lock);
     vitna_cond_init(&api->work);
+    vitna_mutex_init(&api->pool_lock);
+    vitna_cond_init(&api->pool_work);
+    vitna_cond_init(&api->pool_done);
+    vitna_mutex_init(&api->mask_lock);
+    api->takers = model->seqs < TAKE_THREADS ? model->seqs : TAKE_THREADS;
+    api->samplers = (vitna_sampler_t*)calloc(api->takers, sizeof(vitna_sampler_t));
+    api->workers = (vitna_thread_t*)calloc(api->takers, sizeof(vitna_thread_t));
+    api->pool_jobs = (job_t**)calloc(model->seqs, sizeof(job_t*));
+    bool samplers = api->samplers && api->workers && api->pool_jobs;
+    for (size_t i = 0; samplers && i < api->takers; i++) samplers = vitna_sampler_init(&api->samplers[i], model->cfg.vocab, 0);
     size_t n = strlen(model_id) + 1;
     api->model_id = (char*)malloc(n);
     api->row = (float*)malloc(model->cfg.vocab * sizeof(float));
     api->seqs = (seq_t*)calloc(model->seqs, sizeof(seq_t));
-    if (!api->model_id || !api->row || !api->seqs || !vitna_sampler_init(&api->sampler, model->cfg.vocab, 0) || !round_capacity(api, 0)) {
+    if (!api->model_id || !api->row || !api->seqs || !samplers || !round_capacity(api, 0)) {
         vitna_api_free(api);
         return NULL;
     }
@@ -1309,7 +1434,17 @@ void vitna_api_free(vitna_api_t* api) {
     const bool started = api->started;
     vitna_mutex_unlock(&api->lock);
     if (started) vitna_thread_join(api->thread);
-    vitna_sampler_free(&api->sampler);
+    vitna_mutex_lock(&api->pool_lock);
+    api->pool_stop = true;
+    vitna_cond_broadcast(&api->pool_work);
+    vitna_mutex_unlock(&api->pool_lock);
+    for (size_t i = 0; i < api->workers_started; i++) vitna_thread_join(api->workers[i]);
+    if (api->samplers) {
+        for (size_t i = 0; i < api->takers; i++) vitna_sampler_free(&api->samplers[i]);
+    }
+    free(api->samplers);
+    free(api->workers);
+    free(api->pool_jobs);
     if (api->seqs) {
         for (size_t s = 0; s < api->model->seqs; s++) vitna_token_list_free(&api->seqs[s].cached);
     }
@@ -1322,6 +1457,10 @@ void vitna_api_free(vitna_api_t* api) {
     free(api->model_id);
     vitna_cond_destroy(&api->work);
     vitna_mutex_destroy(&api->lock);
+    vitna_cond_destroy(&api->pool_work);
+    vitna_cond_destroy(&api->pool_done);
+    vitna_mutex_destroy(&api->pool_lock);
+    vitna_mutex_destroy(&api->mask_lock);
     free(api);
 }
 
