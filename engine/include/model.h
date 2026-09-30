@@ -69,9 +69,10 @@ typedef struct {
     vitna_llama_layer_t* layers;
     float* inv_freq;          /* head_dim / 2 rotary frequencies */
 
-    size_t ctx;               /* positions the key-value cache holds */
-    size_t n_past;            /* positions filled */
-    float* k_cache;           /* [n_layers][ctx][n_kv_heads * head_dim] */
+    size_t ctx;               /* positions the key-value cache holds for each sequence */
+    size_t seqs;              /* sequences it holds, each run on its own (see vitna_llama_step_rows) */
+    size_t* past;             /* [seqs]: each sequence's positions filled */
+    float* k_cache;           /* [seqs][n_layers][ctx][n_kv_heads * head_dim] */
     float* v_cache;
 
     /* scratch */
@@ -82,50 +83,51 @@ typedef struct {
     struct vitna_cuda_model* cuda;
 
     /* For tests, set by vitna_llama_fail_step_once: while fail_armed, the
-     * step at position fail_at fails. */
+     * step at position fail_at, in any sequence, fails. */
     bool fail_armed;
     size_t fail_at;
 } vitna_llama_t;
 
 /**
- * Load the model in dir, with a key-value cache of ctx positions (0 for the
- * lesser of the model's maximum and 4096). Returns false, with a reason in
- * err, if the model cannot be read or asks for something unsupported.
+ * Load the model in dir, with a key-value cache of seqs sequences (at least
+ * 1), each of ctx positions (0 for the lesser of the model's maximum and
+ * 4096). Returns false, with a reason in err, if the model cannot be read or
+ * asks for something unsupported.
  */
-bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, char* err, size_t err_len);
+bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs, char* err, size_t err_len);
 
 void vitna_llama_free(vitna_llama_t* m);
 
-/** Forget every position, so the next token is at position 0. */
+/** Forget every position of every sequence, so each one's next token is at position 0. */
 void vitna_llama_reset(vitna_llama_t* m);
 
 /**
- * Keep the first n positions and forget the rest, so the next token is at
- * position n. A position's keys and values depend only on the tokens up to
- * it, so what is kept is exactly what feeding those n tokens again would
- * compute. n larger than the positions filled changes nothing.
+ * Keep the first n positions of sequence seq and forget the rest, so its next
+ * token is at position n. A position's keys and values depend only on the
+ * tokens up to it, so what is kept is exactly what feeding those n tokens
+ * again would compute. n larger than the positions filled changes nothing.
  */
-void vitna_llama_truncate(vitna_llama_t* m, size_t n);
+void vitna_llama_truncate(vitna_llama_t* m, size_t seq, size_t n);
 
 /**
- * Run one token at the next position (m->n_past), adding its keys and values
- * to the cache. Writes vocab logits to logits unless it is NULL, which skips
- * the output projection. Returns false if the cache is full or the token is
- * out of range, or, on a GPU, if the device reports an error, which is then
- * printed to stderr, or when a test asked for this step to fail
- * (vitna_llama_fail_step_once). A step that returns false leaves m->n_past
- * where it was.
+ * Run one token at sequence seq's next position (m->past[seq]), adding its
+ * keys and values to that sequence's cache. Writes vocab logits to logits
+ * unless it is NULL, which skips the output projection. Returns false if the
+ * sequence's cache is full or the token is out of range, or, on a GPU, if
+ * the device reports an error, which is then printed to stderr, or when a
+ * test asked for this step to fail (vitna_llama_fail_step_once). A step that
+ * returns false leaves m->past[seq] where it was.
  */
-bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits);
+bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits);
 
 /**
- * Run count tokens at positions m->n_past to m->n_past + count - 1, as count
- * calls to vitna_llama_step would, and return how many ran: count, unless one
- * could not, in which case the tokens before it ran and stay in the cache, it
- * did not, and m->n_past is left after the last that ran. A token fails as a
- * step does: out of range, past the cache, failed by a test, or, on a GPU, a
- * device error, which also leaves out every token of the batch that had not
- * yet been confirmed.
+ * Run count tokens of sequence seq at its positions m->past[seq] onwards, as
+ * count calls to vitna_llama_step would, and return how many ran: count,
+ * unless one could not, in which case the tokens before it ran and stay in
+ * the cache, it did not, and m->past[seq] is left after the last that ran. A
+ * token fails as a step does: out of range, past the cache, failed by a
+ * test, or, on a GPU, a device error, which also leaves out every token of
+ * the batch that had not yet been confirmed.
  *
  * If logits is not NULL and every token ran, it receives vocab logits for
  * each of the last rows positions (rows at most count), rows x vocab, in
@@ -136,29 +138,54 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits);
  * tokens, and causal attention among them; the results are the same up to
  * float32 rounding.
  */
-size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits, size_t rows);
+size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits, size_t rows);
 
 /**
- * Run count tokens at positions m->n_past onwards as count calls to
- * vitna_llama_step would, writing every one's logits, count x vocab, and
- * return how many ran, with vitna_llama_steps's rule for a token that
- * fails. Every value is the one those steps would give, bit for bit, so a
- * caller can check several drafted tokens in one call and reply exactly as
- * it would have one token at a time. On the CPU it is those steps. On a GPU
- * up to vitna_llama_exact_max tokens run in one pass that reads each weight
- * once; more, or a token that cannot run, go a step at a time.
+ * Run count tokens of sequence seq at its positions m->past[seq] onwards as
+ * count calls to vitna_llama_step would, writing every one's logits, count x
+ * vocab, and return how many ran, with vitna_llama_steps's rule for a token
+ * that fails. Every value is the one those steps would give, bit for bit, so
+ * a caller can check several drafted tokens in one call and reply exactly as
+ * it would have one token at a time. It is vitna_llama_step_rows with every
+ * row in seq.
  */
-size_t vitna_llama_steps_exact(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits);
+size_t vitna_llama_steps_exact(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits);
 
-/** The most tokens vitna_llama_steps_exact runs in one pass: 1 on the CPU. */
+/** A token to run in sequence seq, at that sequence's next position. */
+typedef struct {
+    size_t seq;
+    int32_t token;
+} vitna_llama_row_t;
+
+/**
+ * Run n rows, each a token at its sequence's next position, as n calls to
+ * vitna_llama_step would in order: rows of one sequence take its positions
+ * one after another, and sequences share nothing. Writes every row's logits,
+ * n x vocab, and sets ran[i] to whether row i ran. Every value is the one
+ * those steps would give, bit for bit, however the rows mix sequences, so
+ * several requests, each with drafted tokens or not, can run together and
+ * each reply exactly as it would alone, a token at a time.
+ *
+ * A row fails as a step does, and a sequence stops at its first row that
+ * fails: that row and its sequence's rows after it do not run. Rows of other
+ * sequences run as they would without it. A device error on a GPU fails every
+ * row of the pass it was in.
+ *
+ * On the CPU the rows run a step at a time. On a GPU up to
+ * vitna_llama_exact_max rows run in each pass, which reads each weight once
+ * for all of them. Returns how many rows ran.
+ */
+size_t vitna_llama_step_rows(vitna_llama_t* m, const vitna_llama_row_t* rows, size_t n, float* logits, bool* ran);
+
+/** The most rows vitna_llama_step_rows runs in one pass: 1 on the CPU. */
 size_t vitna_llama_exact_max(const vitna_llama_t* m);
 
 /**
- * For tests: make the next step at position pos fail, once, as a step on the
- * GPU does when the device reports an error, so that what its callers do
- * then can be tested on a CPU. That step returns false before computing
- * anything, on either device, and says so on stderr. A later step at pos runs
- * as usual.
+ * For tests: make the next step at position pos fail, once, in whichever
+ * sequence reaches it first, as a step on the GPU does when the device
+ * reports an error, so that what its callers do then can be tested on a CPU.
+ * That step returns false before computing anything, on either device, and
+ * says so on stderr. A later step at pos runs as usual.
  */
 void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos);
 

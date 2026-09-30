@@ -19,8 +19,8 @@ typedef struct {
 } vitna_server_config_t;
 
 /**
- * Start the HTTP server. Answers one request at a time, and blocks until the
- * listening socket fails.
+ * Start the HTTP server. Answers each connection on a thread of its own, and
+ * blocks until the listening socket fails.
  */
 int vitna_server_run(const vitna_server_config_t* config);
 

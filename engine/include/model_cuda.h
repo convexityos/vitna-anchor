@@ -23,18 +23,19 @@ bool vitna_cuda_probe(char* err, size_t err_len);
 /**
  * Upload m's weights to the first device, with the rotary cos and sin of
  * every position its cache holds (m->ctx rows of head_dim / 2), and allocate
- * the key-value cache and scratch there. m stays as loaded; its weights are
- * read once, here. Returns NULL, with the reason in err, on failure.
+ * the key-value cache, m->seqs sequences of m->ctx positions, and scratch
+ * there. m stays as loaded; its weights are read once, here. Returns NULL,
+ * with the reason in err, on failure.
  */
 struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, char* err, size_t err_len);
 
 /**
- * Run one token at position pos, writing its keys and values into the
- * device's cache at pos. Copies vocab logits back to logits unless it is
- * NULL. The caller has checked token and pos. Returns false, with the reason
- * in err, if the device reports an error.
+ * Run one token at position pos of sequence seq, writing its keys and values
+ * into that sequence's cache at pos. Copies vocab logits back to logits
+ * unless it is NULL. The caller has checked token, seq and pos. Returns
+ * false, with the reason in err, if the device reports an error.
  */
-bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, float* logits, char* err, size_t err_len);
+bool vitna_cuda_step(struct vitna_cuda_model* g, size_t seq, int32_t token, size_t pos, float* logits, char* err, size_t err_len);
 
 /**
  * The fewest tokens worth giving vitna_cuda_steps: fewer run faster a step at
@@ -43,31 +44,40 @@ bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, floa
 size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g);
 
 /**
- * The most tokens vitna_cuda_steps_exact takes at once for this model, 0 for
- * a model that takes none.
+ * The most rows vitna_cuda_rows takes at once for this model, 0 for a model
+ * that takes none.
  */
 size_t vitna_cuda_exact_max(const struct vitna_cuda_model* g);
 
-/**
- * Run count tokens at positions pos to pos + count - 1 as count calls to
- * vitna_cuda_step would, writing every one's logits, count x vocab, in one
- * pass that reads each weight once: the same values as those steps, bit for
- * bit. count is 1 to vitna_cuda_exact_max. The caller has checked the tokens
- * and the room in the cache. Returns false, with the reason in err, if the
- * device reports an error.
- */
-bool vitna_cuda_steps_exact(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, char* err,
-                            size_t err_len);
+/** A row of a pass: a token, its position, and the sequence whose cache it reads and writes. */
+typedef struct {
+    int32_t token;
+    int32_t pos;
+    int32_t seq;
+} vitna_cuda_row_t;
 
 /**
- * Run count tokens at positions pos to pos + count - 1 together, writing
- * their keys and values into the device's cache. If logits is not NULL, it
- * receives vocab logits for each of the last rows positions, rows x vocab.
- * The caller has checked the tokens and the room in the cache. Returns
- * false, with the reason in err, if the device reports an error, or if the
- * model's prompts cannot run together (vitna_cuda_prompt_min).
+ * Run count rows as count calls to vitna_cuda_step would, in one pass that
+ * reads each weight once, and copy row i's logits to logits[i] where that is
+ * not NULL: the same values as those steps, bit for bit. Rows of one
+ * sequence hold consecutive positions, in order; rows of different
+ * sequences share nothing. count is 1 to vitna_cuda_exact_max. The caller
+ * has checked the tokens, sequences and positions. Returns false, with the
+ * reason in err, if the device reports an error.
  */
-bool vitna_cuda_steps(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, size_t rows,
+bool vitna_cuda_rows(struct vitna_cuda_model* g, const vitna_cuda_row_t* rows, size_t count, float* const* logits, char* err,
+                     size_t err_len);
+
+/**
+ * Run count tokens of sequence seq at positions pos to pos + count - 1
+ * together, writing their keys and values into that sequence's cache. If
+ * logits is not NULL, it receives vocab logits for each of the last rows
+ * positions, rows x vocab. The caller has checked the tokens and the room in
+ * the cache. Returns false, with the reason in err, if the device reports an
+ * error, or if the model's prompts cannot run together
+ * (vitna_cuda_prompt_min).
+ */
+bool vitna_cuda_steps(struct vitna_cuda_model* g, size_t seq, const int32_t* tokens, size_t count, size_t pos, float* logits, size_t rows,
                       char* err, size_t err_len);
 
 /** The device, for a person to read: its name and compute capability. */

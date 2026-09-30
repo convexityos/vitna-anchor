@@ -111,6 +111,10 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/speculate-serve.test.mjs
+      - name: Requests at once change no response from the server
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/parallel-serve.test.mjs
 
   cuda:
     # GitHub's hosted runners have no GPU. This job compiles the CUDA path, so

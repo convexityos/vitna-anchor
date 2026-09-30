@@ -1,12 +1,15 @@
 /**
  * server.c - The engine's HTTP server: the network half of api.c.
  *
- * Reads one HTTP/1.1 request at a time (headers, then a body of
- * Content-Length bytes), hands it to the API, and closes the connection after
- * the response. A client that stalls is cut off after 30 seconds without a
- * byte, and one that hangs up mid-stream ends that generation without taking
- * the server down. Each request is logged to stderr as method, path, status
- * and token counts; prompts and completions are never logged.
+ * Each connection gets a thread of its own, up to MAX_CONNECTIONS at once,
+ * which reads one HTTP/1.1 request (headers, then a body of Content-Length
+ * bytes), hands it to the API, and closes the connection after the
+ * response. The API runs requests that generate together on its own thread
+ * and hands each connection its output to send. A client that stalls is cut
+ * off after 30 seconds without a byte, and holds up no other; one that hangs
+ * up mid-stream ends that generation without taking the server down. Each
+ * request is logged to stderr as method, path, status and token counts;
+ * prompts and completions are never logged.
  */
 
 #include "server.h"
@@ -45,6 +48,11 @@
 #define MAX_HEADER_BYTES (64 * 1024)
 #define MAX_BODY_BYTES (8 * 1024 * 1024)
 #define IO_TIMEOUT_MS 30000
+
+/* The most connections served at once; past it, the next waits to be
+ * accepted until one closes. Each holds a thread, and one that is waiting
+ * for its request to run holds only that. */
+#define MAX_CONNECTIONS 64
 
 static bool sock_write(void* ctx, const void* data, size_t len) {
     socket_t s = *(socket_t*)ctx;
@@ -219,6 +227,29 @@ static void handle_client(socket_t client, vitna_api_t* api) {
     CLOSE_SOCKET(client);
 }
 
+/* The connections being served, counted so there are never more than MAX_CONNECTIONS. */
+typedef struct {
+    vitna_mutex_t lock;
+    vitna_cond_t freed;
+    int active;
+} conn_count_t;
+
+typedef struct {
+    socket_t client;
+    vitna_api_t* api;
+    conn_count_t* count;
+} conn_t;
+
+static void connection(void* arg) {
+    conn_t* c = (conn_t*)arg;
+    handle_client(c->client, c->api);
+    vitna_mutex_lock(&c->count->lock);
+    c->count->active--;
+    vitna_cond_signal(&c->count->freed);
+    vitna_mutex_unlock(&c->count->lock);
+    free(c);
+}
+
 int vitna_server_run(const vitna_server_config_t* config) {
 #if defined(VITNA_OS_WINDOWS)
     WSADATA wsa_data;
@@ -290,7 +321,9 @@ int vitna_server_run(const vitna_server_config_t* config) {
     }
 
     printf("vitna-anchor listening on http://%s:%u\n", bind_ip, port);
-    if (api) {
+    if (api && vitna_api_parallel(api) > 1) {
+        printf("Serving %s at /v1/chat/completions and /v1/completions, %zu requests at a time.\n", vitna_api_model_id(api), vitna_api_parallel(api));
+    } else if (api) {
         printf("Serving %s at /v1/chat/completions and /v1/completions, one request at a time.\n", vitna_api_model_id(api));
     } else {
         printf("%s\n", vitna_api_no_model_message());
@@ -301,7 +334,14 @@ int vitna_server_run(const vitna_server_config_t* config) {
     }
     fflush(stdout);
 
+    conn_count_t count;
+    vitna_mutex_init(&count.lock);
+    vitna_cond_init(&count.freed);
+    count.active = 0;
     while (1) {
+        vitna_mutex_lock(&count.lock);
+        while (count.active >= MAX_CONNECTIONS) vitna_cond_wait(&count.freed, &count.lock);
+        vitna_mutex_unlock(&count.lock);
         struct sockaddr_in client_addr;
 #if defined(VITNA_OS_WINDOWS)
         int client_len = sizeof(client_addr);
@@ -313,7 +353,24 @@ int vitna_server_run(const vitna_server_config_t* config) {
         if (IS_INVALID_SOCKET(client_sock)) {
             break;
         }
-        handle_client(client_sock, api);
+        conn_t* c = (conn_t*)malloc(sizeof(conn_t));
+        vitna_thread_t t;
+        vitna_mutex_lock(&count.lock);
+        count.active++;
+        vitna_mutex_unlock(&count.lock);
+        if (c) {
+            c->client = client_sock;
+            c->api = api;
+            c->count = &count;
+        }
+        if (!c || !vitna_thread_start(&t, connection, c, true)) {
+            /* No thread for it: serve it here, as the server once served every connection. */
+            free(c);
+            handle_client(client_sock, api);
+            vitna_mutex_lock(&count.lock);
+            count.active--;
+            vitna_mutex_unlock(&count.lock);
+        }
     }
 
     CLOSE_SOCKET(server_sock);

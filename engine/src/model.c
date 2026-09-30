@@ -128,7 +128,7 @@ static float* norm_weights(vitna_llama_t* m, const char* name, char* err, size_t
     return f;
 }
 
-bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, char* err, size_t err_len) {
+bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs, char* err, size_t err_len) {
     memset(m, 0, sizeof(*m));
     if (!read_config(&m->cfg, dir, err, err_len)) return false;
     const vitna_llama_config_t* c = &m->cfg;
@@ -183,8 +183,10 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, char* err, 
     if (ok) {
         m->ctx = ctx ? ctx : (c->max_positions < 4096 ? c->max_positions : 4096);
         if (m->ctx > c->max_positions) m->ctx = c->max_positions;
-        size_t cache = c->n_layers * m->ctx * kv_dim;
+        m->seqs = seqs ? seqs : 1;
+        size_t cache = m->seqs * c->n_layers * m->ctx * kv_dim;
         size_t half = c->head_dim / 2;
+        m->past = (size_t*)calloc(m->seqs, sizeof(size_t));
         m->k_cache = (float*)malloc(cache * sizeof(float));
         m->v_cache = (float*)malloc(cache * sizeof(float));
         m->inv_freq = (float*)malloc(half * sizeof(float));
@@ -200,7 +202,7 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, char* err, 
         m->scores = (float*)malloc(m->ctx * sizeof(float));
         m->cos_t = (float*)malloc(half * sizeof(float));
         m->sin_t = (float*)malloc(half * sizeof(float));
-        ok = m->k_cache && m->v_cache && m->inv_freq && m->x && m->xn && m->q && m->k && m->v && m->att &&
+        ok = m->past && m->k_cache && m->v_cache && m->inv_freq && m->x && m->xn && m->q && m->k && m->v && m->att &&
              m->proj && m->gate && m->up && m->scores && m->cos_t && m->sin_t;
         if (!ok) {
             fail(err, err_len, "out of memory for the key-value cache and scratch buffers%s%s", NULL, NULL);
@@ -228,6 +230,7 @@ void vitna_llama_free(vitna_llama_t* m) {
     }
     free(m->final_norm);
     free(m->inv_freq);
+    free(m->past);
     free(m->k_cache);
     free(m->v_cache);
     free(m->x); free(m->xn); free(m->q); free(m->k); free(m->v); free(m->att);
@@ -240,11 +243,11 @@ void vitna_llama_free(vitna_llama_t* m) {
 }
 
 void vitna_llama_reset(vitna_llama_t* m) {
-    m->n_past = 0;
+    for (size_t s = 0; s < m->seqs; s++) m->past[s] = 0;
 }
 
-void vitna_llama_truncate(vitna_llama_t* m, size_t n) {
-    if (n < m->n_past) m->n_past = n;
+void vitna_llama_truncate(vitna_llama_t* m, size_t seq, size_t n) {
+    if (seq < m->seqs && n < m->past[seq]) m->past[seq] = n;
 }
 
 void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
@@ -252,10 +255,10 @@ void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
     m->fail_at = pos;
 }
 
-bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
+bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
-    if (token < 0 || (size_t)token >= c->vocab || m->n_past >= m->ctx) return false;
-    if (m->fail_armed && m->n_past == m->fail_at) {
+    if (seq >= m->seqs || token < 0 || (size_t)token >= c->vocab || m->past[seq] >= m->ctx) return false;
+    if (m->fail_armed && m->past[seq] == m->fail_at) {
         m->fail_armed = false;
         fprintf(stderr, "The step at position %zu failed, as a test asked.\n", m->fail_at);
         return false;
@@ -264,16 +267,16 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
 #if defined(VITNA_CUDA)
     if (m->cuda) {
         char err[512];
-        if (!vitna_cuda_step(m->cuda, token, m->n_past, logits, err, sizeof(err))) {
+        if (!vitna_cuda_step(m->cuda, seq, token, m->past[seq], logits, err, sizeof(err))) {
             fprintf(stderr, "CUDA: %s\n", err);
             return false;
         }
-        m->n_past++;
+        m->past[seq]++;
         return true;
     }
 #endif
 
-    const size_t pos = m->n_past;
+    const size_t pos = m->past[seq];
     const size_t H = c->hidden, hd = c->head_dim, half = hd / 2;
     const size_t kv_dim = c->n_kv_heads * hd;
     const size_t group = c->n_heads / c->n_kv_heads;
@@ -292,8 +295,8 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
 
     for (size_t l = 0; l < c->n_layers; l++) {
         const vitna_llama_layer_t* L = &m->layers[l];
-        float* kc = m->k_cache + l * m->ctx * kv_dim;
-        float* vc = m->v_cache + l * m->ctx * kv_dim;
+        float* kc = m->k_cache + (seq * c->n_layers + l) * m->ctx * kv_dim;
+        float* vc = m->v_cache + (seq * c->n_layers + l) * m->ctx * kv_dim;
 
         /* Attention */
         vitna_rmsnorm(m->x, L->attn_norm, m->xn, H, c->rms_eps);
@@ -343,7 +346,7 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
         for (size_t i = 0; i < H; i++) m->x[i] += m->proj[i];
     }
 
-    m->n_past = pos + 1;
+    m->past[seq] = pos + 1;
     if (logits) {
         vitna_rmsnorm(m->x, m->final_norm, m->xn, H, c->rms_eps);
         vitna_matvec(m->lm_head.data, m->lm_head.dtype, m->xn, logits, m->lm_head.rows, m->lm_head.cols);
@@ -351,9 +354,10 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits) {
     return true;
 }
 
-size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits, size_t rows) {
+size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits, size_t rows) {
     const vitna_llama_config_t* c = &m->cfg;
-    const size_t start = m->n_past;
+    if (seq >= m->seqs) return 0;
+    const size_t start = m->past[seq];
     if (rows > count) rows = count;
     /* The tokens that can run: those before the first that is out of range,
      * past the cache or failed by a test. */
@@ -369,22 +373,22 @@ size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, 
 #if defined(VITNA_CUDA)
     if (m->cuda && run >= vitna_cuda_prompt_min(m->cuda)) {
         char err[512];
-        if (!vitna_cuda_steps(m->cuda, tokens, run, start, out, out ? rows : 0, err, sizeof(err))) {
+        if (!vitna_cuda_steps(m->cuda, seq, tokens, run, start, out, out ? rows : 0, err, sizeof(err))) {
             fprintf(stderr, "CUDA: %s\n", err);
             return 0;
         }
-        m->n_past = start + run;
+        m->past[seq] = start + run;
     } else
 #endif
     {
         for (size_t i = 0; i < run; i++) {
             float* row = (out && i >= first) ? out + (i - first) * c->vocab : NULL;
-            if (!vitna_llama_step(m, tokens[i], row)) return i;
+            if (!vitna_llama_step(m, seq, tokens[i], row)) return i;
         }
     }
     /* A token a test failed stops the batch as a step there would, with the
      * same word on stderr: vitna_llama_step gives it, and fails. */
-    if (run < count && m->fail_armed && start + run == m->fail_at) (void)vitna_llama_step(m, tokens[run], NULL);
+    if (run < count && m->fail_armed && start + run == m->fail_at) (void)vitna_llama_step(m, seq, tokens[run], NULL);
     return run;
 }
 
@@ -399,34 +403,126 @@ size_t vitna_llama_exact_max(const vitna_llama_t* m) {
     return 1;
 }
 
-size_t vitna_llama_steps_exact(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits) {
-    const vitna_llama_config_t* c = &m->cfg;
+/* Whether seq is one of the n in list. */
+static bool listed(const size_t* list, size_t n, size_t seq) {
+    for (size_t i = 0; i < n; i++) {
+        if (list[i] == seq) return true;
+    }
+    return false;
+}
+
 #if defined(VITNA_CUDA)
-    /* One pass on the GPU when every token can run there; a token out of
-     * range, past the cache or failed by a test goes a step at a time below,
-     * so it fails as its step would. */
-    if (m->cuda && logits && count >= 2 && count <= vitna_cuda_exact_max(m->cuda)) {
-        const size_t start = m->n_past;
-        size_t run = 0;
-        while (run < count && tokens[run] >= 0 && (size_t)tokens[run] < c->vocab && start + run < m->ctx &&
-               !(m->fail_armed && start + run == m->fail_at)) {
-            run++;
+#define PASS_MAX 64
+
+/* One GPU pass over k rows, which are rows at[0..k-1] of the caller's. A
+ * pass of one row runs as a step. On a device error every row fails, and
+ * their sequences stop. */
+static size_t gpu_pass(vitna_llama_t* m, const vitna_cuda_row_t* pass, const size_t* at, size_t k, float* logits, bool* ran,
+                       size_t* stopped, size_t* n_stopped) {
+    const size_t V = m->cfg.vocab;
+    char err[512];
+    bool ok;
+    if (k == 1) {
+        ok = vitna_cuda_step(m->cuda, (size_t)pass[0].seq, pass[0].token, (size_t)pass[0].pos, logits ? logits + at[0] * V : NULL, err,
+                             sizeof(err));
+    } else {
+        float* out[PASS_MAX];
+        for (size_t j = 0; j < k; j++) out[j] = logits ? logits + at[j] * V : NULL;
+        ok = vitna_cuda_rows(m->cuda, pass, k, out, err, sizeof(err));
+    }
+    if (!ok) fprintf(stderr, "CUDA: %s\n", err);
+    for (size_t j = 0; j < k; j++) {
+        const size_t seq = (size_t)pass[j].seq;
+        if (ok) {
+            ran[at[j]] = true;
+            m->past[seq]++;
+        } else if (!listed(stopped, *n_stopped, seq)) {
+            stopped[(*n_stopped)++] = seq;
         }
-        if (run == count) {
-            char err[512];
-            if (!vitna_cuda_steps_exact(m->cuda, tokens, count, start, logits, err, sizeof(err))) {
-                fprintf(stderr, "CUDA: %s\n", err);
-                return 0;
+    }
+    return ok ? k : 0;
+}
+
+/* The rows in passes of up to vitna_cuda_exact_max, in order. A row that
+ * cannot run (out of range, past its sequence's cache, failed by a test)
+ * fails before its pass, as its step would, and the rows ahead of it run. */
+static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_t n, float* logits, bool* ran, size_t* stopped) {
+    const vitna_llama_config_t* c = &m->cfg;
+    size_t cap = vitna_cuda_exact_max(m->cuda);
+    if (cap > PASS_MAX) cap = PASS_MAX;
+    vitna_cuda_row_t pass[PASS_MAX];
+    size_t at[PASS_MAX];
+    size_t k = 0, done = 0, n_stopped = 0;
+    for (size_t i = 0; i < n; i++) {
+        const size_t seq = rows[i].seq;
+        if (listed(stopped, n_stopped, seq)) continue;
+        /* The sequence's next position, after its rows already in this pass. */
+        size_t pos = seq < m->seqs ? m->past[seq] : 0;
+        for (size_t j = 0; j < k; j++) pos += (size_t)pass[j].seq == seq;
+        const int32_t t = rows[i].token;
+        if (seq >= m->seqs || t < 0 || (size_t)t >= c->vocab || pos >= m->ctx || (m->fail_armed && pos == m->fail_at)) {
+            if (seq < m->seqs && m->fail_armed && pos == m->fail_at && t >= 0 && (size_t)t < c->vocab && pos < m->ctx) {
+                m->fail_armed = false;
+                fprintf(stderr, "The step at position %zu failed, as a test asked.\n", pos);
             }
-            m->n_past = start + count;
-            return count;
+            stopped[n_stopped++] = seq;
+            continue;
         }
+        pass[k].token = t;
+        pass[k].pos = (int32_t)pos;
+        pass[k].seq = (int32_t)seq;
+        at[k++] = i;
+        if (k == cap) {
+            done += gpu_pass(m, pass, at, k, logits, ran, stopped, &n_stopped);
+            k = 0;
+        }
+    }
+    if (k > 0) done += gpu_pass(m, pass, at, k, logits, ran, stopped, &n_stopped);
+    return done;
+}
+#endif
+
+size_t vitna_llama_step_rows(vitna_llama_t* m, const vitna_llama_row_t* rows, size_t n, float* logits, bool* ran) {
+    for (size_t i = 0; i < n; i++) ran[i] = false;
+    /* The sequences stopped by a row that failed. */
+    size_t few[16];
+    size_t* stopped = n <= 16 ? few : (size_t*)malloc(n * sizeof(size_t));
+    if (!stopped) return 0;
+    size_t done = 0;
+#if defined(VITNA_CUDA)
+    if (m->cuda && vitna_cuda_exact_max(m->cuda) >= 2) {
+        done = rows_on_gpu(m, rows, n, logits, ran, stopped);
+        if (stopped != few) free(stopped);
+        return done;
     }
 #endif
-    for (size_t i = 0; i < count; i++) {
-        if (!vitna_llama_step(m, tokens[i], logits ? logits + i * c->vocab : NULL)) return i;
+    size_t n_stopped = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (listed(stopped, n_stopped, rows[i].seq)) continue;
+        ran[i] = vitna_llama_step(m, rows[i].seq, rows[i].token, logits ? logits + i * m->cfg.vocab : NULL);
+        if (ran[i]) done++;
+        else stopped[n_stopped++] = rows[i].seq;
     }
-    return count;
+    if (stopped != few) free(stopped);
+    return done;
+}
+
+size_t vitna_llama_steps_exact(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits) {
+    vitna_llama_row_t few[16];
+    bool few_ran[16];
+    vitna_llama_row_t* rows = count <= 16 ? few : (vitna_llama_row_t*)malloc(count * sizeof(vitna_llama_row_t));
+    bool* ran = count <= 16 ? few_ran : (bool*)malloc(count * sizeof(bool));
+    size_t done = 0;
+    if (rows && ran) {
+        for (size_t i = 0; i < count; i++) {
+            rows[i].seq = seq;
+            rows[i].token = tokens[i];
+        }
+        done = vitna_llama_step_rows(m, rows, count, logits, ran);
+    }
+    if (rows != few) free(rows);
+    if (ran != few_ran) free(ran);
+    return done;
 }
 
 /* --- The GPU --- */

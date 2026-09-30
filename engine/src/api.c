@@ -1,8 +1,12 @@
 /**
  * api.c - The OpenAI-compatible HTTP API over a loaded model.
  *
- * One request at a time: the model has one key-value cache, which each
- * request starts afresh (reusing a prefix across requests is gate A6).
+ * Requests run on one thread of their own, the scheduler, which owns the
+ * model: each a sequence of its key-value cache, as many at once as it holds
+ * (serve --parallel), with their next tokens run together in each round. A
+ * request that finds no sequence free waits its turn. The connection that
+ * asked for a request sends what the scheduler writes for it, so a slow
+ * client holds up only itself.
  */
 
 #include "api.h"
@@ -35,22 +39,45 @@ typedef struct {
 #define NO_MODEL_MESSAGE \
     "This server was started without a model, so it serves none. Start it with: vitna-anchor serve --model <dir>"
 
+/* A sequence of the model's cache, lent to one request at a time. */
+typedef struct {
+    vitna_token_list_t cached;  /* the tokens whose keys and values it holds, in order */
+    uint64_t used;              /* when it was last lent, so the one unused longest goes first */
+    bool busy;
+} seq_t;
+
+typedef struct job job_t;
+
 struct vitna_api {
     vitna_llama_t* model;
     const vitna_tokenizer_t* tok;
     char* model_id;
     long long created;
-    uint64_t counter;
-    vitna_sampler_t sampler;
-    float* row;
     bool prefix_cache;
-    vitna_token_list_t cached;  /* the tokens whose keys and values are in the model's cache, in order */
+    bool mask_cache;                /* whether JSON mode's masks are kept (vitna_api_set_mask_cache) */
+    size_t speculate;               /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
+
+    /* The scheduler's alone, on its thread. */
+    uint64_t counter;
+    vitna_sampler_t sampler;        /* its state is each request's in turn (take) */
+    float* row;                     /* a prompt's last logits */
     mask_entry_t masks[MASK_CACHE]; /* JSON mode's masks by state (mask_json) */
-    bool mask_cache;                /* whether they are kept (vitna_api_set_mask_cache) */
     uint64_t mask_clock;
-    size_t speculate;           /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
-    float* rows;                /* speculate + 1 rows of logits, from a pass over a token and its drafts */
-    int32_t* pass;              /* that token and its drafts */
+    seq_t* seqs;                    /* one per sequence of the model's cache */
+    uint64_t seq_clock;
+    size_t rows_cap;                /* the rows a round can hold (round_capacity) */
+    vitna_llama_row_t* rows;        /* a round's rows, */
+    float* logits;                  /* their logits, rows_cap x vocab, */
+    bool* ran;                      /* and which ran */
+
+    /* Under lock. */
+    vitna_mutex_t lock;
+    vitna_cond_t work;              /* signalled when a request queues, and to stop */
+    job_t* queue;                   /* requests waiting for a sequence, oldest first */
+    job_t* queue_tail;
+    bool stopping;
+    bool started;                   /* the scheduler's thread is running */
+    vitna_thread_t thread;
 };
 
 typedef struct {
@@ -77,6 +104,7 @@ typedef struct {
     const char* code;
     const char* param;
     char message[512];
+    char param_buf[64];     /* for a param made up on the spot, as "messages[2]" */
 } api_error_t;
 
 /* --- Output --- */
@@ -352,7 +380,7 @@ bool vitna_chatml_format(const char* const* roles, const char* const* contents, 
 /* Messages as ChatML: each "<|im_start|>{role}\n{content}<|im_end|>\n", then
  * "<|im_start|>assistant\n" for the reply. A developer message is a system one. */
 static bool chat_prompt(const vitna_json_value_t* messages, vitna_strbuf_t* out, api_error_t* e) {
-    static char param[64];
+    char* param = e->param_buf;
     if (!messages || messages->type != VITNA_JSON_ARRAY || messages->u.array.count == 0) {
         set_error(e, 400, "invalid_request_error", "invalid_value", "messages", "`messages` must be a non-empty array");
         return false;
@@ -360,7 +388,7 @@ static bool chat_prompt(const vitna_json_value_t* messages, vitna_strbuf_t* out,
     for (size_t i = 0; i < messages->u.array.count; i++) {
         const vitna_json_value_t* m = messages->u.array.items[i];
         const char* role = vitna_json_as_string(vitna_json_get(m, "role"));
-        snprintf(param, sizeof(param), "messages[%zu]", i);
+        snprintf(param, sizeof(e->param_buf), "messages[%zu]", i);
         if (m->type != VITNA_JSON_OBJECT || !role) {
             set_error(e, 400, "invalid_request_error", "invalid_value", param, "each message needs a role");
             return false;
@@ -713,9 +741,440 @@ void vitna_drafter_taken(vitna_drafter_t* d, size_t taken) {
     }
 }
 
-static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const params_t* p, const vitna_token_list_t* ids, const char* ignored) {
-    vitna_api_result_t r = { 200, ids->count, 0, 0 };
+/* --- Requests at once (the scheduler) --- */
+
+/* A request that generates, from the connection that asked for it to the
+ * scheduler that runs it. The connection fills the first part and queues
+ * the job; the scheduler writes the response into out as a sink would, and
+ * the connection sends it on (run_job). */
+struct job {
+    vitna_api_t* api;
+    const params_t* p;
+    const vitna_token_list_t* ids;
+    const char* ignored;
+    size_t max_new;
+
+    /* Under api->lock. */
+    vitna_strbuf_t out;     /* written by the scheduler, not yet sent */
+    bool done;              /* the scheduler has finished with the job */
+    bool gone;              /* the client went away, so writing more is pointless */
+    vitna_cond_t cv;        /* signalled when out grows or done is set */
+    job_t* next;            /* in the queue, then in the scheduler's list */
+
+    /* The scheduler's. */
+    vitna_sink_t sink;      /* writes to out (job_write) */
+    size_t seq;             /* the sequence of the model's cache lent to it */
+    bool begun, ended;
+    gen_t g;
+    take_t tk;
+    vitna_sampling_t cfg;
+    uint64_t rng;           /* the sampler's state while this request's tokens are taken */
+    vitna_strbuf_t headers;
+    vitna_api_result_t r;
+    const char* finish;
+    bool ok;                /* every step so far ran */
+    int st;                 /* the last take_token's answer */
+    int32_t t;              /* the token taken last, which runs next */
+    int32_t* text;          /* with speculation: the prompt and the tokens taken, for drafting */
+    size_t text_len;
+    vitna_drafter_t drafter;
+    int32_t* pass;          /* with speculation: t and the tokens drafted after it */
+    size_t d, row0, start;  /* this round: drafts, the job's first row, its sequence's position before */
+    size_t passes, drafted, taken;
+};
+
+/* The job's sink: out, for the connection to send. Once the client has gone
+ * a write fails, so the generation stops as it did when the scheduler wrote
+ * to the socket itself. */
+static bool job_write(void* ctx, const void* data, size_t len) {
+    job_t* j = (job_t*)ctx;
+    vitna_mutex_lock(&j->api->lock);
+    bool ok = !j->gone;
+    if (ok) {
+        vitna_sb_append(&j->out, data, len);
+        ok = j->out.ok;
+        vitna_cond_signal(&j->cv);
+    }
+    vitna_mutex_unlock(&j->api->lock);
+    return ok;
+}
+
+/* take_token with this request's sampler state: requests take their tokens in
+ * turn, and each draws from its own stream, as it would alone. */
+static int take(vitna_api_t* api, job_t* j, float* row, int32_t* chosen) {
+    api->sampler.state = j->rng;
+    const int st = take_token(&j->tk, row, chosen);
+    j->rng = api->sampler.state;
+    return st;
+}
+
+/* Room for a round's rows: one for each request, as many as the passes they
+ * fill hold, or one request and k drafts. */
+static bool round_capacity(vitna_api_t* api, size_t k) {
+    const size_t cap = vitna_llama_exact_max(api->model);
+    const size_t seqs = api->model->seqs;
+    size_t n = (seqs + cap - 1) / cap * cap;
+    if (n < k + 1) n = k + 1;
+    if (n == api->rows_cap && api->rows) return true;
+    vitna_llama_row_t* rows = (vitna_llama_row_t*)malloc(n * sizeof(vitna_llama_row_t));
+    float* logits = (float*)malloc(n * api->model->cfg.vocab * sizeof(float));
+    bool* ran = (bool*)malloc(n * sizeof(bool));
+    if (!rows || !logits || !ran) {
+        free(rows);
+        free(logits);
+        free(ran);
+        return false;
+    }
+    free(api->rows);
+    free(api->logits);
+    free(api->ran);
+    api->rows = rows;
+    api->logits = logits;
+    api->ran = ran;
+    api->rows_cap = n;
+    return true;
+}
+
+/* The sequence to lend a request, or SIZE_MAX with none free: of the free
+ * ones, the one whose cache holds the longest prefix of its prompt, and of
+ * those the one unused longest. Called under api->lock. */
+static size_t pick_seq(vitna_api_t* api, const vitna_token_list_t* ids) {
+    size_t best = SIZE_MAX, best_len = 0;
+    for (size_t s = 0; s < api->model->seqs; s++) {
+        const seq_t* q = &api->seqs[s];
+        if (q->busy) continue;
+        size_t n = 0;
+        if (api->prefix_cache) {
+            const size_t limit = ids->count - 1 < q->cached.count ? ids->count - 1 : q->cached.count;
+            while (n < limit && q->cached.ids[n] == ids->ids[n]) n++;
+        }
+        if (best == SIZE_MAX || n > best_len || (n == best_len && q->used < api->seqs[best].used)) {
+            best = s;
+            best_len = n;
+        }
+    }
+    return best;
+}
+
+/* A request's start, once it has a sequence: its headers, the prompt (what
+ * the sequence already holds of it reused), and its first token. */
+static void job_begin(vitna_api_t* api, job_t* j) {
     vitna_llama_t* m = api->model;
+    const params_t* p = j->p;
+    const vitna_token_list_t* ids = j->ids;
+    seq_t* q = &api->seqs[j->seq];
+    j->begun = true;
+    j->r.status = 200;
+    j->r.prompt_tokens = ids->count;
+
+    gen_t* g = &j->g;
+    g->api = api;
+    g->sink = &j->sink;
+    g->p = p;
+    g->created = (long long)time(NULL);
+    snprintf(g->id, sizeof(g->id), "%s%016llx", p->chat ? "chatcmpl-" : "cmpl-", (unsigned long long)fresh_u64(api));
+    vitna_sb_init(&g->text);
+
+    const uint64_t seed = p->has_seed ? p->seed : fresh_u64(api);
+    j->rng = seed;
+    j->cfg.temperature = p->temperature;
+    j->cfg.top_k = p->top_k;
+    j->cfg.top_p = p->top_p;
+    j->cfg.seed = seed;
+
+    vitna_sb_init(&j->headers);
+    vitna_sb_printf(&j->headers, "x-vitna-seed: %llu\r\n", (unsigned long long)seed);
+    if (j->ignored && *j->ignored) vitna_sb_printf(&j->headers, "x-vitna-ignored: %s\r\n", j->ignored);
+
+    if (p->stream) {
+        vitna_strbuf_t h;
+        vitna_sb_init(&h);
+        vitna_sb_printf(&h, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n%s\r\n", j->headers.data);
+        sink_out(&j->sink, h.data, h.len);
+        vitna_sb_free(&h);
+        if (p->chat) send_chunk(g, NULL, 0, NULL, NULL, true, false);
+    }
+
+    /* Reuse the longest prefix the sequence's cache already holds from the
+     * request it served before. The last prompt token is always fed again,
+     * for the logits that choose the first new token. */
+    size_t reuse = 0;
+    if (api->prefix_cache) {
+        const size_t limit = ids->count - 1 < q->cached.count ? ids->count - 1 : q->cached.count;
+        while (reuse < limit && q->cached.ids[reuse] == ids->ids[reuse]) reuse++;
+    }
+    vitna_llama_truncate(m, j->seq, reuse);
+    q->cached.count = reuse;
+    j->r.cached_tokens = reuse;
+
+    /* Prefill the rest together, then a token at a time. ok stays true
+     * while every step runs. A step that fails, as one on a GPU does when the
+     * device reports an error, ends the request with an error rather than
+     * with the reply so far, and its token never joins the sequence's cached
+     * list; the prompt tokens that ran before it do. */
+    j->finish = "length";
+    const size_t todo = ids->count - reuse;
+    const size_t ran = vitna_llama_steps(m, j->seq, ids->ids + reuse, todo, api->row, 1);
+    for (size_t t = 0; t < ran; t++) vitna_token_list_push(&q->cached, ids->ids[reuse + t]);
+    j->ok = ran == todo;
+    j->tk.api = api;
+    j->tk.g = g;
+    j->tk.p = p;
+    j->tk.cfg = &j->cfg;
+    j->tk.r = &j->r;
+    j->tk.finish = &j->finish;
+    vitna_jsonpfx_init(&j->tk.json);
+
+    /* With speculation, the text so far, for drafting: the prompt, then each
+     * token taken. */
+    const size_t spec = api->speculate;
+    if (spec) {
+        j->text = (int32_t*)malloc((ids->count + j->max_new) * sizeof(int32_t));
+        j->pass = (int32_t*)malloc((spec + 1) * sizeof(int32_t));
+        if (!j->text || !j->pass) {
+            free(j->text);
+            free(j->pass);
+            j->text = NULL;
+            j->pass = NULL;
+        } else {
+            memcpy(j->text, ids->ids, ids->count * sizeof(int32_t));
+            j->text_len = ids->count;
+        }
+    }
+    vitna_drafter_init(&j->drafter, j->text ? spec : 0);
+
+    /* Every token is taken as one step at a time takes it, and a token taken
+     * then needs the logits after it: from a step, or from a pass over it and
+     * the tokens drafted after it, whose rows serve while the tokens taken
+     * agree with the drafts. So a reply is the one without drafts, and the
+     * cache ends holding what it would hold: every token fed that one step at
+     * a time would have fed, and no other. */
+    j->st = j->ok && j->max_new > 0 && !j->sink.failed ? take(api, j, api->row, &j->t) : TAKE_END;
+    if (j->text && j->st != TAKE_END_NONE) j->text[j->text_len++] = j->t;
+    j->ended = !(j->ok && j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
+}
+
+/* After a round's rows ran: the request takes the tokens its rows give, as a
+ * token at a time would. */
+static void job_take(vitna_api_t* api, job_t* j) {
+    vitna_llama_t* m = api->model;
+    seq_t* q = &api->seqs[j->seq];
+    const size_t V = m->cfg.vocab;
+    float* rows = api->logits + j->row0 * V;
+    const bool* ran = api->ran + j->row0;
+    if (j->d == 0) {
+        j->ok = ran[0];
+        if (!j->ok) {
+            j->ended = true;
+            return;
+        }
+        vitna_token_list_push(&q->cached, j->t);
+        if (j->sink.failed) {
+            j->ended = true;
+            return;
+        }
+        j->st = take(api, j, rows, &j->t);
+        if (j->text && j->st != TAKE_END_NONE) j->text[j->text_len++] = j->t;
+    } else {
+        j->passes++;
+        j->drafted += j->d;
+        size_t fed = 0;
+        while (fed <= j->d && ran[fed]) fed++;
+        if (fed < j->d + 1) {
+            /* As a step that fails: the tokens before it stay, it does not. */
+            for (size_t i = 0; i < fed; i++) vitna_token_list_push(&q->cached, j->pass[i]);
+            j->ok = false;
+            j->ended = true;
+            return;
+        }
+        /* Row i holds the logits after j->pass[i], with j->pass[0..i] fed.
+         * keep says how many of the pass's tokens one step at a time would
+         * have fed by the time it stops using the pass. */
+        size_t keep = 0;
+        for (size_t i = 0;; i++) {
+            if (j->sink.failed) {
+                keep = i + 1;
+                break;
+            }
+            int32_t u = 0;
+            j->st = take(api, j, rows + i * V, &u);
+            if (j->st != TAKE_END_NONE && j->text) j->text[j->text_len++] = u;
+            if (j->st == TAKE_GO && j->r.completion_tokens < j->max_new && i < j->d && u == j->pass[i + 1]) continue;
+            keep = i + 1;
+            j->t = u;
+            break;
+        }
+        j->taken += keep - 1;
+        vitna_drafter_taken(&j->drafter, keep - 1);
+        vitna_llama_truncate(m, j->seq, j->start + keep);
+        for (size_t i = 0; i < keep; i++) vitna_token_list_push(&q->cached, j->pass[i]);
+        if (j->sink.failed) {
+            j->ended = true;
+            return;
+        }
+    }
+    j->ended = !(j->ok && j->st == TAKE_GO && j->r.completion_tokens < j->max_new);
+}
+
+/* One round: every running request's next token, and any drafts after it,
+ * as rows of one vitna_llama_step_rows, which runs them in passes and gives
+ * each row the logits a step would. Drafts take only the rows the passes
+ * have room for beyond one a request, so they add no pass; a request running
+ * alone drafts as many as --speculate allows. */
+static void run_round(vitna_api_t* api, job_t* running) {
+    vitna_llama_t* m = api->model;
+    size_t live = 0;
+    for (job_t* j = running; j; j = j->next) live += !j->ended;
+    if (live == 0) return;
+    const size_t cap = vitna_llama_exact_max(m);
+    size_t spare = live == 1 ? api->speculate : (live + cap - 1) / cap * cap - live;
+    size_t n = 0;
+    for (job_t* j = running; j; j = j->next) {
+        if (j->ended) continue;
+        const size_t past = m->past[j->seq];
+        size_t d = 0;
+        if (j->text && spare > 0) {
+            d = vitna_drafter_draft(&j->drafter, j->text, j->text_len, j->pass + 1);
+            if (d > spare) d = spare;
+            if (d) {
+                const size_t left = j->max_new - j->r.completion_tokens; /* tokens still to take, 1 or more */
+                if (d > left - 1) d = left - 1;
+                if (past + d + 1 > m->ctx) d = past + 1 < m->ctx ? m->ctx - past - 1 : 0;
+                /* A step a test makes fail (vitna_llama_fail_step_once) fails
+                 * only where one step at a time would have run it: a pass stops
+                 * short of it, and the step itself runs alone. */
+                if (m->fail_armed && m->fail_at >= past && m->fail_at <= past + d) d = m->fail_at > past ? m->fail_at - past - 1 : 0;
+            }
+            spare -= d;
+        }
+        j->d = d;
+        j->row0 = n;
+        j->start = past;
+        if (j->pass) j->pass[0] = j->t;
+        api->rows[n].seq = j->seq;
+        api->rows[n++].token = j->t;
+        for (size_t i = 1; i <= d; i++) {
+            api->rows[n].seq = j->seq;
+            api->rows[n++].token = j->pass[i];
+        }
+    }
+    vitna_llama_step_rows(m, api->rows, n, api->logits, api->ran);
+    for (job_t* j = running; j; j = j->next) {
+        if (!j->ended) job_take(api, j);
+    }
+}
+
+/* A request's end: the rest of its response. */
+static void job_end(vitna_api_t* api, job_t* j) {
+    const params_t* p = j->p;
+    gen_t* g = &j->g;
+    api_error_t e;
+    /* One line a request on stderr while drafting is on, as generate --timing
+     * prints it: what drafting did, which never changes the response. */
+    if (j->text) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", j->passes, j->drafted, j->taken);
+    free(j->text);
+    free(j->pass);
+    j->text = NULL;
+    j->pass = NULL;
+
+    if (!j->ok) {
+        set_error(&e, 500, "server_error", NULL, NULL, "The model failed to run a step, so the reply could not be completed.");
+        if (p->stream) send_error_event(g, &e);
+        else j->r.status = respond_error(&j->sink, &e);
+    } else if (!g->text.ok) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        if (!p->stream) j->r.status = respond_error(&j->sink, &e);
+    } else if (p->stream) {
+        stream_ready(g, true);
+        send_chunk(g, NULL, 0, j->finish, &j->r, false, false);
+        if (p->include_usage) send_chunk(g, NULL, 0, NULL, &j->r, false, true);
+        sink_out(&j->sink, "data: [DONE]\n\n", 14);
+    } else {
+        vitna_strbuf_t b;
+        vitna_sb_init(&b);
+        vitna_sb_puts(&b, "{\"id\":");
+        vitna_sb_json_string(&b, (const unsigned char*)g->id, strlen(g->id));
+        vitna_sb_printf(&b, ",\"object\":\"%s\",\"created\":%lld,\"model\":", p->chat ? "chat.completion" : "text_completion", g->created);
+        vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
+        vitna_sb_puts(&b, ",\"choices\":[{\"index\":0,");
+        if (p->chat) {
+            vitna_sb_puts(&b, "\"message\":{\"role\":\"assistant\",\"content\":");
+            vitna_sb_json_string(&b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
+            vitna_sb_puts(&b, "}");
+        } else {
+            vitna_sb_puts(&b, "\"text\":");
+            vitna_sb_json_string(&b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
+        }
+        vitna_sb_printf(&b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", j->finish);
+        usage_json(&b, &j->r);
+        vitna_sb_puts(&b, "}");
+        respond(&j->sink, 200, j->headers.data, b.data, b.len);
+        vitna_sb_free(&b);
+    }
+    vitna_sb_free(&j->headers);
+    vitna_sb_free(&g->text);
+}
+
+/* The scheduler's thread: it lends free sequences to waiting requests, oldest
+ * first, begins each (its prompt), runs rounds over every request that has
+ * one, and hands each back to its connection when it ends. */
+static void scheduler(void* arg) {
+    vitna_api_t* api = (vitna_api_t*)arg;
+    job_t* running = NULL; /* the requests with a sequence, in the order they got one */
+    for (;;) {
+        vitna_mutex_lock(&api->lock);
+        while (!api->stopping && !running && !api->queue) vitna_cond_wait(&api->work, &api->lock);
+        if (api->stopping) {
+            vitna_mutex_unlock(&api->lock);
+            return;
+        }
+        job_t** tail = &running;
+        while (*tail) tail = &(*tail)->next;
+        while (api->queue) {
+            const size_t s = pick_seq(api, api->queue->ids);
+            if (s == SIZE_MAX) break;
+            job_t* j = api->queue;
+            api->queue = j->next;
+            if (!api->queue) api->queue_tail = NULL;
+            j->next = NULL;
+            j->seq = s;
+            api->seqs[s].busy = true;
+            api->seqs[s].used = ++api->seq_clock;
+            *tail = j;
+            tail = &j->next;
+        }
+        vitna_mutex_unlock(&api->lock);
+
+        for (job_t* j = running; j; j = j->next) {
+            if (!j->begun) job_begin(api, j);
+        }
+        run_round(api, running);
+
+        /* Hand back the requests that ended; a connection frees its job once
+         * done is set, so each leaves the list first. */
+        job_t** at = &running;
+        while (*at) {
+            job_t* j = *at;
+            if (!j->ended) {
+                at = &j->next;
+                continue;
+            }
+            job_end(api, j);
+            *at = j->next;
+            vitna_mutex_lock(&api->lock);
+            api->seqs[j->seq].busy = false;
+            j->done = true;
+            vitna_cond_signal(&j->cv);
+            vitna_mutex_unlock(&api->lock);
+        }
+    }
+}
+
+/* A request that generates: checked here, on the connection's thread, then
+ * queued for the scheduler, whose output this thread sends on as it comes. */
+static vitna_api_result_t run_job(vitna_api_t* api, vitna_sink_t* sink, const params_t* p, const vitna_token_list_t* ids, const char* ignored) {
+    vitna_api_result_t r = { 200, ids->count, 0, 0 };
+    const vitna_llama_t* m = api->model;
     api_error_t e;
     if (ids->count == 0) {
         set_error(&e, 400, "invalid_request_error", "invalid_value", p->chat ? "messages" : "prompt", "the prompt has no tokens");
@@ -732,175 +1191,56 @@ static vitna_api_result_t generate(vitna_api_t* api, vitna_sink_t* sink, const p
         return r;
     }
 
-    gen_t g;
-    memset(&g, 0, sizeof(g));
-    g.api = api;
-    g.sink = sink;
-    g.p = p;
-    g.created = (long long)time(NULL);
-    snprintf(g.id, sizeof(g.id), "%s%016llx", p->chat ? "chatcmpl-" : "cmpl-", (unsigned long long)fresh_u64(api));
-    vitna_sb_init(&g.text);
-
-    uint64_t seed = p->has_seed ? p->seed : fresh_u64(api);
-    api->sampler.state = seed;
-    vitna_sampling_t cfg = { p->temperature, p->top_k, p->top_p, seed };
-
-    vitna_strbuf_t headers;
-    vitna_sb_init(&headers);
-    vitna_sb_printf(&headers, "x-vitna-seed: %llu\r\n", (unsigned long long)seed);
-    if (ignored && *ignored) vitna_sb_printf(&headers, "x-vitna-ignored: %s\r\n", ignored);
-
-    if (p->stream) {
-        vitna_strbuf_t h;
-        vitna_sb_init(&h);
-        vitna_sb_printf(&h, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n%s\r\n", headers.data);
-        sink_out(sink, h.data, h.len);
-        vitna_sb_free(&h);
-        if (p->chat) send_chunk(&g, NULL, 0, NULL, NULL, true, false);
-    }
-
-    /* Reuse the longest prefix the model's cache already holds from the
-     * previous request. The last prompt token is always fed again, for the
-     * logits that choose the first new token. */
-    size_t reuse = 0;
-    if (api->prefix_cache) {
-        size_t limit = ids->count - 1 < api->cached.count ? ids->count - 1 : api->cached.count;
-        while (reuse < limit && api->cached.ids[reuse] == ids->ids[reuse]) reuse++;
-    }
-    vitna_llama_truncate(m, reuse);
-    api->cached.count = reuse;
-    r.cached_tokens = reuse;
-
-    /* Prefill the rest together, then one token at a time. ok stays true
-     * while every step runs. A step that fails, as one on a GPU does when the
-     * device reports an error, ends the request with an error rather than
-     * with the reply so far, and its token never joins api->cached; the
-     * prompt tokens that ran before it do. */
-    const char* finish = "length";
-    const size_t todo = ids->count - reuse;
-    const size_t ran = vitna_llama_steps(m, ids->ids + reuse, todo, api->row, 1);
-    for (size_t t = 0; t < ran; t++) vitna_token_list_push(&api->cached, ids->ids[reuse + t]);
-    bool ok = ran == todo;
-    take_t tk = { api, &g, p, &cfg, &r, &finish, { 0 } };
-    vitna_jsonpfx_init(&tk.json);
-
-    /* With speculation, the text so far, for drafting: the prompt, then each
-     * token taken. */
-    const size_t spec = api->speculate;
-    int32_t* text = spec ? (int32_t*)malloc((ids->count + max_new) * sizeof(int32_t)) : NULL;
-    size_t text_len = 0;
-    if (text) {
-        memcpy(text, ids->ids, ids->count * sizeof(int32_t));
-        text_len = ids->count;
-    }
-    vitna_drafter_t drafter;
-    size_t passes = 0, drafted = 0, taken = 0; /* for the log line below */
-    vitna_drafter_init(&drafter, text ? spec : 0);
-
-    /* Every token is taken as one step at a time takes it, and a token taken
-     * then needs the logits after it: from a step, or from a pass over it and
-     * the tokens drafted after it, whose rows serve while the tokens taken
-     * agree with the drafts. So a reply is the one without drafts, and the
-     * cache ends holding what it would hold: every token fed that one step at
-     * a time would have fed, and no other. */
-    int32_t t = 0;
-    int st = ok && max_new > 0 && !sink->failed ? take_token(&tk, api->row, &t) : TAKE_END;
-    if (text && st != TAKE_END_NONE) text[text_len++] = t;
-    while (ok && st == TAKE_GO && r.completion_tokens < max_new) {
-        size_t d = text ? vitna_drafter_draft(&drafter, text, text_len, api->pass + 1) : 0;
-        if (d) {
-            const size_t left = max_new - r.completion_tokens; /* tokens still to take, 1 or more */
-            if (d > left - 1) d = left - 1;
-            if (m->n_past + d + 1 > m->ctx) d = m->n_past + 1 < m->ctx ? m->ctx - m->n_past - 1 : 0;
-            /* A step a test makes fail (vitna_llama_fail_step_once) fails
-             * only where one step at a time would have run it: a pass stops
-             * short of it, and the step itself runs alone. */
-            if (m->fail_armed && m->fail_at >= m->n_past && m->fail_at <= m->n_past + d) d = m->fail_at > m->n_past ? m->fail_at - m->n_past - 1 : 0;
-        }
-        if (d == 0) {
-            ok = vitna_llama_step(m, t, api->row);
-            if (!ok) break;
-            vitna_token_list_push(&api->cached, t);
-            if (sink->failed) break;
-            st = take_token(&tk, api->row, &t);
-            if (text && st != TAKE_END_NONE) text[text_len++] = t;
-            continue;
-        }
-        api->pass[0] = t;
-        const size_t start = m->n_past;
-        passes++;
-        drafted += d;
-        const size_t fed = vitna_llama_steps_exact(m, api->pass, d + 1, api->rows);
-        if (fed < d + 1) {
-            /* As a step that fails: the tokens before it stay, it does not. */
-            for (size_t i = 0; i < fed; i++) vitna_token_list_push(&api->cached, api->pass[i]);
-            ok = false;
-            break;
-        }
-        /* Row i holds the logits after api->pass[i], with api->pass[0..i]
-         * fed. keep says how many of the pass's tokens one step at a time
-         * would have fed by the time it stops using the pass. */
-        size_t keep = 0;
-        for (size_t i = 0;; i++) {
-            if (sink->failed) {
-                keep = i + 1;
-                break;
-            }
-            int32_t u = 0;
-            st = take_token(&tk, api->rows + i * api->model->cfg.vocab, &u);
-            if (st != TAKE_END_NONE && text) text[text_len++] = u;
-            if (st == TAKE_GO && r.completion_tokens < max_new && i < d && u == api->pass[i + 1]) continue;
-            keep = i + 1;
-            t = u;
-            break;
-        }
-        taken += keep - 1;
-        vitna_drafter_taken(&drafter, keep - 1);
-        vitna_llama_truncate(m, start + keep);
-        for (size_t i = 0; i < keep; i++) vitna_token_list_push(&api->cached, api->pass[i]);
-        if (sink->failed) break;
-    }
-    /* One line a request on stderr while drafting is on, as generate --timing
-     * prints it: what drafting did, which never changes the response. */
-    if (text) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", passes, drafted, taken);
-    free(text);
-
-    if (!ok) {
-        set_error(&e, 500, "server_error", NULL, NULL, "The model failed to run a step, so the reply could not be completed.");
-        if (p->stream) send_error_event(&g, &e);
-        else r.status = respond_error(sink, &e);
-    } else if (!g.text.ok) {
+    job_t* j = (job_t*)calloc(1, sizeof(job_t));
+    if (!j) {
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
-        if (!p->stream) r.status = respond_error(sink, &e);
-    } else if (p->stream) {
-        stream_ready(&g, true);
-        send_chunk(&g, NULL, 0, finish, &r, false, false);
-        if (p->include_usage) send_chunk(&g, NULL, 0, NULL, &r, false, true);
-        sink_out(sink, "data: [DONE]\n\n", 14);
-    } else {
-        vitna_strbuf_t b;
-        vitna_sb_init(&b);
-        vitna_sb_puts(&b, "{\"id\":");
-        vitna_sb_json_string(&b, (const unsigned char*)g.id, strlen(g.id));
-        vitna_sb_printf(&b, ",\"object\":\"%s\",\"created\":%lld,\"model\":", p->chat ? "chat.completion" : "text_completion", g.created);
-        vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-        vitna_sb_puts(&b, ",\"choices\":[{\"index\":0,");
-        if (p->chat) {
-            vitna_sb_puts(&b, "\"message\":{\"role\":\"assistant\",\"content\":");
-            vitna_sb_json_string(&b, (const unsigned char*)(g.text.data ? g.text.data : ""), g.text.len);
-            vitna_sb_puts(&b, "}");
-        } else {
-            vitna_sb_puts(&b, "\"text\":");
-            vitna_sb_json_string(&b, (const unsigned char*)(g.text.data ? g.text.data : ""), g.text.len);
-        }
-        vitna_sb_printf(&b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", finish);
-        usage_json(&b, &r);
-        vitna_sb_puts(&b, "}");
-        respond(sink, 200, headers.data, b.data, b.len);
-        vitna_sb_free(&b);
+        r.status = respond_error(sink, &e);
+        return r;
     }
-    vitna_sb_free(&headers);
-    vitna_sb_free(&g.text);
+    j->api = api;
+    j->p = p;
+    j->ids = ids;
+    j->ignored = ignored;
+    j->max_new = max_new;
+    vitna_sb_init(&j->out);
+    vitna_cond_init(&j->cv);
+    j->sink.write = job_write;
+    j->sink.ctx = j;
+
+    vitna_mutex_lock(&api->lock);
+    if (!api->started) api->started = vitna_thread_start(&api->thread, scheduler, api, false);
+    if (!api->started) {
+        vitna_mutex_unlock(&api->lock);
+        vitna_cond_destroy(&j->cv);
+        free(j);
+        set_error(&e, 500, "server_error", NULL, NULL, "the server could not start the thread that runs requests");
+        r.status = respond_error(sink, &e);
+        return r;
+    }
+    if (api->queue_tail) api->queue_tail->next = j;
+    else api->queue = j;
+    api->queue_tail = j;
+    vitna_cond_signal(&api->work);
+    /* Send what the scheduler writes until it is done. Bytes are taken out
+     * of the job under the lock and sent without it, so the scheduler never
+     * waits on this client. */
+    for (;;) {
+        while (j->out.len == 0 && j->out.ok && !j->done) vitna_cond_wait(&j->cv, &api->lock);
+        if (j->out.len == 0 && j->out.ok) break; /* done, and everything sent */
+        vitna_strbuf_t chunk = j->out;
+        vitna_sb_init(&j->out);
+        vitna_mutex_unlock(&api->lock);
+        if (chunk.ok) sink_out(sink, chunk.data, chunk.len);
+        else sink->failed = true;
+        vitna_sb_free(&chunk);
+        vitna_mutex_lock(&api->lock);
+        if (sink->failed) j->gone = true;
+    }
+    vitna_mutex_unlock(&api->lock);
+    r = j->r;
+    vitna_sb_free(&j->out);
+    vitna_cond_destroy(&j->cv);
+    free(j);
     return r;
 }
 
@@ -920,19 +1260,26 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
     api->model = model;
     api->tok = tok;
     api->created = (long long)time(NULL);
+    vitna_mutex_init(&api->lock);
+    vitna_cond_init(&api->work);
     size_t n = strlen(model_id) + 1;
     api->model_id = (char*)malloc(n);
     api->row = (float*)malloc(model->cfg.vocab * sizeof(float));
-    if (!api->model_id || !api->row || !vitna_sampler_init(&api->sampler, model->cfg.vocab, 0)) {
+    api->seqs = (seq_t*)calloc(model->seqs, sizeof(seq_t));
+    if (!api->model_id || !api->row || !api->seqs || !vitna_sampler_init(&api->sampler, model->cfg.vocab, 0) || !round_capacity(api, 0)) {
         vitna_api_free(api);
         return NULL;
     }
     memcpy(api->model_id, model_id, n);
     api->prefix_cache = true;
     api->mask_cache = true;
-    /* The cache starts empty, and api->cached says so. */
+    /* The cache starts empty, and each sequence's cached list says so. */
     vitna_llama_reset(model);
     return api;
+}
+
+size_t vitna_api_parallel(const vitna_api_t* api) {
+    return api ? api->model->seqs : 0;
 }
 
 void vitna_api_set_mask_cache(vitna_api_t* api, bool on) {
@@ -946,34 +1293,35 @@ void vitna_api_set_prefix_cache(vitna_api_t* api, bool on) {
 bool vitna_api_set_speculate(vitna_api_t* api, size_t k) {
     const size_t pass_max = vitna_llama_exact_max(api->model);
     if (k && pass_max > 1 && k > pass_max - 1) k = pass_max - 1;
-    free(api->rows);
-    free(api->pass);
-    api->rows = NULL;
-    api->pass = NULL;
-    api->speculate = 0;
-    if (!k) return true;
-    api->rows = (float*)malloc((k + 1) * api->model->cfg.vocab * sizeof(float));
-    api->pass = (int32_t*)malloc((k + 1) * sizeof(int32_t));
-    if (!api->rows || !api->pass) {
-        free(api->rows);
-        free(api->pass);
-        api->rows = NULL;
-        api->pass = NULL;
-        return false;
-    }
-    api->speculate = k;
-    return true;
+    vitna_mutex_lock(&api->lock);
+    const bool ok = round_capacity(api, k);
+    api->speculate = ok ? k : 0;
+    if (!ok) round_capacity(api, 0);
+    vitna_mutex_unlock(&api->lock);
+    return ok;
 }
 
 void vitna_api_free(vitna_api_t* api) {
     if (!api) return;
+    vitna_mutex_lock(&api->lock);
+    api->stopping = true;
+    vitna_cond_broadcast(&api->work);
+    const bool started = api->started;
+    vitna_mutex_unlock(&api->lock);
+    if (started) vitna_thread_join(api->thread);
     vitna_sampler_free(&api->sampler);
-    vitna_token_list_free(&api->cached);
+    if (api->seqs) {
+        for (size_t s = 0; s < api->model->seqs; s++) vitna_token_list_free(&api->seqs[s].cached);
+    }
     for (size_t i = 0; i < MASK_CACHE; i++) free(api->masks[i].allowed);
+    free(api->seqs);
     free(api->rows);
-    free(api->pass);
+    free(api->logits);
+    free(api->ran);
     free(api->row);
     free(api->model_id);
+    vitna_cond_destroy(&api->work);
+    vitna_mutex_destroy(&api->lock);
     free(api);
 }
 
@@ -1019,7 +1367,7 @@ static vitna_api_result_t completion_route(vitna_api_t* api, bool chat, const ch
         r.status = respond_error(sink, &e);
         goto done;
     }
-    r = generate(api, sink, &p, &ids, ignored.data);
+    r = run_job(api, sink, &p, &ids, ignored.data);
 
 done:
     vitna_token_list_free(&ids);
@@ -1049,7 +1397,7 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
         if (api) {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
             vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu}", api->model->ctx);
+            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu}", api->model->ctx, api->model->seqs);
         } else {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":null,\"generation\":false,\"message\":\"" NO_MODEL_MESSAGE "\"}");
         }
