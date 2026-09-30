@@ -30,7 +30,7 @@ static void print_usage(const char* prog) {
     printf("Usage:\n");
     printf("  %s run      --model <dir> --prompt <text> [--max-new <n>] [sampling]\n", prog);
     printf("  %s generate --model <dir> (--prompt <text> | --ids <a,b,...>) [--max-new <n>] [sampling]\n", prog);
-    printf("               [--logits-out <file>] [--stop-at-special] [--timing]\n");
+    printf("               [--logits-out <file>] [--stop-at-special] [--timing] [--speculate <k>]\n");
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
@@ -43,7 +43,10 @@ static void print_usage(const char* prog) {
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
-    printf("          long the prompt and the new tokens took, measured on this machine\n");
+    printf("          long the prompt and the new tokens took, measured on this machine. --speculate k drafts up\n");
+    printf("          to k tokens where the text's last two or three tokens occur earlier in it, and checks them\n");
+    printf("          together: the same tokens and logits as without it. On a GPU they run in one pass (k at\n");
+    printf("          most 7); on the CPU a step at a time, which is no faster\n");
     printf("logits    writes the logits at every position of the prompt, positions x vocab, float32 LE\n");
     printf("tokenize  prints the ids of --text as a JSON array; without --text it reads one JSON string\n");
     printf("          per line from stdin and prints one array per line\n");
@@ -71,6 +74,7 @@ typedef struct {
     bool stop_at_special;
     bool no_prefix_cache;
     bool timing;
+    size_t speculate;
     vitna_sampling_t sampling;
 } args_t;
 
@@ -94,6 +98,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--host")) a->host = v;
         else if (TAKE("--device")) a->device = v;
         else if (TAKE("--max-new")) a->max_new = (size_t)strtoull(v, NULL, 10);
+        else if (TAKE("--speculate")) a->speculate = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--ctx")) a->ctx = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
@@ -301,16 +306,76 @@ static int cmd_logits(const args_t* a) {
 
 /* Prefill the prompt, then choose max_new tokens one at a time. Calls
  * on_token after each, and writes each step's logits to logits_out. */
+/* Drafts for speculative decoding, by prompt lookup: the latest earlier place
+ * in ctx where its last n tokens occur (n = 3, then 2), and up to k of the
+ * tokens that followed them there, into out. Returns how many. A match of one
+ * token drafts nothing: measured, its drafts were taken too seldom to pay for
+ * the pass that checks them. */
+static size_t draft_by_lookup(const int32_t* ctx, size_t len, size_t k, int32_t* out) {
+    for (size_t n = 3; n >= 2; n--) {
+        if (len <= n) continue;
+        const int32_t* key = ctx + len - n;
+        for (size_t i = len - n; i-- > 0;) {
+            if (memcmp(ctx + i, key, n * sizeof(int32_t)) != 0) continue;
+            size_t d = 0;
+            while (d < k && i + n + d < len) {
+                out[d] = ctx[i + n + d];
+                d++;
+            }
+            if (d > 0) return d;
+        }
+    }
+    return 0;
+}
+
+/* One new token from a row of logits, as generate takes every one: the row
+ * to --logits-out, the choice, the list, the callback. Returns 1 to go on, 0
+ * to stop (a special token under --stop-at-special), -1 on an error. */
+static int take_token(const args_t* a, const vitna_tokenizer_t* tok, vitna_sampler_t* sampler, const float* row, size_t V, FILE* logits_out,
+                      vitna_token_list_t* out, void (*on_token)(const vitna_tokenizer_t*, int32_t), int32_t* chosen) {
+    if (logits_out && fwrite(row, sizeof(float), V, logits_out) != V) {
+        fprintf(stderr, "cannot write the logits\n");
+        return -1;
+    }
+    const int32_t next = vitna_sample(sampler, row, &a->sampling);
+    if (!vitna_token_list_push(out, next)) return -1;
+    if (on_token) on_token(tok, next);
+    *chosen = next;
+    return a->stop_at_special && tok && vitna_tokenizer_is_special(tok, next) ? 0 : 1;
+}
+
 static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* tok, const vitna_token_list_t* prompt,
                     vitna_token_list_t* out, FILE* logits_out, void (*on_token)(const vitna_tokenizer_t*, int32_t)) {
     const size_t V = m->cfg.vocab;
+    /* With --speculate k, each token taken is followed by up to k drafted
+     * ones, checked in one call of vitna_llama_steps_exact: as many as a pass
+     * takes on a GPU; on the CPU as asked, a step at a time. */
+    size_t k = a->speculate;
+    const size_t pass_max = vitna_llama_exact_max(m);
+    if (k && pass_max > 1 && k > pass_max - 1) k = pass_max - 1;
     float* row = (float*)malloc(V * sizeof(float));
+    float* rows = k ? (float*)malloc((k + 1) * V * sizeof(float)) : NULL;
+    int32_t* pass = k ? (int32_t*)malloc((k + 1) * sizeof(int32_t)) : NULL;
+    int32_t* text = k ? (int32_t*)malloc((prompt->count + a->max_new + 1) * sizeof(int32_t)) : NULL;
     vitna_sampler_t sampler;
-    if (!row || !vitna_sampler_init(&sampler, V, a->sampling.seed)) {
+    if (!row || (k && (!rows || !pass || !text)) || !vitna_sampler_init(&sampler, V, a->sampling.seed)) {
         free(row);
+        free(rows);
+        free(pass);
+        free(text);
         fprintf(stderr, "out of memory\n");
         return 1;
     }
+    size_t text_len = 0;
+    if (k) {
+        memcpy(text, prompt->ids, prompt->count * sizeof(int32_t));
+        text_len = prompt->count;
+    }
+    size_t passes = 0, drafted = 0, accepted = 0; /* for --timing */
+    /* After a pass that took none of its drafts, the next skip tokens are
+     * not drafted for, the pause doubling each time that happens again, up to
+     * 16, and starting over from 1 once a pass takes one. */
+    size_t skip = 0, backoff = 1;
     int rc = 0;
     const double t_prompt = vitna_time_ms();
     const size_t ran = vitna_llama_steps(m, prompt->ids, prompt->count, row, 1);
@@ -320,20 +385,72 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
     }
     const double t_first = vitna_time_ms();
     double t_after_first = t_first;
-    for (size_t s = 0; s < a->max_new && rc == 0; s++) {
-        if (logits_out && fwrite(row, sizeof(float), V, logits_out) != V) {
-            fprintf(stderr, "cannot write the logits\n");
+
+    /* The first new token, from the prompt's logits. */
+    int32_t t = 0;
+    int go = rc == 0 && a->max_new > 0 ? take_token(a, tok, &sampler, row, V, logits_out, out, on_token, &t) : 0;
+    t_after_first = vitna_time_ms();
+    if (go < 0) rc = 1;
+    if (k && go >= 0) text[text_len++] = t;
+
+    /* Then each token t taken needs the logits after it: from a step, or from
+     * a pass over t and the tokens drafted after it, whose rows serve while
+     * the choices agree with the drafts. Every row is the one a step would
+     * give, and every choice is taken from it in turn, so the reply is the
+     * same with or without drafts. */
+    while (go > 0 && out->count < a->max_new) {
+        size_t d = 0;
+        if (k && skip) {
+            skip--;
+        } else if (k) {
+            d = draft_by_lookup(text, text_len, k, pass + 1);
+            const size_t left = a->max_new - out->count; /* choices still to take, 1 or more */
+            if (d > left - 1) d = left - 1;
+            if (m->n_past + d + 1 > m->ctx) d = m->n_past + 1 < m->ctx ? m->ctx - m->n_past - 1 : 0;
+        }
+        if (d == 0) {
+            if (!vitna_llama_step(m, t, row)) {
+                fprintf(stderr, "the key-value cache is full at %zu positions; raise --ctx\n", m->ctx);
+                rc = 1;
+                break;
+            }
+            go = take_token(a, tok, &sampler, row, V, logits_out, out, on_token, &t);
+            if (go < 0) rc = 1;
+            if (k && go >= 0) text[text_len++] = t;
+            continue;
+        }
+        pass[0] = t;
+        passes++;
+        drafted += d;
+        const size_t start = m->n_past;
+        if (vitna_llama_steps_exact(m, pass, d + 1, rows) < d + 1) {
+            fprintf(stderr, "the forward pass failed at position %zu\n", m->n_past);
             rc = 1;
             break;
         }
-        int32_t next = vitna_sample(&sampler, row, &a->sampling);
-        if (s == 0) t_after_first = vitna_time_ms();
-        if (!vitna_token_list_push(out, next)) { rc = 1; break; }
-        if (on_token) on_token(tok, next);
-        if (a->stop_at_special && tok && vitna_tokenizer_is_special(tok, next)) break;
-        if (s + 1 < a->max_new && !vitna_llama_step(m, next, row)) {
-            fprintf(stderr, "the key-value cache is full at %zu positions; raise --ctx\n", m->ctx);
-            rc = 1;
+        for (size_t i = 0; i <= d; i++) {
+            int32_t u = 0;
+            go = take_token(a, tok, &sampler, rows + i * V, V, logits_out, out, on_token, &u);
+            if (go < 0) {
+                rc = 1;
+                break;
+            }
+            text[text_len++] = u;
+            /* The next row is ready while u is the next draft. Otherwise the
+             * pass's positions after pass[i] held drafts not taken: forget them. */
+            if (go > 0 && out->count < a->max_new && i < d && u == pass[i + 1]) {
+                accepted++;
+                continue;
+            }
+            if (i == 0) {
+                skip = backoff;
+                backoff = backoff < 16 ? 2 * backoff : 16;
+            } else {
+                backoff = 1;
+            }
+            vitna_llama_truncate(m, start + i + 1);
+            t = u;
+            break;
         }
     }
     /* Each token after the first new one cost one forward step and one choice. */
@@ -341,9 +458,13 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         const double ms = vitna_time_ms() - t_after_first;
         fprintf(stderr, "timing: %zu prompt tokens in %.3f ms; %zu tokens after the first new one in %.3f ms, %.4f ms each\n",
                 prompt->count, t_first - t_prompt, out->count - 1, ms, ms / (double)(out->count - 1));
+        if (k) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", passes, drafted, accepted);
     }
     vitna_sampler_free(&sampler);
     free(row);
+    free(rows);
+    free(pass);
+    free(text);
     return rc;
 }
 

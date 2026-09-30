@@ -103,6 +103,10 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/step-failure.test.mjs
+      - name: Drafted tokens, checked together, change no reply
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/speculate.test.mjs
 
   cuda:
     # GitHub's hosted runners have no GPU. This job compiles the CUDA path, so

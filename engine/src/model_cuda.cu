@@ -53,6 +53,12 @@
  * a step is. This is the same computation again, its sums in other orders.
  * The next token's logits come from the head a step uses; when every
  * position's are asked for, a matrix-matrix product computes them.
+ *
+ * Several steps at once (vitna_cuda_steps_exact) are the step's kernels for
+ * up to MULTI_MAX tokens: each weight is read once for all of them, and each
+ * token's arithmetic is its step's, in its step's order, so every logit is
+ * the one those steps would give, bit for bit. It is how drafted tokens are
+ * checked together without changing a reply (generate --speculate).
  */
 
 #define NOMINMAX
@@ -88,6 +94,10 @@
 
 /* The fewest tokens that run together; fewer are faster a step at a time. */
 #define PROMPT_MIN 2
+
+/* The most tokens a pass of vitna_cuda_steps_exact takes: several steps at
+ * once, each token computed exactly as its step would be. */
+#define MULTI_MAX 8
 
 /* The matrix-matrix product takes a tile of GEMM_BM tokens by GEMM_BN
  * outputs at a time, over the inner dimension GEMM_BK at a time. */
@@ -155,6 +165,10 @@ struct vitna_cuda_model {
     cudaStream_t stream;
     cudaGraphExec_t body;   /* the embedding and every layer */
     cudaGraphExec_t head;   /* the final RMSNorm and the output projection */
+    cudaGraphExec_t multi[MULTI_MAX + 1]; /* vitna_cuda_steps_exact for that many tokens, captured on first use */
+    int multi_max;          /* the most tokens a pass of it takes for this model, 0 for none */
+    int capture_T;          /* the tokens enqueue_multi is capturing */
+    float* host_multi;      /* pinned, MULTI_MAX x vocab, for its logits */
     float* host_logits;     /* pinned, for the copy back */
 };
 
@@ -418,7 +432,19 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     extern __shared__ float4 shared4[];
     __shared__ int last;
     const int split = blockIdx.x, kvh = blockIdx.y;
-    const int n = step->pos + 1;
+    /* Token blockIdx.z of a pass over several (vitna_cuda_steps_exact) sits at
+     * position step->pos + blockIdx.z, with a query, an output, slices and a
+     * count of its own, and runs exactly as a step there would; a step is
+     * token 0 of a grid one deep. */
+    const int tz = blockIdx.z;
+    const size_t n_heads = (size_t)gridDim.y * group;
+    q += (size_t)tz * n_heads * head_dim;
+    att += (size_t)tz * n_heads * head_dim;
+    part_m += (size_t)tz * n_heads * ATTENTION_SPLITS;
+    part_l += (size_t)tz * n_heads * ATTENTION_SPLITS;
+    part_o += (size_t)tz * n_heads * ATTENTION_SPLITS * head_dim;
+    done += (size_t)tz * gridDim.y;
+    const int n = step->pos + 1 + tz;
     /* As many slices as n needs at ATTENTION_MIN_SLICE positions each, up
      * to the grid's width; the blocks past them have nothing to do. */
     const int splits = min((int)gridDim.x, (n + ATTENTION_MIN_SLICE - 1) / ATTENTION_MIN_SLICE);
@@ -562,6 +588,196 @@ __global__ void head_kernel(const float* __restrict__ x, const float* __restrict
     for (int r = blockIdx.x * WARPS + warp; r < vocab; r += gridDim.x * WARPS) {
         const float s = row_dot<DT>(w, r, hidden, xs, lane);
         if (lane == 0) logits[r] = s;
+    }
+}
+
+/* --- Several steps at once, exactly (vitna_cuda_steps_exact) ---
+ *
+ * The decode kernels above for up to MULTI_MAX tokens at consecutive
+ * positions: a warp reads a row of weights once and applies it to every
+ * token. Each token's arithmetic is a step's, in a step's order: the RMSNorm
+ * sums its squares as norm_to_shared does and reduces them in block_sum's
+ * tree, and each row's product with a token runs row_dot's chunks and lanes
+ * in row_dot's order, then warp_sum's. So every value is the one that many
+ * steps would compute, bit for bit, which is what lets several drafted
+ * tokens be checked in one pass without changing any reply. */
+
+/* x's T rows (stride n) through RMSNorm into xs (T rows, stride n), each as
+ * norm_to_shared computes its one. red holds MULTI_MAX * WARPS floats. */
+__device__ void norm_multi_to_shared(const float* __restrict__ x, const float* __restrict__ w, float* xs, int n, float eps, float* red,
+                                     int T) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float ss[MULTI_MAX];
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) {
+        ss[t] = 0.0f;
+        if (t < T) {
+            for (int i = threadIdx.x; i < n; i += THREADS) ss[t] = fmaf(x[(size_t)t * n + i], x[(size_t)t * n + i], ss[t]);
+        }
+    }
+    __syncthreads(); /* red may still be read from the reduction before */
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) {
+        if (t < T) {
+            const float v = warp_sum(ss[t]);
+            if (lane == 0) red[t * WARPS + warp] = v;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) {
+        if (t < T) {
+            const float total = warp_sum(lane < WARPS ? red[t * WARPS + lane] : 0.0f);
+            const float inv = 1.0f / sqrtf(total / (float)n + eps);
+            for (int i = threadIdx.x; i < n; i += THREADS) xs[(size_t)t * n + i] = x[(size_t)t * n + i] * inv * w[i];
+        }
+    }
+    __syncthreads();
+}
+
+/* s[t] plus row c's chunk of eight weights times x's T rows (stride ld) at
+ * chunk c, one fused multiply-add after another, as row_dot adds them. */
+__device__ __forceinline__ void chunk_multi(const float w[8], const float* x, size_t ld, int c, int T, float s[MULTI_MAX]) {
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) {
+        if (t < T) {
+            const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)t * ld);
+            const float4 a = x4[2 * c], b = x4[2 * c + 1];
+            float v = s[t];
+            v = fmaf(w[0], a.x, v);
+            v = fmaf(w[1], a.y, v);
+            v = fmaf(w[2], a.z, v);
+            v = fmaf(w[3], a.w, v);
+            v = fmaf(w[4], b.x, v);
+            v = fmaf(w[5], b.y, v);
+            v = fmaf(w[6], b.z, v);
+            v = fmaf(w[7], b.w, v);
+            s[t] = v;
+        }
+    }
+}
+
+/* Row r of a matrix times x's T rows (stride ld), each summed across the warp as row_dot sums it. */
+template <vitna_dtype_t DT>
+__device__ __forceinline__ void row_dot_multi(const void* w, int r, int cols, const float* x, size_t ld, int T, int lane,
+                                              float out[MULTI_MAX]) {
+    const size_t bytes = DT == VITNA_DTYPE_F32 ? 4 : 2;
+    const void* row = static_cast<const char*>(w) + (size_t)r * cols * bytes;
+    float s[MULTI_MAX];
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) s[t] = 0.0f;
+    for (int c = lane; c < cols / 8; c += 32) {
+        float v[8];
+        load8<DT>(row, c, v);
+        chunk_multi(v, x, ld, c, T, s);
+    }
+#pragma unroll
+    for (int t = 0; t < MULTI_MAX; t++) {
+        if (t < T) out[t] = warp_sum(s[t]);
+    }
+}
+
+/* attn_in_kernel for T tokens at positions step->pos onwards: x and q hold T rows. */
+template <vitna_dtype_t DT>
+__global__ void attn_in_multi_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+                                     const void* __restrict__ wq, const void* __restrict__ wk, const void* __restrict__ wv,
+                                     float* __restrict__ q, float* __restrict__ kc, float* __restrict__ vc,
+                                     const float* __restrict__ cos_all, const float* __restrict__ sin_all,
+                                     const step_t* __restrict__ step, int hidden, int n_heads, int n_kv_heads, int head_dim, int T) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[MULTI_MAX * WARPS];
+    float* xs = reinterpret_cast<float*>(shared4); /* [T][hidden] */
+    norm_multi_to_shared(x, norm_w, xs, hidden, eps, red, T);
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int half = head_dim / 2;
+    const int q_dim = n_heads * head_dim, kv_dim = n_kv_heads * head_dim;
+    const size_t p0 = (size_t)step->pos;
+    const int units_q = n_heads * half, units_qk = units_q + n_kv_heads * half;
+    const int units = units_qk + kv_dim / 2;
+    for (int u = blockIdx.x * WARPS + warp; u < units; u += gridDim.x * WARPS) {
+        float a[MULTI_MAX], b[MULTI_MAX];
+        if (u < units_qk) {
+            const bool is_q = u < units_q;
+            const int uu = is_q ? u : u - units_q;
+            const int j = uu % half;
+            const int ra = (uu / half) * head_dim + j, rb = ra + half;
+            const void* w = is_q ? wq : wk;
+            row_dot_multi<DT>(w, ra, hidden, xs, hidden, T, lane, a);
+            row_dot_multi<DT>(w, rb, hidden, xs, hidden, T, lane, b);
+            if (lane == 0) {
+                for (int t = 0; t < T; t++) {
+                    const size_t pos = p0 + t;
+                    const float c = cos_all[pos * half + j], s = sin_all[pos * half + j];
+                    float* out = is_q ? q + (size_t)t * q_dim : kc + pos * kv_dim;
+                    out[ra] = a[t] * c - b[t] * s;
+                    out[rb] = b[t] * c + a[t] * s;
+                }
+            }
+        } else {
+            const int ra = 2 * (u - units_qk);
+            row_dot_multi<DT>(wv, ra, hidden, xs, hidden, T, lane, a);
+            row_dot_multi<DT>(wv, ra + 1, hidden, xs, hidden, T, lane, b);
+            if (lane == 0) {
+                for (int t = 0; t < T; t++) {
+                    float* v = vc + (p0 + t) * kv_dim;
+                    v[ra] = a[t];
+                    v[ra + 1] = b[t];
+                }
+            }
+        }
+    }
+}
+
+/* matvec_add_kernel for T tokens: y's T rows (stride rows) += W x's T rows (stride cols). */
+template <vitna_dtype_t DT>
+__global__ void matvec_add_multi_kernel(const void* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows,
+                                        int cols, int T) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = blockIdx.x * WARPS + warp; r < rows; r += gridDim.x * WARPS) {
+        float s[MULTI_MAX];
+        row_dot_multi<DT>(w, r, cols, x, cols, T, lane, s);
+        if (lane == 0) {
+            for (int t = 0; t < T; t++) y[(size_t)t * rows + r] = y[(size_t)t * rows + r] + s[t];
+        }
+    }
+}
+
+/* mlp_in_kernel for T tokens: x and act hold T rows. */
+template <vitna_dtype_t DT>
+__global__ void mlp_in_multi_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+                                    const void* __restrict__ wg, const void* __restrict__ wu, float* __restrict__ act,
+                                    int hidden, int intermediate, int T) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[MULTI_MAX * WARPS];
+    float* xs = reinterpret_cast<float*>(shared4);
+    norm_multi_to_shared(x, norm_w, xs, hidden, eps, red, T);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = blockIdx.x * WARPS + warp; r < intermediate; r += gridDim.x * WARPS) {
+        float g[MULTI_MAX], u[MULTI_MAX];
+        row_dot_multi<DT>(wg, r, hidden, xs, hidden, T, lane, g);
+        row_dot_multi<DT>(wu, r, hidden, xs, hidden, T, lane, u);
+        if (lane == 0) {
+            for (int t = 0; t < T; t++) act[(size_t)t * intermediate + r] = (g[t] / (1.0f + expf(-g[t]))) * u[t];
+        }
+    }
+}
+
+/* head_kernel for T tokens: x and logits hold T rows. */
+template <vitna_dtype_t DT>
+__global__ void head_multi_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+                                  const void* __restrict__ w, float* __restrict__ logits, int hidden, int vocab, int T) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[MULTI_MAX * WARPS];
+    float* xs = reinterpret_cast<float*>(shared4);
+    norm_multi_to_shared(x, norm_w, xs, hidden, eps, red, T);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = blockIdx.x * WARPS + warp; r < vocab; r += gridDim.x * WARPS) {
+        float s[MULTI_MAX];
+        row_dot_multi<DT>(w, r, hidden, xs, hidden, T, lane, s);
+        if (lane == 0) {
+            for (int t = 0; t < T; t++) logits[(size_t)t * vocab + r] = s[t];
+        }
     }
 }
 
@@ -1082,6 +1298,40 @@ static void enqueue_head(const struct vitna_cuda_model* g) {
     enqueue_head_of(g, g->x);
 }
 
+/* g->capture_T tokens at once, g->p_tokens from the position g->step holds:
+ * the embedding, every layer and the head, as enqueue_body and enqueue_head
+ * run one token, with the kernels for several (vitna_cuda_steps_exact). Rows
+ * go in the prompt's scratch: p_x, p_q, p_att, p_gate for the activations
+ * and p_logits for the logits. Captured once for each count. */
+static void enqueue_multi(const struct vitna_cuda_model* g) {
+    const cudaStream_t s = g->stream;
+    const int T = g->capture_T;
+    const int H = g->hidden, hd = g->head_dim, half = hd / 2;
+    const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
+    const int group = g->n_heads / g->n_kv_heads;
+    const size_t rows_shared = (size_t)T * H * sizeof(float);
+    const unsigned int attn_in_blocks = grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2);
+    const unsigned int mlp_in_blocks = grid_for(g, g->intermediate);
+    const unsigned int out_blocks = grid_for(g, H);
+
+    LAUNCH(g->dtype, embed_rows_kernel, dim3(blocks_for((size_t)H, THREADS), T), 0, s, g->embed.w, g->p_tokens, H, g->p_x);
+    for (int l = 0; l < g->n_layers; l++) {
+        const dlayer_t* L = &g->layers[l];
+        float* kc = g->k_cache + (size_t)l * g->ctx * kv_dim;
+        float* vc = g->v_cache + (size_t)l * g->ctx * kv_dim;
+        LAUNCH(g->dtype, attn_in_multi_kernel, attn_in_blocks, rows_shared, s, g->p_x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w,
+               g->p_q, kc, vc, g->cos_t, g->sin_t, g->step, H, g->n_heads, g->n_kv_heads, hd, T);
+        attention_kernel<<<dim3(ATTENTION_SPLITS, g->n_kv_heads, T), THREADS, attention_shared(g), s>>>(
+            g->p_q, kc, vc, g->p_att, g->part_m, g->part_l, g->part_o, g->done, g->step, hd, kv_dim, group, g->scale);
+        LAUNCH(g->dtype, matvec_add_multi_kernel, out_blocks, 0, s, L->o.w, g->p_att, g->p_x, H, q_dim, T);
+        LAUNCH(g->dtype, mlp_in_multi_kernel, mlp_in_blocks, rows_shared, s, g->p_x, L->mlp_norm, g->eps, L->gate.w, L->up.w, g->p_gate, H,
+               g->intermediate, T);
+        LAUNCH(g->dtype, matvec_add_multi_kernel, out_blocks, 0, s, L->down.w, g->p_gate, g->p_x, H, g->intermediate, T);
+    }
+    LAUNCH(g->dtype, head_multi_kernel, grid_for(g, g->vocab), rows_shared, s, g->p_x, g->final_norm, g->eps, g->lm_head.w, g->p_logits, H,
+           g->vocab, T);
+}
+
 /* Y = X W^T for T rows, on the model's stream: gemm_few_kernel for up to
  * FEW_TOKENS rows, which a tile of GEMM_BM would mostly leave empty, and
  * gemm_kernel for more. */
@@ -1198,6 +1448,10 @@ void vitna_cuda_free(struct vitna_cuda_model* g) {
     if (g->stream) cudaStreamSynchronize(g->stream);
     if (g->body) cudaGraphExecDestroy(g->body);
     if (g->head) cudaGraphExecDestroy(g->head);
+    for (int t = 0; t <= MULTI_MAX; t++) {
+        if (g->multi[t]) cudaGraphExecDestroy(g->multi[t]);
+    }
+    if (g->host_multi) cudaFreeHost(g->host_multi);
     if (g->stream) cudaStreamDestroy(g->stream);
     if (g->host_logits) cudaFreeHost(g->host_logits);
     if (g->arena) cudaFree(g->arena);
@@ -1274,6 +1528,12 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     if (e == cudaSuccess) e = cudaGetDeviceProperties(&prop, g->device);
     if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&g->stream, cudaStreamNonBlocking);
     if (e == cudaSuccess) e = cudaMallocHost((void**)&g->host_logits, c->vocab * sizeof(float));
+    /* Several steps at once take up to MULTI_MAX tokens, as many as fit their
+     * normalized rows in 48 KB of shared memory, in the prompt's scratch. */
+    g->multi_max = g->prompt ? (int)(48 * 1024 / (c->hidden * sizeof(float))) : 0;
+    if (g->multi_max > MULTI_MAX) g->multi_max = MULTI_MAX;
+    if (g->multi_max < 2) g->multi_max = 0;
+    if (e == cudaSuccess && g->multi_max) e = cudaMallocHost((void**)&g->host_multi, (size_t)MULTI_MAX * c->vocab * sizeof(float));
     if (e != cudaSuccess) {
         fail_cuda(err, err_len, "cannot use CUDA device 0", e);
         vitna_cuda_free(g);
@@ -1301,10 +1561,11 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     total += padded(c->hidden * sizeof(float));
     total += 2 * padded(m->ctx * half * sizeof(float));
     total += 2 * padded(cache_floats * sizeof(float));
-    const size_t slices = c->n_heads * ATTENTION_SPLITS;
+    /* Attention's slices and counts, for each of up to MULTI_MAX tokens (a step uses the first). */
+    const size_t slices = MULTI_MAX * c->n_heads * ATTENTION_SPLITS;
     total += padded(c->hidden * sizeof(float)) + 2 * padded(q_dim * sizeof(float)) + padded(c->intermediate * sizeof(float)) +
              padded(c->vocab * sizeof(float)) + 2 * padded(slices * sizeof(float)) + padded(slices * c->head_dim * sizeof(float)) +
-             padded(c->n_kv_heads * sizeof(unsigned int)) + padded(sizeof(step_t));
+             padded(MULTI_MAX * c->n_kv_heads * sizeof(unsigned int)) + padded(sizeof(step_t));
     /* A prompt's chunk, its logits and its tokens. */
     size_t P = 0;
     if (g->prompt) {
@@ -1387,7 +1648,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         g->part_m = (float*)carve(&cv, slices * sizeof(float));
         g->part_l = (float*)carve(&cv, slices * sizeof(float));
         g->part_o = (float*)carve(&cv, slices * c->head_dim * sizeof(float));
-        g->done = (unsigned int*)carve(&cv, c->n_kv_heads * sizeof(unsigned int));
+        g->done = (unsigned int*)carve(&cv, MULTI_MAX * c->n_kv_heads * sizeof(unsigned int));
         g->step = (step_t*)carve(&cv, sizeof(step_t));
         if (g->prompt) {
             g->p_x = (float*)carve(&cv, P * c->hidden * sizeof(float));
@@ -1402,7 +1663,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         /* A position is always written before it is read; zeros make a mistake there repeatable. */
         e = cudaMemset(g->k_cache, 0, 2 * padded(cache_floats * sizeof(float)));
         /* Attention counts finished slices up from zero, and leaves the count at zero. */
-        if (e == cudaSuccess) e = cudaMemset(g->done, 0, c->n_kv_heads * sizeof(unsigned int));
+        if (e == cudaSuccess) e = cudaMemset(g->done, 0, MULTI_MAX * c->n_kv_heads * sizeof(unsigned int));
         /* The uploads and the memset ran on the default stream, which the
          * model's non-blocking stream does not wait for: finish them first. */
         if (e == cudaSuccess) e = cudaDeviceSynchronize();
@@ -1508,5 +1769,34 @@ bool vitna_cuda_steps(struct vitna_cuda_model* g, const int32_t* tokens, size_t 
         if (e == cudaSuccess) memcpy(logits, g->host_logits, bytes);
     }
     if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
+    return true;
+}
+
+size_t vitna_cuda_exact_max(const struct vitna_cuda_model* g) {
+    return g ? (size_t)g->multi_max : 0;
+}
+
+bool vitna_cuda_steps_exact(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, char* err,
+                            size_t err_len) {
+    if (count < 1 || count > (size_t)g->multi_max) return fail(err, err_len, "%zu tokens at once is more than this model takes (%d)", count, g->multi_max);
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
+    if (!g->multi[count]) {
+        g->capture_T = (int)count;
+        e = capture(g, enqueue_multi, &g->multi[count]);
+        if (e != cudaSuccess) return fail_cuda(err, err_len, "capturing several steps as a CUDA graph failed", e);
+    }
+    const size_t bytes = count * g->vocab * sizeof(float);
+    /* From pageable memory, so tokens may change as soon as this returns. */
+    e = cudaMemcpyAsync(g->p_tokens, tokens, count * sizeof(int32_t), cudaMemcpyHostToDevice, g->stream);
+    if (e == cudaSuccess) {
+        set_step_kernel<<<1, 1, 0, g->stream>>>(g->step, 0, (int)pos);
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess) e = cudaGraphLaunch(g->multi[count], g->stream);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(g->host_multi, g->p_logits, bytes, cudaMemcpyDeviceToHost, g->stream);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
+    memcpy(logits, g->host_multi, bytes);
     return true;
 }

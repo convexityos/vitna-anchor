@@ -103,7 +103,7 @@ node scripts/fetch-model.mjs
 | Command | What it does |
 |---|---|
 | `run --model <dir> --prompt <text>` | Prints the prompt's continuation as it is generated |
-| `generate --model <dir> (--prompt <text> \| --ids <a,b,...>)` | Prints JSON: the prompt's ids, the new ids and their text. `--logits-out <file>` writes each step's logits, and `--timing` prints to stderr how long the prompt and the new tokens took |
+| `generate --model <dir> (--prompt <text> \| --ids <a,b,...>)` | Prints JSON: the prompt's ids, the new ids and their text. `--logits-out <file>` writes each step's logits, and `--timing` prints to stderr how long the prompt and the new tokens took. `--speculate <k>` drafts up to k tokens after each one taken, from the place the text's last two or three tokens occur earlier in it, and checks them together, drafting nothing for a while after a pass whose drafts were all refused; the ids and logits are the ones decoding a token at a time gives, byte for byte, which `tests/speculate.test.mjs` checks. On a GPU the drafts are checked in one pass, k at most 7; on the CPU a step at a time |
 | `logits --model <dir> (--prompt <text> \| --ids <a,b,...>) --out <file>` | Writes the logits at every position of the prompt, as float32 |
 | `tokenize --model <dir> [--text <text>]` | Prints token ids as JSON |
 | `info --model <file.safetensors>` | Lists the tensors in a SafeTensors file |
@@ -156,7 +156,7 @@ node bin/vitna-anchor.mjs --help
 npm test
 ```
 
-`tests/engine-server.test.mjs`, `tests/reference.test.mjs`, `tests/serving.test.mjs`, `tests/reuse-and-json.test.mjs` and `tests/step-failure.test.mjs` run the built engine when they find one, and the last four also need the model files. Without them those tests are skipped, and say why. CI builds the engine and runs the unit tests on Linux, macOS and Windows, fetches the model, and requires all five engine tests to pass.
+`tests/engine-server.test.mjs`, `tests/reference.test.mjs`, `tests/serving.test.mjs`, `tests/reuse-and-json.test.mjs`, `tests/step-failure.test.mjs` and `tests/speculate.test.mjs` run the built engine when they find one, and the last five also need the model files. Without them those tests are skipped, and say why. CI builds the engine and runs the unit tests on Linux, macOS and Windows, fetches the model, and requires all six engine tests to pass.
 
 `tests/step-failure.test.mjs` starts each of its servers with `VITNA_TEST_FAIL_STEP=<position>`, a hook for tests only, which makes the step at that position fail once, before it computes anything. It is how the tests check what a client sees when a step fails, with no GPU error to cause one. A server started with it says so on stderr.
 

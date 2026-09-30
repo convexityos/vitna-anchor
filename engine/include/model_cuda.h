@@ -43,6 +43,23 @@ bool vitna_cuda_step(struct vitna_cuda_model* g, int32_t token, size_t pos, floa
 size_t vitna_cuda_prompt_min(const struct vitna_cuda_model* g);
 
 /**
+ * The most tokens vitna_cuda_steps_exact takes at once for this model, 0 for
+ * a model that takes none.
+ */
+size_t vitna_cuda_exact_max(const struct vitna_cuda_model* g);
+
+/**
+ * Run count tokens at positions pos to pos + count - 1 as count calls to
+ * vitna_cuda_step would, writing every one's logits, count x vocab, in one
+ * pass that reads each weight once: the same values as those steps, bit for
+ * bit. count is 1 to vitna_cuda_exact_max. The caller has checked the tokens
+ * and the room in the cache. Returns false, with the reason in err, if the
+ * device reports an error.
+ */
+bool vitna_cuda_steps_exact(struct vitna_cuda_model* g, const int32_t* tokens, size_t count, size_t pos, float* logits, char* err,
+                            size_t err_len);
+
+/**
  * Run count tokens at positions pos to pos + count - 1 together, writing
  * their keys and values into the device's cache. If logits is not NULL, it
  * receives vocab logits for each of the last rows positions, rows x vocab.
