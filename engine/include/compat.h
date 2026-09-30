@@ -46,6 +46,16 @@ extern "C" {
 
 /* --- Monotonic Timer --- */
 
+/* Nanoseconds in ticks of a counter running at freq ticks a second. Whole
+ * seconds and the remainder are taken separately: ticks * 1e9 overflows 64
+ * bits once ticks passes 2^64 / 1e9, which for Windows' usual 10 MHz
+ * performance counter is 31 minutes after boot, and the clock then wrapped
+ * every 31 minutes. The remainder is below freq, so remainder * 1e9 fits for
+ * any freq up to about 18 GHz. */
+static inline uint64_t vitna_ticks_to_nanos(uint64_t ticks, uint64_t freq) {
+    return (ticks / freq) * 1000000000ULL + ((ticks % freq) * 1000000000ULL) / freq;
+}
+
 static inline uint64_t vitna_time_nanos(void) {
 #if defined(VITNA_OS_WINDOWS)
     static LARGE_INTEGER freq;
@@ -56,7 +66,7 @@ static inline uint64_t vitna_time_nanos(void) {
     }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (uint64_t)((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+    return vitna_ticks_to_nanos((uint64_t)counter.QuadPart, (uint64_t)freq.QuadPart);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
