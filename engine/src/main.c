@@ -21,6 +21,9 @@
   #include <fcntl.h>
 #endif
 
+/* The most requests serve --parallel runs at once. */
+#define PARALLEL_MAX 64
+
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
         printf("vitna-anchor engine: a dense Llama-architecture model in float32, on the CPU or, with --device cuda, on an NVIDIA GPU.\n\n");
@@ -34,7 +37,7 @@ static void print_usage(const char* prog) {
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
-    printf("               [--speculate <k>]\n");
+    printf("               [--speculate <k>] [--parallel <n>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
@@ -54,7 +57,9 @@ static void print_usage(const char* prog) {
     printf("serve     serves the model over an OpenAI-compatible HTTP API at /v1, on 127.0.0.1:8765 unless told\n");
     printf("          otherwise, under the model directory's name unless --model-id says another. Without\n");
     printf("          --model its generation endpoints answer 501. --speculate k drafts and checks tokens as\n");
-    printf("          generate --speculate does; no response changes\n");
+    printf("          generate --speculate does; no response changes. --parallel n runs up to n requests at\n");
+    printf("          once (default 1, at most %d), each with a key-value cache of its own, their tokens\n", PARALLEL_MAX);
+    printf("          together in each pass on a GPU; every response is the one it gets alone\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
 }
@@ -77,6 +82,7 @@ typedef struct {
     bool no_prefix_cache;
     bool timing;
     size_t speculate;
+    size_t parallel;        /* serve: the requests it runs at once, each with a sequence of its own */
     vitna_sampling_t sampling;
 } args_t;
 
@@ -101,6 +107,10 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--device")) a->device = v;
         else if (TAKE("--max-new")) a->max_new = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--speculate")) a->speculate = (size_t)strtoull(v, NULL, 10);
+        else if (TAKE("--parallel")) {
+            a->parallel = (size_t)strtoull(v, NULL, 10);
+            if (a->parallel == 0) a->parallel = SIZE_MAX; /* refused in cmd_serve, as too many would be */
+        }
         else if (TAKE("--ctx")) a->ctx = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
@@ -256,7 +266,7 @@ static bool wants_cuda(const args_t* a) {
 
 static bool load_model(const args_t* a, vitna_llama_t* m) {
     char err[512];
-    if (!vitna_llama_load(m, a->model, a->ctx, err, sizeof(err))) {
+    if (!vitna_llama_load(m, a->model, a->ctx, a->parallel ? a->parallel : 1, err, sizeof(err))) {
         fprintf(stderr, "%s\n", err);
         return false;
     }
@@ -287,7 +297,7 @@ static int cmd_logits(const args_t* a) {
             rc = 0;
             for (size_t t = 0; t < ids.count && rc == 0; t += chunk) {
                 const size_t n = ids.count - t < chunk ? ids.count - t : chunk;
-                const size_t ran = vitna_llama_steps(&m, ids.ids + t, n, rows, n);
+                const size_t ran = vitna_llama_steps(&m, 0, ids.ids + t, n, rows, n);
                 if (ran < n) {
                     fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", ids.ids[t + ran], t + ran);
                     rc = 1;
@@ -356,7 +366,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
     vitna_drafter_init(&drafter, k);
     int rc = 0;
     const double t_prompt = vitna_time_ms();
-    const size_t ran = vitna_llama_steps(m, prompt->ids, prompt->count, row, 1);
+    const size_t ran = vitna_llama_steps(m, 0, prompt->ids, prompt->count, row, 1);
     if (ran < prompt->count) {
         fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", prompt->ids[ran], ran);
         rc = 1;
@@ -382,10 +392,10 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
             d = vitna_drafter_draft(&drafter, text, text_len, pass + 1);
             const size_t left = a->max_new - out->count; /* choices still to take, 1 or more */
             if (d > left - 1) d = left - 1;
-            if (m->n_past + d + 1 > m->ctx) d = m->n_past + 1 < m->ctx ? m->ctx - m->n_past - 1 : 0;
+            if (m->past[0] + d + 1 > m->ctx) d = m->past[0] + 1 < m->ctx ? m->ctx - m->past[0] - 1 : 0;
         }
         if (d == 0) {
-            if (!vitna_llama_step(m, t, row)) {
+            if (!vitna_llama_step(m, 0, t, row)) {
                 fprintf(stderr, "the key-value cache is full at %zu positions; raise --ctx\n", m->ctx);
                 rc = 1;
                 break;
@@ -398,9 +408,9 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         pass[0] = t;
         passes++;
         drafted += d;
-        const size_t start = m->n_past;
-        if (vitna_llama_steps_exact(m, pass, d + 1, rows) < d + 1) {
-            fprintf(stderr, "the forward pass failed at position %zu\n", m->n_past);
+        const size_t start = m->past[0];
+        if (vitna_llama_steps_exact(m, 0, pass, d + 1, rows) < d + 1) {
+            fprintf(stderr, "the forward pass failed at position %zu\n", m->past[0]);
             rc = 1;
             break;
         }
@@ -419,7 +429,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
                 continue;
             }
             vitna_drafter_taken(&drafter, i);
-            vitna_llama_truncate(m, start + i + 1);
+            vitna_llama_truncate(m, 0, start + i + 1);
             t = u;
             break;
         }
@@ -617,6 +627,10 @@ static void dir_basename(const char* dir, char* out, size_t n) {
 }
 
 static int cmd_serve(const args_t* a) {
+    if (a->parallel > PARALLEL_MAX) {
+        fprintf(stderr, "--parallel takes a number of requests from 1 to %d\n", PARALLEL_MAX);
+        return 1;
+    }
     vitna_server_config_t cfg;
     cfg.port = a->port;
     cfg.bind_addr = a->host ? a->host : "127.0.0.1";

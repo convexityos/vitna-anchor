@@ -16,6 +16,11 @@
  * model fails to run ends the request with an error, never with the reply so
  * far: a 500 of type server_error or, once a stream's 200 has gone out, an
  * event carrying that error, with no final chunk or [DONE] after it.
+ *
+ * Requests that generate run together, as many at once as the model's cache
+ * has sequences (vitna_llama_load's seqs), each in a sequence of its own; the
+ * rest wait their turn. Every one is answered exactly as it would be alone,
+ * a token at a time: its tokens' logits are those steps', bit for bit.
  */
 
 #ifndef VITNA_API_H
@@ -52,24 +57,30 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
 
 void vitna_api_free(vitna_api_t* api);
 
+/** The requests it runs at once: the model's sequences. */
+size_t vitna_api_parallel(const vitna_api_t* api);
+
 /**
- * Whether a request may reuse the key-value cache the previous one left
- * (on by default). The longest prefix of tokens the two share is kept
- * rather than recomputed, and reported as usage.prompt_tokens_details
- * .cached_tokens. Reuse cannot change a response: the keys and values it
- * keeps are the ones the same tokens would produce again.
+ * Whether a request may reuse the key-value cache an earlier one left in
+ * the sequence it is given (on by default): of the sequences free, the one
+ * holding the longest prefix of its prompt. That prefix is kept rather than
+ * recomputed, and reported as usage.prompt_tokens_details.cached_tokens.
+ * Reuse cannot change a response: the keys and values it keeps are the ones
+ * the same tokens would produce again.
  */
 void vitna_api_set_prefix_cache(vitna_api_t* api, bool on);
 
 /**
  * Whether a request drafts tokens and checks them several at a time (off by
  * default): up to k drafted after each token taken, by vitna_drafter_t, and
- * checked with vitna_llama_steps_exact, which gives every position the logits
+ * checked with vitna_llama_step_rows, which gives every position the logits
  * a step there would. Each token is still chosen from those logits in turn,
  * with the JSON mask, the stop sequences and the sampler exactly as without
  * it, and the cache left as it would be, so no response changes, usage
- * included. On a GPU k is at most vitna_llama_exact_max - 1. Returns false if
- * it could not allocate for k, and leaves it off.
+ * included. On a GPU k is at most vitna_llama_exact_max - 1. With several
+ * requests running, drafts take only the rows a round's passes have spare.
+ * Call it before serving. Returns false if it could not allocate for k, and
+ * leaves it off.
  */
 bool vitna_api_set_speculate(vitna_api_t* api, size_t k);
 
@@ -103,9 +114,12 @@ size_t vitna_drafter_draft(vitna_drafter_t* d, const int32_t* text, size_t len, 
 void vitna_drafter_taken(vitna_drafter_t* d, size_t taken);
 
 /**
- * Answer one request with a complete HTTP response through sink. api may be
- * NULL, for a server started without a model: health and the model list say
- * so, and generation answers 501.
+ * Answer one request with a complete HTTP response through sink, returning
+ * once it has all gone. Several threads may call it at once, one a
+ * connection: a request that generates waits for a sequence, and its output
+ * goes out through its own caller's sink. api may be NULL, for a server
+ * started without a model: health and the model list say so, and generation
+ * answers 501.
  */
 vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const char* path,
                                     const char* body, size_t body_len, vitna_sink_t* sink);

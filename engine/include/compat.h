@@ -6,7 +6,7 @@
  * - Memory-mapped file I/O (mmap on POSIX, MapViewOfFile on Windows)
  * - Positional file reads (pread on POSIX, overlapped ReadFile on Windows)
  * - Cache-line aligned dynamic memory allocation
- * - Lightweight mutual exclusion and thread pools
+ * - Threads, locks and condition variables
  */
 
 #ifndef VITNA_COMPAT_H
@@ -275,6 +275,92 @@ static inline void vitna_file_close(vitna_file_t* f) {
         close(f->fd);
         f->fd = -1;
     }
+#endif
+}
+
+/* --- Threads, locks and condition variables --- */
+
+#if defined(VITNA_OS_WINDOWS)
+typedef SRWLOCK vitna_mutex_t;
+typedef CONDITION_VARIABLE vitna_cond_t;
+typedef HANDLE vitna_thread_t;
+static inline void vitna_mutex_init(vitna_mutex_t* m) { InitializeSRWLock(m); }
+static inline void vitna_mutex_destroy(vitna_mutex_t* m) { (void)m; }
+static inline void vitna_mutex_lock(vitna_mutex_t* m) { AcquireSRWLockExclusive(m); }
+static inline void vitna_mutex_unlock(vitna_mutex_t* m) { ReleaseSRWLockExclusive(m); }
+static inline void vitna_cond_init(vitna_cond_t* c) { InitializeConditionVariable(c); }
+static inline void vitna_cond_destroy(vitna_cond_t* c) { (void)c; }
+static inline void vitna_cond_wait(vitna_cond_t* c, vitna_mutex_t* m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
+static inline void vitna_cond_signal(vitna_cond_t* c) { WakeConditionVariable(c); }
+static inline void vitna_cond_broadcast(vitna_cond_t* c) { WakeAllConditionVariable(c); }
+#else
+typedef pthread_mutex_t vitna_mutex_t;
+typedef pthread_cond_t vitna_cond_t;
+typedef pthread_t vitna_thread_t;
+static inline void vitna_mutex_init(vitna_mutex_t* m) { pthread_mutex_init(m, NULL); }
+static inline void vitna_mutex_destroy(vitna_mutex_t* m) { pthread_mutex_destroy(m); }
+static inline void vitna_mutex_lock(vitna_mutex_t* m) { pthread_mutex_lock(m); }
+static inline void vitna_mutex_unlock(vitna_mutex_t* m) { pthread_mutex_unlock(m); }
+static inline void vitna_cond_init(vitna_cond_t* c) { pthread_cond_init(c, NULL); }
+static inline void vitna_cond_destroy(vitna_cond_t* c) { pthread_cond_destroy(c); }
+static inline void vitna_cond_wait(vitna_cond_t* c, vitna_mutex_t* m) { pthread_cond_wait(c, m); }
+static inline void vitna_cond_signal(vitna_cond_t* c) { pthread_cond_signal(c); }
+static inline void vitna_cond_broadcast(vitna_cond_t* c) { pthread_cond_broadcast(c); }
+#endif
+
+typedef struct {
+    void (*fn)(void*);
+    void* arg;
+} vitna_thread_call_t;
+
+#if defined(VITNA_OS_WINDOWS)
+static inline DWORD WINAPI vitna_thread_entry(LPVOID p) {
+#else
+static inline void* vitna_thread_entry(void* p) {
+#endif
+    vitna_thread_call_t call = *(vitna_thread_call_t*)p;
+    free(p);
+    call.fn(call.arg);
+    return 0;
+}
+
+/**
+ * Run fn(arg) on a thread of its own. A detached thread is never joined: it
+ * frees what it holds when fn returns. Returns false, with fn not run, if no
+ * thread could start.
+ */
+static inline bool vitna_thread_start(vitna_thread_t* t, void (*fn)(void*), void* arg, bool detached) {
+    vitna_thread_call_t* call = (vitna_thread_call_t*)malloc(sizeof(vitna_thread_call_t));
+    if (!call) return false;
+    call->fn = fn;
+    call->arg = arg;
+#if defined(VITNA_OS_WINDOWS)
+    HANDLE h = CreateThread(NULL, 0, vitna_thread_entry, call, 0, NULL);
+    if (!h) {
+        free(call);
+        return false;
+    }
+    if (detached) CloseHandle(h);
+    else *t = h;
+#else
+    pthread_t h;
+    if (pthread_create(&h, NULL, vitna_thread_entry, call) != 0) {
+        free(call);
+        return false;
+    }
+    if (detached) pthread_detach(h);
+    else *t = h;
+#endif
+    return true;
+}
+
+/** Wait for a thread vitna_thread_start started undetached to return. */
+static inline void vitna_thread_join(vitna_thread_t t) {
+#if defined(VITNA_OS_WINDOWS)
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+#else
+    pthread_join(t, NULL);
 #endif
 }
 
