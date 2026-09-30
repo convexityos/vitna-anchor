@@ -139,6 +139,21 @@ bool vitna_llama_step(vitna_llama_t* m, int32_t token, float* logits);
 size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits, size_t rows);
 
 /**
+ * Run count tokens at positions m->n_past onwards as count calls to
+ * vitna_llama_step would, writing every one's logits, count x vocab, and
+ * return how many ran, with vitna_llama_steps's rule for a token that
+ * fails. Every value is the one those steps would give, bit for bit, so a
+ * caller can check several drafted tokens in one call and reply exactly as
+ * it would have one token at a time. On the CPU it is those steps. On a GPU
+ * up to vitna_llama_exact_max tokens run in one pass that reads each weight
+ * once; more, or a token that cannot run, go a step at a time.
+ */
+size_t vitna_llama_steps_exact(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits);
+
+/** The most tokens vitna_llama_steps_exact runs in one pass: 1 on the CPU. */
+size_t vitna_llama_exact_max(const vitna_llama_t* m);
+
+/**
  * For tests: make the next step at position pos fail, once, as a step on the
  * GPU does when the device reports an error, so that what its callers do
  * then can be tested on a CPU. That step returns false before computing

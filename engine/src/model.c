@@ -388,6 +388,47 @@ size_t vitna_llama_steps(vitna_llama_t* m, const int32_t* tokens, size_t count, 
     return run;
 }
 
+size_t vitna_llama_exact_max(const vitna_llama_t* m) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) {
+        const size_t k = vitna_cuda_exact_max(m->cuda);
+        return k > 1 ? k : 1;
+    }
+#endif
+    (void)m;
+    return 1;
+}
+
+size_t vitna_llama_steps_exact(vitna_llama_t* m, const int32_t* tokens, size_t count, float* logits) {
+    const vitna_llama_config_t* c = &m->cfg;
+#if defined(VITNA_CUDA)
+    /* One pass on the GPU when every token can run there; a token out of
+     * range, past the cache or failed by a test goes a step at a time below,
+     * so it fails as its step would. */
+    if (m->cuda && logits && count >= 2 && count <= vitna_cuda_exact_max(m->cuda)) {
+        const size_t start = m->n_past;
+        size_t run = 0;
+        while (run < count && tokens[run] >= 0 && (size_t)tokens[run] < c->vocab && start + run < m->ctx &&
+               !(m->fail_armed && start + run == m->fail_at)) {
+            run++;
+        }
+        if (run == count) {
+            char err[512];
+            if (!vitna_cuda_steps_exact(m->cuda, tokens, count, start, logits, err, sizeof(err))) {
+                fprintf(stderr, "CUDA: %s\n", err);
+                return 0;
+            }
+            m->n_past = start + count;
+            return count;
+        }
+    }
+#endif
+    for (size_t i = 0; i < count; i++) {
+        if (!vitna_llama_step(m, tokens[i], logits ? logits + i * c->vocab : NULL)) return i;
+    }
+    return count;
+}
+
 /* --- The GPU --- */
 
 bool vitna_llama_cuda_built(void) {
