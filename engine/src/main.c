@@ -656,6 +656,14 @@ static int cmd_serve(const args_t* a) {
     } else {
         vitna_api_set_prefix_cache(api, !a->no_prefix_cache);
         if (a->speculate && !vitna_api_set_speculate(api, a->speculate)) fprintf(stderr, "out of memory for --speculate; serving without it\n");
+        /* For tests only: VITNA_TEST_NO_MASK_CACHE=1 makes JSON mode find
+         * every mask anew, so tests/reuse-and-json.test.mjs can check that a
+         * kept mask gives the same responses. */
+        const char* no_mask_cache = getenv("VITNA_TEST_NO_MASK_CACHE");
+        if (no_mask_cache && *no_mask_cache) {
+            vitna_api_set_mask_cache(api, false);
+            fprintf(stderr, "VITNA_TEST_NO_MASK_CACHE is set, for a test: JSON mode finds every mask anew.\n");
+        }
         char device[400];
         printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;

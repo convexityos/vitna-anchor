@@ -19,6 +19,19 @@
 #include <time.h>
 
 #define MAX_STOPS 4
+
+/* JSON mode's mask is a function of the object so far, as the automaton's
+ * state holds it, and of nothing else, and the same states come round again
+ * and again: every token inside a string, for one. So the masks of the last
+ * MASK_CACHE states are kept, a bit a token (mask_json). */
+#define MASK_CACHE 32
+
+typedef struct {
+    vitna_jsonpfx_t key; /* the state, with the stack's slots past its depth cleared */
+    uint32_t* allowed;   /* bit (id & 31) of word id >> 5: whether token id can follow */
+    size_t left;         /* how many can */
+    uint64_t used;       /* when it last served, to replace the one unused longest */
+} mask_entry_t;
 #define NO_MODEL_MESSAGE \
     "This server was started without a model, so it serves none. Start it with: vitna-anchor serve --model <dir>"
 
@@ -32,6 +45,9 @@ struct vitna_api {
     float* row;
     bool prefix_cache;
     vitna_token_list_t cached;  /* the tokens whose keys and values are in the model's cache, in order */
+    mask_entry_t masks[MASK_CACHE]; /* JSON mode's masks by state (mask_json) */
+    bool mask_cache;                /* whether they are kept (vitna_api_set_mask_cache) */
+    uint64_t mask_clock;
     size_t speculate;           /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
     float* rows;                /* speculate + 1 rows of logits, from a pass over a token and its drafts */
     int32_t* pass;              /* that token and its drafts */
@@ -540,20 +556,66 @@ static void stream_ready(gen_t* g, bool final) {
 /* JSON mode: set the logit of every token that could not continue a JSON
  * object to minus infinity, so neither greedy decoding nor sampling can
  * choose it. Special tokens are masked too; the object's closing brace ends
- * the reply instead. Returns false when no token is left. */
+ * the reply instead. Returns false when no token is left.
+ *
+ * Which tokens can follow depends only on the automaton's state, so a
+ * state's answer is kept (MASK_CACHE) and serves again when the state comes
+ * round again: the same tokens masked, found once. */
 static bool mask_json(vitna_api_t* api, float* row, const vitna_jsonpfx_t* state) {
-    uint8_t allowed[32];
-    vitna_jsonpfx_next_bytes(state, allowed);
-    size_t left = 0;
-    for (size_t id = 0; id < api->model->cfg.vocab; id++) {
-        size_t n = 0;
-        const unsigned char* b = vitna_tokenizer_token_bytes(api->tok, (int32_t)id, &n);
-        bool ok = b && n > 0 && !vitna_tokenizer_is_special(api->tok, (int32_t)id) &&
-                  (allowed[b[0] >> 3] & (1u << (b[0] & 7))) && vitna_jsonpfx_accepts(state, b, n);
-        if (ok) left++;
-        else row[id] = -INFINITY;
+    const size_t V = api->model->cfg.vocab;
+    const size_t words = (V + 31) / 32;
+    vitna_jsonpfx_t key = *state;
+    memset(key.stack + key.depth, 0, sizeof(key.stack) - key.depth); /* what a pop leaves behind means nothing */
+    mask_entry_t* e = NULL;
+    mask_entry_t* spare = &api->masks[0];
+    for (size_t i = 0; i < MASK_CACHE; i++) {
+        mask_entry_t* c = &api->masks[i];
+        if (c->allowed && memcmp(&c->key, &key, sizeof(key)) == 0) {
+            e = c;
+            break;
+        }
+        /* The slot to fill if the state is new: an empty one, else the one unused longest. */
+        if (spare->allowed && (!c->allowed || c->used < spare->used)) spare = c;
     }
-    return left > 0;
+    if (!e) {
+        if (api->mask_cache && !spare->allowed) spare->allowed = (uint32_t*)malloc(words * sizeof(uint32_t));
+        if (!api->mask_cache || !spare->allowed) {
+            /* Not kept, for a test, or nowhere to keep it: mask directly. */
+            uint8_t allowed[32];
+            vitna_jsonpfx_next_bytes(state, allowed);
+            size_t left = 0;
+            for (size_t id = 0; id < V; id++) {
+                size_t n = 0;
+                const unsigned char* b = vitna_tokenizer_token_bytes(api->tok, (int32_t)id, &n);
+                bool ok = b && n > 0 && !vitna_tokenizer_is_special(api->tok, (int32_t)id) &&
+                          (allowed[b[0] >> 3] & (1u << (b[0] & 7))) && vitna_jsonpfx_accepts(state, b, n);
+                if (ok) left++;
+                else row[id] = -INFINITY;
+            }
+            return left > 0;
+        }
+        e = spare;
+        memset(e->allowed, 0, words * sizeof(uint32_t));
+        e->left = 0;
+        uint8_t allowed[32];
+        vitna_jsonpfx_next_bytes(state, allowed);
+        for (size_t id = 0; id < V; id++) {
+            size_t n = 0;
+            const unsigned char* b = vitna_tokenizer_token_bytes(api->tok, (int32_t)id, &n);
+            bool ok = b && n > 0 && !vitna_tokenizer_is_special(api->tok, (int32_t)id) &&
+                      (allowed[b[0] >> 3] & (1u << (b[0] & 7))) && vitna_jsonpfx_accepts(state, b, n);
+            if (ok) {
+                e->allowed[id >> 5] |= 1u << (id & 31);
+                e->left++;
+            }
+        }
+        e->key = key;
+    }
+    e->used = ++api->mask_clock;
+    for (size_t id = 0; id < V; id++) {
+        if (!((e->allowed[id >> 5] >> (id & 31)) & 1u)) row[id] = -INFINITY;
+    }
+    return e->left > 0;
 }
 
 /* What taking a token needs, for take_token. */
@@ -867,9 +929,14 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
     }
     memcpy(api->model_id, model_id, n);
     api->prefix_cache = true;
+    api->mask_cache = true;
     /* The cache starts empty, and api->cached says so. */
     vitna_llama_reset(model);
     return api;
+}
+
+void vitna_api_set_mask_cache(vitna_api_t* api, bool on) {
+    api->mask_cache = on;
 }
 
 void vitna_api_set_prefix_cache(vitna_api_t* api, bool on) {
@@ -902,6 +969,7 @@ void vitna_api_free(vitna_api_t* api) {
     if (!api) return;
     vitna_sampler_free(&api->sampler);
     vitna_token_list_free(&api->cached);
+    for (size_t i = 0; i < MASK_CACHE; i++) free(api->masks[i].allowed);
     free(api->rows);
     free(api->pass);
     free(api->row);

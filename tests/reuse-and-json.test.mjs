@@ -44,8 +44,11 @@ const onDevice = DEVICE ? ["--device", DEVICE] : [];
 
 const servers = {};
 
-function start(args) {
-  const child = spawn(engine, ["serve", "--model", modelDir, "--port", "0", "--ctx", "1024", ...onDevice, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+function start(args, env = {}) {
+  const child = spawn(engine, ["serve", "--model", modelDir, "--port", "0", "--ctx", "1024", ...onDevice, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...env },
+  });
   return new Promise((resolve, reject) => {
     let out = "";
     const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}`)), 30_000);
@@ -66,6 +69,9 @@ before(async () => {
   assert.ok(!missing, missing ?? "");
   servers.reuse = await start([]);
   servers.fresh = await start(["--no-prefix-cache"]);
+  // JSON mode keeps the mask it finds for each state of the object; this one
+  // finds every mask anew (VITNA_TEST_NO_MASK_CACHE), to compare against.
+  servers.anew = await start([], { VITNA_TEST_NO_MASK_CACHE: "1" });
 });
 
 after(() => {
@@ -203,4 +209,39 @@ test("JSON mode streams the same object, and a schema is refused rather than ign
   });
   assert.equal(schema.status, 400);
   assert.equal(schema.json.error.param, "response_format");
+});
+
+test("JSON mode's kept masks change no reply: the same as a server that finds every mask anew", A6, async (t) => {
+  const J = { type: "json_object" };
+  const bodies = [
+    ...fixture.prompts.map((p) => ["/v1/completions", { prompt: p.text, max_tokens: 120, temperature: 0, response_format: J }]),
+    ["/v1/chat/completions", { messages: [{ role: "user", content: "Give me a JSON object describing a cat." }], response_format: J, max_tokens: 160, temperature: 0.8, seed: 4 }],
+    ["/v1/chat/completions", { messages: [{ role: "user", content: "List three cities as a JSON object." }], response_format: J, max_tokens: 160, temperature: 0 }],
+    ["/v1/completions", { prompt: "Data:", max_tokens: 80, temperature: 0, response_format: J, stream: true }],
+  ];
+  // What a reply says, leaving out what the two servers' histories make
+  // differ (the id, the time, and how much of the prompt each could reuse).
+  const said = (text) => {
+    if (text.startsWith("data: ")) {
+      return text.split("\n\n").filter((e) => e.startsWith("data: {")).map((e) => {
+        const c = JSON.parse(e.slice(6)).choices[0];
+        return `${c.text ?? ""}|${c.finish_reason}`;
+      }).join("\n");
+    }
+    const o = JSON.parse(text);
+    const c = o.choices[0];
+    return JSON.stringify([c.text ?? c.message.content, c.finish_reason, o.usage.prompt_tokens, o.usage.completion_tokens]);
+  };
+  let n = 0;
+  for (const [path, body] of bodies) {
+    // Twice: the second time, the kept masks answer for states met before.
+    for (let round = 0; round < 2; round++) {
+      const kept = await fetch(servers.reuse.base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const anew = await fetch(servers.anew.base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      assert.equal(kept.status, anew.status);
+      assert.equal(said(await kept.text()), said(await anew.text()), `${path} ${JSON.stringify(body).slice(0, 60)}, round ${round}`);
+      n++;
+    }
+  }
+  t.diagnostic(`${n} JSON-mode replies the same with masks kept and found anew`);
 });
