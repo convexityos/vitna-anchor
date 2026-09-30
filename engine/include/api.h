@@ -74,6 +74,13 @@ void vitna_api_set_prefix_cache(vitna_api_t* api, bool on);
 bool vitna_api_set_speculate(vitna_api_t* api, size_t k);
 
 /**
+ * For tests: whether JSON mode keeps each state's mask for when the state
+ * comes round again (on by default). Off, every mask is found anew; the
+ * responses must be the same either way.
+ */
+void vitna_api_set_mask_cache(vitna_api_t* api, bool on);
+
+/**
  * Drafts for speculative decoding, by prompt lookup: the tokens that followed
  * the latest earlier place in the text where its last three, or two, tokens
  * occur. A match of one token drafts nothing, and after a pass takes none of
