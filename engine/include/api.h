@@ -62,6 +62,40 @@ void vitna_api_free(vitna_api_t* api);
 void vitna_api_set_prefix_cache(vitna_api_t* api, bool on);
 
 /**
+ * Whether a request drafts tokens and checks them several at a time (off by
+ * default): up to k drafted after each token taken, by vitna_drafter_t, and
+ * checked with vitna_llama_steps_exact, which gives every position the logits
+ * a step there would. Each token is still chosen from those logits in turn,
+ * with the JSON mask, the stop sequences and the sampler exactly as without
+ * it, and the cache left as it would be, so no response changes, usage
+ * included. On a GPU k is at most vitna_llama_exact_max - 1. Returns false if
+ * it could not allocate for k, and leaves it off.
+ */
+bool vitna_api_set_speculate(vitna_api_t* api, size_t k);
+
+/**
+ * Drafts for speculative decoding, by prompt lookup: the tokens that followed
+ * the latest earlier place in the text where its last three, or two, tokens
+ * occur. A match of one token drafts nothing, and after a pass takes none of
+ * its drafts none are made for 1 token, then 2, doubling to 16, and back to 1
+ * once a pass takes one: both chosen by measurement, as drafts refused cost a
+ * pass that gains nothing. generate --speculate and the API draft the same way.
+ */
+typedef struct {
+    size_t k;       /* the most drafts at once */
+    size_t skip;    /* tokens still to go without drafting */
+    size_t backoff; /* the next pause */
+} vitna_drafter_t;
+
+void vitna_drafter_init(vitna_drafter_t* d, size_t k);
+
+/** Up to d->k drafts to follow text[len - 1], into out; 0 while pausing or with nothing found. */
+size_t vitna_drafter_draft(vitna_drafter_t* d, const int32_t* text, size_t len, int32_t* out);
+
+/** After a pass: how many of its drafts were taken. */
+void vitna_drafter_taken(vitna_drafter_t* d, size_t taken);
+
+/**
  * Answer one request with a complete HTTP response through sink. api may be
  * NULL, for a server started without a model: health and the model list say
  * so, and generation answers 501.

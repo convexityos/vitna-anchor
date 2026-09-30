@@ -34,6 +34,7 @@ static void print_usage(const char* prog) {
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
+    printf("               [--speculate <k>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
@@ -52,7 +53,8 @@ static void print_usage(const char* prog) {
     printf("          per line from stdin and prints one array per line\n");
     printf("serve     serves the model over an OpenAI-compatible HTTP API at /v1, on 127.0.0.1:8765 unless told\n");
     printf("          otherwise, under the model directory's name unless --model-id says another. Without\n");
-    printf("          --model its generation endpoints answer 501\n");
+    printf("          --model its generation endpoints answer 501. --speculate k drafts and checks tokens as\n");
+    printf("          generate --speculate does; no response changes\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
 }
@@ -304,30 +306,6 @@ static int cmd_logits(const args_t* a) {
     return rc;
 }
 
-/* Prefill the prompt, then choose max_new tokens one at a time. Calls
- * on_token after each, and writes each step's logits to logits_out. */
-/* Drafts for speculative decoding, by prompt lookup: the latest earlier place
- * in ctx where its last n tokens occur (n = 3, then 2), and up to k of the
- * tokens that followed them there, into out. Returns how many. A match of one
- * token drafts nothing: measured, its drafts were taken too seldom to pay for
- * the pass that checks them. */
-static size_t draft_by_lookup(const int32_t* ctx, size_t len, size_t k, int32_t* out) {
-    for (size_t n = 3; n >= 2; n--) {
-        if (len <= n) continue;
-        const int32_t* key = ctx + len - n;
-        for (size_t i = len - n; i-- > 0;) {
-            if (memcmp(ctx + i, key, n * sizeof(int32_t)) != 0) continue;
-            size_t d = 0;
-            while (d < k && i + n + d < len) {
-                out[d] = ctx[i + n + d];
-                d++;
-            }
-            if (d > 0) return d;
-        }
-    }
-    return 0;
-}
-
 /* One new token from a row of logits, as generate takes every one: the row
  * to --logits-out, the choice, the list, the callback. Returns 1 to go on, 0
  * to stop (a special token under --stop-at-special), -1 on an error. */
@@ -344,6 +322,8 @@ static int take_token(const args_t* a, const vitna_tokenizer_t* tok, vitna_sampl
     return a->stop_at_special && tok && vitna_tokenizer_is_special(tok, next) ? 0 : 1;
 }
 
+/* Prefill the prompt, then choose max_new tokens one at a time. Calls
+ * on_token after each, and writes each step's logits to logits_out. */
 static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* tok, const vitna_token_list_t* prompt,
                     vitna_token_list_t* out, FILE* logits_out, void (*on_token)(const vitna_tokenizer_t*, int32_t)) {
     const size_t V = m->cfg.vocab;
@@ -372,10 +352,8 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         text_len = prompt->count;
     }
     size_t passes = 0, drafted = 0, accepted = 0; /* for --timing */
-    /* After a pass that took none of its drafts, the next skip tokens are
-     * not drafted for, the pause doubling each time that happens again, up to
-     * 16, and starting over from 1 once a pass takes one. */
-    size_t skip = 0, backoff = 1;
+    vitna_drafter_t drafter; /* drafts as the API does (vitna_drafter_t) */
+    vitna_drafter_init(&drafter, k);
     int rc = 0;
     const double t_prompt = vitna_time_ms();
     const size_t ran = vitna_llama_steps(m, prompt->ids, prompt->count, row, 1);
@@ -400,10 +378,8 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
      * same with or without drafts. */
     while (go > 0 && out->count < a->max_new) {
         size_t d = 0;
-        if (k && skip) {
-            skip--;
-        } else if (k) {
-            d = draft_by_lookup(text, text_len, k, pass + 1);
+        if (k) {
+            d = vitna_drafter_draft(&drafter, text, text_len, pass + 1);
             const size_t left = a->max_new - out->count; /* choices still to take, 1 or more */
             if (d > left - 1) d = left - 1;
             if (m->n_past + d + 1 > m->ctx) d = m->n_past + 1 < m->ctx ? m->ctx - m->n_past - 1 : 0;
@@ -442,12 +418,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
                 accepted++;
                 continue;
             }
-            if (i == 0) {
-                skip = backoff;
-                backoff = backoff < 16 ? 2 * backoff : 16;
-            } else {
-                backoff = 1;
-            }
+            vitna_drafter_taken(&drafter, i);
             vitna_llama_truncate(m, start + i + 1);
             t = u;
             break;
@@ -684,6 +655,7 @@ static int cmd_serve(const args_t* a) {
         fprintf(stderr, "out of memory\n");
     } else {
         vitna_api_set_prefix_cache(api, !a->no_prefix_cache);
+        if (a->speculate && !vitna_api_set_speculate(api, a->speculate)) fprintf(stderr, "out of memory for --speculate; serving without it\n");
         char device[400];
         printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;
