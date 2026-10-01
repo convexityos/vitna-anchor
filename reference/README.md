@@ -1,6 +1,8 @@
-# The reference (gate A1)
+# The reference (gates A1 and A5)
 
 Gate A2 asks whether the engine computes what the model computes. This directory is the answer key. It pins one model, holds token ids and logits recorded from a pinned reference implementation, and says how close the engine has to come.
+
+Gate A5 needs a second answer key, for a mixture of experts. It is [below](#a-mixture-of-experts-gate-a5), and follows A1's in everything but what a mixture of experts adds.
 
 ## The model
 
@@ -59,3 +61,68 @@ Set here in A1, before the engine could produce a single logit, and written in [
 Why 1e-2: the reference and the engine's float path both compute in float32. Summing in a different order, or rounding exp and sin differently, moves a logit by far less than 1e-2. A real defect, such as the wrong rotary convention, a missing norm, or a position off by one, moves logits by 0.1 or more and usually changes the argmax too. The smallest top-1 margin in any greedy step is 0.0085 (prompt `numbers`, step 17), so a pass there means the engine and the reference agree on a close call.
 
 `tests/reference.test.mjs` checks that the fixture matches its pin, inputs and recorder, that the comparison accepts the reference's own logits and rejects wrong ones, and then compares the engine. The engine comparisons are `todo` until A2.
+
+## A mixture of experts (gate A5)
+
+Gate A5 streams a mixture-of-experts checkpoint from a drive. The engine has to compute such a model correctly before it is worth making it fast, so A5 starts as A1 did: one model pinned, and a recording to hold the engine to. The engine does not run this model yet.
+
+### The model
+
+[OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), Apache-2.0, pinned in [`olmoe-1b-7b/model.json`](olmoe-1b-7b/model.json) at revision `6d84c48581ece794365f2b8e9cfb043c68ade9c5`, with the size and SHA-256 of each of its nine files. It has 6.9B parameters in 16 layers. Each layer has 64 experts, SwiGLU MLPs 1,024 wide, and a router that sends each token through 8 of them, so about 1.3B parameters act on any one token and 93% of the weights are in the experts. The rest is close to SmolLM2's Llama architecture, with four differences the engine will need:
+
+- 16 key-value heads for 16 query heads: no grouping.
+- RMSNorm over the query and key projections, each across all 2,048 values before they are split into heads, with weights of its own.
+- The router: a softmax over the 64 experts' logits, whose 8 largest weights are used as they are, not renormalized to sum to 1.
+- An output layer of its own, not tied to the embeddings, with 50,304 rows for the tokenizer's 50,280 ids.
+
+The tokenizer is GPT-NeoX's byte-level BPE, after NFC normalization, with added tokens matched before anything else: runs of 2 to 24 spaces, three placeholders (`|||IP_ADDRESS|||`, `|||EMAIL_ADDRESS|||`, `|||PHONE_NUMBER|||`), `<|padding|>` and `<|endoftext|>`.
+
+The weights are 13.8 GB in bfloat16, in three files. That is more than the 8 GB GPU that passed A4 holds, which is why A5 streams them. They are downloaded, never committed:
+
+```bash
+node scripts/fetch-model.mjs olmoe-1b-7b           # into models/olmoe-1b-7b, each file checked against the pin
+node scripts/fetch-model.mjs olmoe-1b-7b --check   # check what is there, download nothing
+```
+
+### The recording
+
+[`record_moe.py`](record_moe.py) records it as `record.py` records SmolLM2, with the same pinned software, the same settings and the same fields, into [`olmoe-1b-7b/fixture.json`](olmoe-1b-7b/fixture.json) (3.3 MB). The inputs, in [`olmoe-1b-7b/prompts.json`](olmoe-1b-7b/prompts.json), are A1's 6 prompts and 42 corpus strings, and 12 more strings for this tokenizer's added tokens and NFC. For this model transformers runs the model's own `tokenizer.json`, so the two sets of ids agree on every string and `tokenizer_disagreements` is empty. Three things are new:
+
+- **The routing.** For every layer of every prompt position, and of every token greedy decoding feeds back: the 8 experts the router chose, in its order, then the one that came closest; the router logits of those 9; and the logsumexp of all 64, which gives each chosen expert's weight as exp(logit - logsumexp).
+- **The experts' implementation.** They run as transformers' eager implementation, one expert at a time, selected explicitly as eager attention is. Left to itself, transformers 5.17 picks a grouped matrix multiply where torch provides one.
+- **Two checks on loading.** transformers fills any weight it cannot find with random numbers and only warns, so recording stops unless its loading report is empty. It also stacks each layer's experts into two tensors as it loads, and that report leaves conversion errors out, so all 3,219 tensors in the checkpoint are then compared with the model's copies, each expert's three matrices found in the stacks.
+
+`record_moe.py` imports its helpers and its pinned versions from `record.py` rather than changing it: A1's fixture pins `record.py`'s hash. This fixture pins the hashes of both.
+
+The committed fixture was recorded on 2026-10-01 on an AMD Ryzen 7 3700X (Windows 11, x86-64) with Python 3.12.10. Recording took 386 to 590 s there in three runs, on one thread. The model takes 27.7 GB in float32, and the recorder's memory peaked near 36 GB while loading it. The [Reference workflow](../.github/workflows/reference.yml) does not record this one again, since GitHub's standard runners have far less memory than that. `--check` is run by hand:
+
+```bash
+python reference/record_moe.py           # write the fixture
+python reference/record_moe.py --check   # record into memory and compare with the committed fixture
+```
+
+On the machine that recorded it, `--check` reproduces it bit for bit, routing included.
+
+### Routing near-ties
+
+A token goes through the 8 experts its router scores highest, so two scores that nearly tie can trade places when the engine adds the same sums in another order. The fixture holds 6,848 routing decisions. In 85 of them the 8th and 9th router logits are within 1e-3 of each other, in 9 within 1e-4, and in 2 within 1e-5: 5.45e-6 (prompt `unicode`, greedy token 26, layer 2) and 6.62e-6 (`code`, greedy token 10, layer 5).
+
+Such a decision going the other way is no rounding error downstream. Each prompt's closest call at a prompt position (margins from 8.8e-5 to 6.9e-4) was forced the other way, everything else as recorded, and the logits after it moved by 0.019 to 0.39: past the 1e-2 tolerance every time. So the engine's routing is compared on its own, against a band of its own (below), and the plan for step 2 is to compare the engine's logits with its routing pinned to the fixture's, so that a near-tie it decides the other way cannot fail the comparison of everything after it.
+
+### The tolerance
+
+A1's table applies to this fixture unchanged, at this model's 50,304 logits a row. [`compare.mjs`](compare.mjs) adds one rule, set here before the engine could route a single token:
+
+| What | Must hold |
+|---|---|
+| Routing | At every layer of every position, prompt and greedy alike: the router logits of the 9 experts the fixture keeps are within 1e-3 of the reference's, and the token goes through the reference's 8 experts, except that one whose router logit the reference puts within 2e-3 of the runner-up's may give way to the runner-up |
+
+Why 1e-3: the reference was run in two other valid float32 orders, once with the greedy tokens batched into one pass rather than fed one at a time, and once more like that on eight threads with PyTorch's SDPA attention. Its router logits moved by at most 1.05e-5 and its logits by at most 2.96e-5, and not one routing decision changed, the 5.45e-6 near-tie included. So the band is about a hundred times what reordering does, and a tenth of the logits' 1e-2 for router logits that are small: those the fixture keeps have a median magnitude of 0.42, and none exceeds 5.7. A band of 2e-2 would leave 1,416 of the 6,848 decisions free to go either way; 2e-3 leaves 159.
+
+Both measurements, the forced calls and the two orders, come from one command, run on the machine that recorded the fixture:
+
+```bash
+python reference/routing_sensitivity.py
+```
+
+`tests/reference-moe.test.mjs` checks that this fixture matches its pin, inputs and both recorders, that its routing is complete and consistent, that the comparisons accept the reference's own logits and routing and reject wrong ones, and that the runner-up may stand in at the fixture's closest call, for one expert only, and not at a wide one. The engine comparisons are `todo` until step 2.
