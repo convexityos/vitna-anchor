@@ -50,7 +50,11 @@ before(async () => {
   const stderr = keepStderr(child);
   base = await new Promise((resolve, reject) => {
     let out = "";
-    const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}${stderr.text}`)), 30_000);
+    // A server given up on is killed: left running, it would keep this file's process alive.
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`the server did not start: ${out}${stderr.text}`));
+    }, 30_000);
     child.stdout.on("data", (chunk) => {
       out += chunk;
       const m = out.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/);
@@ -94,8 +98,9 @@ function events(text) {
 }
 
 function tokenCount(text) {
-  const r = spawnSync(engine, ["tokenize", "--model", modelDir], { input: JSON.stringify(text) + "\n", encoding: "utf8" });
-  assert.equal(r.status, 0, r.stderr);
+  // It takes well under a second; one that has not finished in 2 minutes never will, and is killed.
+  const r = spawnSync(engine, ["tokenize", "--model", modelDir], { input: JSON.stringify(text) + "\n", encoding: "utf8", timeout: 2 * 60_000 });
+  assert.equal(r.status, 0, r.error?.code === "ETIMEDOUT" ? `tokenize timed out after 2 minutes and was killed: ${r.stderr}` : r.stderr);
   return JSON.parse(r.stdout.trim()).length;
 }
 
