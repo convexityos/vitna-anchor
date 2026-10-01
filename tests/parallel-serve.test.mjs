@@ -61,7 +61,11 @@ function start(args, env = {}) {
   child.stderr.on("data", (chunk) => (server.stderr += chunk));
   keepStderr(child, env);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`the server did not start: ${server.stdout}${server.stderr}`)), 30_000);
+    // A server given up on is killed: left running, it would keep this file's process alive.
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`the server did not start: ${server.stdout}${server.stderr}`));
+    }, 30_000);
     child.stdout.on("data", (chunk) => {
       server.stdout += chunk;
       const m = server.stdout.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/);
