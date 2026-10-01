@@ -20,9 +20,16 @@ const kept = [];
 /** The report keeps the end of what a server printed, at most this much. */
 const MOST = 4000;
 
-/** When the running test began: how much each server had printed, and which had exited. */
-let from = new Map();
-let gone = new Set();
+/** When the running test began: how much each server had printed, and which had exited. Null until a test begins. */
+let from = null;
+let gone = null;
+
+/**
+ * The errors given a report. When a before hook fails, every test of the file
+ * fails with the hook's one error, and none of them begins: that error takes
+ * one report, of what each server has printed since it started.
+ */
+const reported = new WeakSet();
 
 /**
  * Keeps what a spawned server prints on stderr, and how it exits. The report
@@ -53,7 +60,8 @@ beforeEach(() => {
 afterEach(async (t) => {
   if (t.passed !== false) return;
   const err = t.error?.cause instanceof Error ? t.error.cause : t.error;
-  if (!(err instanceof Error)) return;
+  if (!(err instanceof Error) || reported.has(err)) return;
+  reported.add(err);
   await settle();
   // Read the stack before the message changes: V8 writes it out on first read, with the message as it is then.
   const stack = err.stack;
@@ -74,17 +82,20 @@ async function settle() {
   }
 }
 
-/** What each server running when the test began, or started since, has printed since then. */
+/**
+ * What each server running when the test began, or started since, has printed
+ * since then; before any test has begun, what every server has printed.
+ */
 function stderrReport() {
   const lines = [];
   for (const s of kept) {
-    if (gone.has(s)) continue;
-    let text = s.text.slice(from.get(s) ?? 0);
+    if (gone?.has(s)) continue;
+    let text = s.text.slice(from?.get(s) ?? 0);
     const cut = text.length - MOST;
     if (cut > 0) text = `(${cut} earlier characters left out)\n` + text.slice(cut);
     lines.push(`  ${s.name}${s.exited === null ? "" : `, which has exited (${s.exited})`}:`);
     lines.push(text.trim() ? text.trimEnd().split(/\r?\n/).map((l) => `    ${l}`).join("\n") : "    nothing");
   }
-  if (lines.length === 0) return "\n\nNo server was running while this test ran.";
-  return `\n\nWhat the servers printed on stderr while this test ran:\n${lines.join("\n")}`;
+  if (lines.length === 0) return from ? "\n\nNo server was running while this test ran." : "\n\nNo server had been started.";
+  return `\n\nWhat the servers printed on stderr ${from ? "while this test ran" : "since they started"}:\n${lines.join("\n")}`;
 }
