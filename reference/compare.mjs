@@ -41,15 +41,16 @@
 //
 // Why a band: a token goes through the 8 experts its router scores highest,
 // so two scores that nearly tie can trade places when the same sums are
-// added in another order, and everything after then moves by the weight of
-// a whole expert: by 0.019 to 0.39 when each prompt's closest call was
-// forced the other way. Why 1e-3: run in two other float32 orders, OLMoE's
-// reference moved its router logits by at most 1.05e-5 and changed no
-// routing decision, so the band is about a hundred times that, and a tenth
-// of LOGIT_ATOL for logits that are small (those the fixture keeps have a
-// median magnitude of 0.42, and none exceeds 5.7). A band of 2e-2 would
-// leave 1,416 of the fixture's 6,848 routing decisions free to go either
-// way; 2e-3 leaves 159. The measurements come from
+// added in another order, and everything after then moves by far more than
+// rounding: by 0.011 to 0.21 when each prompt's closest call was forced the
+// other way with every other decision held, and by up to 0.39 when the
+// others were left to the router. Why 1e-3: run in two other float32
+// orders, OLMoE's reference moved its router logits by at most 1.05e-5 and
+// changed no routing decision, so the band is about a hundred times that,
+// and a tenth of LOGIT_ATOL for logits that are small (those the fixture
+// keeps have a median magnitude of 0.42, and none exceeds 5.7). A band of
+// 2e-2 would leave 1,416 of the fixture's 6,848 routing decisions free to go
+// either way; 2e-3 leaves 159. The measurements come from
 // reference/routing_sensitivity.py.
 
 import { readFileSync } from "node:fs";

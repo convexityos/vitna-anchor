@@ -107,7 +107,7 @@ On the machine that recorded it, `--check` reproduces it bit for bit, routing in
 
 A token goes through the 8 experts its router scores highest, so two scores that nearly tie can trade places when the engine adds the same sums in another order. The fixture holds 6,848 routing decisions. In 85 of them the 8th and 9th router logits are within 1e-3 of each other, in 9 within 1e-4, and in 2 within 1e-5: 5.45e-6 (prompt `unicode`, greedy token 26, layer 2) and 6.62e-6 (`code`, greedy token 10, layer 5).
 
-Such a decision going the other way is no rounding error downstream. Each prompt's closest call at a prompt position (margins from 8.8e-5 to 6.9e-4) was forced the other way, everything else as recorded, and the logits after it moved by 0.019 to 0.39: past the 1e-2 tolerance every time. So the engine's routing is compared on its own, against a band of its own (below), and the plan for step 2 is to compare the engine's logits with its routing pinned to the fixture's, so that a near-tie it decides the other way cannot fail the comparison of everything after it.
+Such a decision going the other way is no rounding error downstream. Each prompt's closest call at a prompt position (margins from 8.8e-5 to 6.9e-4) was forced the other way. With every other decision held to the reference's, the logits after it moved by 0.011 to 0.21. With the others left to the router, which in four of the six prompts then decided some of them differently as well, they moved by 0.019 to 0.39. Either way, past the 1e-2 tolerance every time. So the engine's routing is compared on its own, against a band of its own (below), and the plan for step 2 is to compare the engine's logits with its routing pinned to the fixture's, so that a near-tie it decides the other way cannot fail the comparison of everything after it.
 
 ### The tolerance
 
@@ -119,7 +119,7 @@ A1's table applies to this fixture unchanged, at this model's 50,304 logits a ro
 
 Why 1e-3: the reference was run in two other valid float32 orders, once with the greedy tokens batched into one pass rather than fed one at a time, and once more like that on eight threads with PyTorch's SDPA attention. Its router logits moved by at most 1.05e-5 and its logits by at most 2.96e-5, and not one routing decision changed, the 5.45e-6 near-tie included. So the band is about a hundred times what reordering does, and a tenth of the logits' 1e-2 for router logits that are small: those the fixture keeps have a median magnitude of 0.42, and none exceeds 5.7. A band of 2e-2 would leave 1,416 of the 6,848 decisions free to go either way; 2e-3 leaves 159.
 
-Both measurements, the forced calls and the two orders, come from one command, run on the machine that recorded the fixture:
+Both measurements, the forced calls both ways and the two orders, come from one command, run on the machine that recorded the fixture:
 
 ```bash
 python reference/routing_sensitivity.py

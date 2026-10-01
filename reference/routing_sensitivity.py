@@ -7,9 +7,12 @@ which reference/README.md quotes:
 
 1. Forced. Each prompt's closest routing decision at a prompt position is
    decided the other way, its 8th expert replaced by the runner-up at the
-   runner-up's own weight, everything else as recorded. Printed: the largest
-   change in the logits the fixture keeps, at any position, and whether any
-   position's argmax changed.
+   runner-up's own weight, twice: once with every other decision left to
+   the router, which may then decide some of them differently too, and once
+   with every other decision held to the fixture's experts, each weighted as
+   the router weighs it, as the engine's --experts-in holds them. Printed for
+   each: the largest change in the logits the fixture keeps, at any
+   position, and whether any position's argmax changed.
 2. Reordered. Each prompt and its greedy tokens, all but the last, go through
    the model in one pass, which batches positions the recording fed one at a
    time: first on one thread with eager attention, as recorded, then on eight
@@ -85,14 +88,30 @@ def main() -> int:
             weights[t, slot] = torch.softmax(router_logits[t].float(), dim=-1)[add].to(weights.dtype)
             return router_logits, weights, chosen
 
-        hook = routers[layer].register_forward_hook(swap)
-        try:
-            logits = model(torch.tensor([p["ids"]])).logits[0].numpy()
-        finally:
-            hook.remove()
-        worst, moved = kept(p, logits)
-        print(f"  {p['id']:8s} position {t:3d} layer {layer:2d}, margin {margin:.2e}: "
-              f"kept logits moved by up to {worst:.3e}; argmax changed at {moved or 'no position'}", flush=True)
+        def hold(l, p=p, t=t, layer=layer, add=add):
+            def hook(module, inputs, output):
+                router_logits, weights, chosen = output
+                pinned = torch.tensor([r["experts"][l][:k] for r in p["routing"]], dtype=chosen.dtype)
+                if l == layer:
+                    pinned[t, k - 1] = add  # in place of drop, the 8th of the fixture's order
+                weights = torch.gather(torch.softmax(router_logits.float(), dim=-1), 1, pinned).to(weights.dtype)
+                return router_logits, weights, pinned
+            return hook
+
+        results = []
+        for others, hooks in (
+            ("left to the router", lambda: [routers[layer].register_forward_hook(swap)]),
+            ("held", lambda: [r.register_forward_hook(hold(l)) for l, r in enumerate(routers)]),
+        ):
+            hs = hooks()
+            try:
+                logits = model(torch.tensor([p["ids"]])).logits[0].numpy()
+            finally:
+                for h in hs:
+                    h.remove()
+            worst, moved = kept(p, logits)
+            results.append(f"the others {others}, kept logits moved by up to {worst:.3e} (argmax changed at {moved or 'no position'})")
+        print(f"  {p['id']:8s} position {t:3d} layer {layer:2d}, margin {margin:.2e}: " + "; ".join(results), flush=True)
 
     captured = []
     hooks = [r.register_forward_hook(lambda m, i, out: captured.append((out[0].numpy().copy(), out[2].numpy().copy())))
