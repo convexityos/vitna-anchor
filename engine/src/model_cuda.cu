@@ -1649,6 +1649,19 @@ void vitna_cuda_wait(struct vitna_cuda_model* g) {
     if (g->stream) cudaStreamSynchronize(g->stream);
 }
 
+bool vitna_cuda_lost(struct vitna_cuda_model* g, char* err, size_t err_len) {
+    /* An error that is not sticky, as a launch refused for its shape, ends
+     * here. cudaGetLastError cannot tell the two apart itself: after an
+     * illegal address it answers cudaSuccess the second time it is asked,
+     * while every launch, copy and wait still fails. */
+    cudaGetLastError();
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+    if (e == cudaSuccess) return false;
+    fail(err, err_len, "%s (%s)", cudaGetErrorString(e), cudaGetErrorName(e));
+    return true;
+}
+
 /* Whether the GPU kernels can take the model: every matrix in the dtype of
  * the embedding, and widths the 16-byte reads divide. */
 static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {

@@ -82,9 +82,19 @@ typedef struct {
      * with its own key-value cache there, and k_cache and v_cache go unused. */
     struct vitna_cuda_model* cuda;
 
+    /* Set when a step on the GPU fails with an error CUDA calls sticky (an
+     * illegal address, a kernel that faulted, and others), after which the
+     * device can run nothing more in this process: every later step fails
+     * without asking it, and only a new process can use it again.
+     * device_error says what the error was. */
+    bool device_lost;
+    char device_error[160];
+
     /* For tests, set by vitna_llama_fail_step_once: while fail_armed, the
-     * step at position fail_at, in any sequence, fails. */
+     * step at position fail_at, in any sequence, fails, and with fail_loses
+     * the device with it. */
     bool fail_armed;
+    bool fail_loses;
     size_t fail_at;
 } vitna_llama_t;
 
@@ -114,9 +124,10 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t seq, size_t n);
  * keys and values to that sequence's cache. Writes vocab logits to logits
  * unless it is NULL, which skips the output projection. Returns false if the
  * sequence's cache is full or the token is out of range, or, on a GPU, if
- * the device reports an error, which is then printed to stderr, or when a
- * test asked for this step to fail (vitna_llama_fail_step_once). A step that
- * returns false leaves m->past[seq] where it was.
+ * the device reports an error, which is then printed to stderr, or once the
+ * device is lost (device_lost), or when a test asked for this step to fail
+ * (vitna_llama_fail_step_once). A step that returns false leaves
+ * m->past[seq] where it was.
  */
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits);
 
@@ -197,9 +208,11 @@ size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
  * That step returns false before computing anything, on either device, and
  * says so on stderr. On a GPU it first lets what earlier steps queued there
  * run to its end, so nothing of the model's is left running when the failure
- * is reported, as after a device error. A later step at pos runs as usual.
+ * is reported, as after a device error. A later step at pos runs as usual,
+ * unless lose_device: then the step fails as one does on a GPU whose error
+ * CUDA calls sticky, and the device is lost with it (device_lost).
  */
-void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos);
+void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos, bool lose_device);
 
 /** True when this engine was built with the CUDA path (VITNA_CUDA). */
 bool vitna_llama_cuda_built(void);

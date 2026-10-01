@@ -11,6 +11,13 @@
 // makes the step at that position fail once, before it computes anything.
 // Everything else is the server as it serves.
 //
+// Some errors on a GPU leave it able to run nothing more in the process (CUDA
+// calls them sticky: an illegal address, a kernel that faulted), and then the
+// server answers every request still open with an error and exits with
+// status 75, for whatever started it to start it again. With
+// VITNA_TEST_LOSE_DEVICE=1 as well, the failed step loses the device in that
+// way, so the last tests here check that too, on either device.
+//
 // Needs a built engine and the model files (node scripts/fetch-model.mjs).
 // Without them these tests are skipped, with the reason, unless
 // VITNA_REQUIRE_REFERENCE=1 (as in CI), where they fail. VITNA_DEVICE=cuda
@@ -21,6 +28,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,16 +66,21 @@ const STEP_FAILED = {
   code: null,
 };
 
-/** A server whose step at position failAt fails once. */
-async function start(failAt) {
+/**
+ * A server whose step at position failAt fails once, and loses the device
+ * with it when lose is set; parallel is how many requests it runs at once.
+ */
+async function start(failAt, { lose = false, parallel = 1 } = {}) {
   assert.ok(!missing, missing ?? "");
-  const child = spawn(engine, ["serve", "--model", modelDir, "--model-id", MODEL, "--port", "0", "--ctx", "1024", ...onDevice], {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, VITNA_TEST_FAIL_STEP: String(failAt) },
-  });
+  const env = { VITNA_TEST_FAIL_STEP: String(failAt), ...(lose ? { VITNA_TEST_LOSE_DEVICE: "1" } : {}) };
+  const args = ["serve", "--model", modelDir, "--model-id", MODEL, "--port", "0", "--ctx", "1024", ...onDevice];
+  if (parallel > 1) args.push("--parallel", String(parallel));
+  const child = spawn(engine, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
   const server = { child, base: null, stderr: "" };
   child.stderr.on("data", (chunk) => (server.stderr += chunk));
-  keepStderr(child, { VITNA_TEST_FAIL_STEP: failAt });
+  keepStderr(child, env);
+  // The status it exits with, once its stderr has all been read.
+  server.closed = new Promise((resolve) => child.on("close", (code) => resolve(code)));
   server.base = await new Promise((resolve, reject) => {
     let out = "";
     // A server given up on is killed: left running, it would keep this file's process alive.
@@ -89,13 +102,59 @@ async function start(failAt) {
   return server;
 }
 
-async function withServer(failAt, fn) {
-  const server = await start(failAt);
+async function withServer(failAt, fn, options) {
+  const server = await start(failAt, options);
   try {
     await fn(server);
   } finally {
     server.child.kill();
   }
+}
+
+/**
+ * What promise settles to, or an error naming what if it takes longer than
+ * ms: a server that never answers fails the test rather than holding it up.
+ */
+async function within(promise, ms, what) {
+  let timer;
+  const late = new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`${what}: nothing within ${ms / 1000} s`)), ms)));
+  try {
+    return await Promise.race([promise, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The status the server's process exited with, once it has. */
+const exitStatus = (server) => within(server.closed, 10_000, "the server's exit");
+
+/**
+ * A request whose response is read as it comes: started settles once its
+ * status line arrives (for a stream, once the request has its sequence),
+ * done once the whole response has.
+ */
+function send(server, path, body) {
+  let begun, refused;
+  const started = new Promise((resolve, reject) => ((begun = resolve), (refused = reject)));
+  const done = new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const url = new URL(server.base + path);
+    const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(payload) };
+    const req = httpRequest({ hostname: url.hostname, port: url.port, path: url.pathname, method: "POST", headers }, (res) => {
+      begun();
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => (text += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, text }));
+    });
+    req.on("error", (e) => {
+      refused(e);
+      reject(e);
+    });
+    req.end(payload);
+  });
+  started.catch(() => {}); // a test that waits only for done hears of the error there
+  return { started, done };
 }
 
 async function post(server, path, body) {
@@ -221,3 +280,76 @@ test("a chat stream whose step fails before the first token sends its role, then
     assert.deepEqual(ev[0].choices[0].delta, { role: "assistant", content: "" });
     assert.deepEqual(ev[1], { error: STEP_FAILED });
   }));
+
+/** What a request is refused with once the step at position lost the device. */
+function deviceLost(position) {
+  return {
+    message:
+      `The GPU can run nothing more in this process after this error: the step at position ${position} failed, and the device with it, as a test asked. ` +
+      "The server is stopping; start it again to use the GPU.",
+    type: "server_error",
+    param: null,
+    code: "device_lost",
+  };
+}
+
+test("a step that loses the device is a 500, then the server exits with status 75 and takes no more connections", A3, () =>
+  withServer(
+    5,
+    async (server) => {
+      const failed = await within(post(server, "/v1/completions", { model: MODEL, prompt: science.ids, max_tokens: 4, temperature: 0 }), 60_000, "the request");
+      assert.equal(failed.status, 500, failed.text);
+      assert.deepEqual(failed.json, { error: STEP_FAILED }, "the request that was running gets the error a failed step gives");
+      assert.equal(await exitStatus(server), 75);
+      assert.match(
+        server.stderr,
+        new RegExp(
+          [
+            "VITNA_TEST_LOSE_DEVICE is set, for a test: the device is lost with that step\\.",
+            "The step at position 5 failed, and the device with it, as a test asked\\.",
+            "The GPU can run nothing more in this process after this error: the step at position 5 failed, and the device with it, as a test asked\\. " +
+              "Each request still open is answered with an error, and the server stops: start it again to use the GPU\\.",
+            "POST /v1/completions 500 ",
+          ].join("\\r?\\n"),
+        ),
+      );
+      await assert.rejects(fetch(server.base + "/v1/health"), (e) => e.cause?.code === "ECONNREFUSED", "nothing listens on its port any more");
+    },
+    { lose: true },
+  ));
+
+test("once the device is lost, every request running ends with the error, one waiting for a sequence is refused with a 503, and the server exits", A3, () => {
+  // A 48-token prompt that reaches the step at position 78, which loses the
+  // device, with its 31st new token. The request that started first decodes
+  // the 8-token prompt and is far short of position 78 then: it ends because
+  // the device is lost, not because the hook failed a step of its own. (On
+  // the CPU its step in that round has run; on a GPU it was in the pass that
+  // no longer runs.)
+  const long = Array.from({ length: 6 }, () => science.ids).flat();
+  const position = long.length + 30;
+  return withServer(
+    position,
+    async (server) => {
+      const first = send(server, "/v1/completions", { prompt: science.ids, max_tokens: 200, temperature: 0, stream: true });
+      await within(first.started, 60_000, "the first request's start");
+      const second = send(server, "/v1/completions", { prompt: long, max_tokens: 40, temperature: 0, stream: true });
+      await within(second.started, 60_000, "the second request's start");
+      // Both sequences are taken, so this one waits for one to come free.
+      const waiting = await within(post(server, "/v1/completions", { prompt: science.ids, max_tokens: 4, temperature: 0 }), 60_000, "the waiting request");
+      assert.equal(waiting.status, 503, waiting.text);
+      assert.deepEqual(waiting.json, { error: deviceLost(position) });
+      for (const [name, s] of [["first", first], ["second", second]]) {
+        const r = await within(s.done, 10_000, `the ${name} request's end`);
+        assert.equal(r.status, 200, `${name}: the 200 went out before the device was lost`);
+        const ev = events(r.text);
+        assert.ok(ev.length > 1, `${name}: some tokens streamed first: ${r.text}`);
+        assert.deepEqual(ev.at(-1), { error: STEP_FAILED }, `${name} ends with the error event`);
+        assert.ok(!ev.includes("[DONE]"), name);
+      }
+      assert.equal(await exitStatus(server), 75);
+      assert.equal(server.stderr.match(/The GPU can run nothing more in this process/g)?.length, 1, server.stderr);
+      assert.match(server.stderr, /POST \/v1\/completions 503 /);
+    },
+    { lose: true, parallel: 2 },
+  );
+});

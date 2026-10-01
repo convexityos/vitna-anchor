@@ -10,6 +10,9 @@
  * up mid-stream ends that generation without taking the server down. Each
  * request is logged to stderr as method, path, status and token counts;
  * prompts and completions are never logged.
+ *
+ * Once the GPU can run nothing more in the process (vitna_api_lost), the
+ * server stops taking connections, lets the open ones finish, and returns.
  */
 
 #include "server.h"
@@ -28,6 +31,7 @@
   #define CLOSE_SOCKET(s) closesocket(s)
   #define SHUTDOWN_SEND SD_SEND
 #else
+  #include <sys/select.h>
   #include <sys/socket.h>
   #include <sys/time.h>
   #include <netinet/in.h>
@@ -53,6 +57,10 @@
  * accepted until one closes. Each holds a thread, and one that is waiting
  * for its request to run holds only that. */
 #define MAX_CONNECTIONS 64
+
+/* How long the server waits for a connection before it looks again whether
+ * the GPU has been lost, which no connection would tell it. */
+#define ACCEPT_WAIT_MS 250
 
 static bool sock_write(void* ctx, const void* data, size_t len) {
     socket_t s = *(socket_t*)ctx;
@@ -250,6 +258,20 @@ static void connection(void* arg) {
     free(c);
 }
 
+/* Whether a connection waits on the listening socket s to be accepted,
+ * waiting up to ms for one: 1 if one does, 0 if none came, -1 on an error. */
+static int connection_waiting(socket_t s, int ms) {
+    fd_set ready;
+    FD_ZERO(&ready);
+    FD_SET(s, &ready);
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    /* Windows ignores the first argument. */
+    const int n = select((int)(s + 1), &ready, NULL, NULL, &tv);
+    return n < 0 ? -1 : n > 0;
+}
+
 int vitna_server_run(const vitna_server_config_t* config) {
 #if defined(VITNA_OS_WINDOWS)
     WSADATA wsa_data;
@@ -338,10 +360,13 @@ int vitna_server_run(const vitna_server_config_t* config) {
     vitna_mutex_init(&count.lock);
     vitna_cond_init(&count.freed);
     count.active = 0;
-    while (1) {
+    while (!(api && vitna_api_lost(api))) {
         vitna_mutex_lock(&count.lock);
         while (count.active >= MAX_CONNECTIONS) vitna_cond_wait(&count.freed, &count.lock);
         vitna_mutex_unlock(&count.lock);
+        const int waiting = connection_waiting(server_sock, ACCEPT_WAIT_MS);
+        if (waiting < 0) break;
+        if (waiting == 0) continue;
         struct sockaddr_in client_addr;
 #if defined(VITNA_OS_WINDOWS)
         int client_len = sizeof(client_addr);
@@ -373,7 +398,14 @@ int vitna_server_run(const vitna_server_config_t* config) {
         }
     }
 
+    /* Closed first, so a client that comes now is refused at once rather
+     * than left waiting. The connections still open then finish, each
+     * sending its response: once the GPU is lost, the error each of its
+     * requests ended with. */
     CLOSE_SOCKET(server_sock);
+    vitna_mutex_lock(&count.lock);
+    while (count.active > 0) vitna_cond_wait(&count.freed, &count.lock);
+    vitna_mutex_unlock(&count.lock);
 #if defined(VITNA_OS_WINDOWS)
     WSACleanup();
 #endif
