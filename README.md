@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. It does not run on the GPU or stream its experts from a drive yet. Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. Told to, it reads that model's experts from the drive as the layers want them, with direct I/O, into a cache in memory of a size it is given, and the logits are then the same, bit for bit; how fast that runs was measured on one machine ([below](#speed-with-the-experts-read-from-a-drive)). It does not run a mixture of experts on the GPU yet. Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -20,7 +20,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | A2, a forward pass on a CPU | Tokenizer, embeddings, RMSNorm, attention over a real key-value cache, MLP and sampling in C. Logits match A1 within a stated tolerance, and greedy output matches token for token | Passed, [#5](https://github.com/convexityos/vitna-anchor/pull/5). CI checks it on every push |
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Passed, [#7](https://github.com/convexityos/vitna-anchor/pull/7). CI checks it on every push |
 | A4, one GPU | The A2 comparison passes on CUDA | Passed, [#11](https://github.com/convexityos/vitna-anchor/pull/11), on one GPU, an NVIDIA GeForce RTX 3070, checked by hand with the command [below](#how-gate-a4-was-checked). CI compiles the CUDA path and does not run it: GitHub's runners have no GPU |
-| A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Started. Step 1, the reference: OLMoE-1B-7B pinned, with logits and every layer's routing recorded, in [`reference/`](reference/README.md#a-mixture-of-experts-gate-a5). Step 2, the forward pass on a CPU: matches it, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)). Streaming the experts from a drive, and measuring the speed, are next |
+| A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Started. Step 1, the reference: OLMoE-1B-7B pinned, with logits and every layer's routing recorded, in [`reference/`](reference/README.md#a-mixture-of-experts-gate-a5). Step 2, the forward pass on a CPU: matches it, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)). Step 3, this change: the experts read from the drive with direct I/O, the next layer's prefetched, into a cache of a given size, the logits unchanged bit for bit, and the speed measured ([below](#speed-with-the-experts-read-from-a-drive)). On the CPU only |
 | A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Passed, [#9](https://github.com/convexityos/vitna-anchor/pull/9), for reuse of the previous request's cache and for JSON object mode. CI checks it on every push. Constraining output to a JSON Schema is not built |
 
 ## What is in the repository
@@ -42,7 +42,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | Paged key-value cache | `engine/src/kv_cache.c` | Unused, untested. Known defect: all layers share one block pool sized for a single layer. The forward pass uses a contiguous cache |
 | SHA-256 | `engine/src/crypto.c` | Tested against the FIPS 180-2 examples |
 | Top-k softmax routing over experts | `engine/src/router.c` | Untested, and unused: it takes the softmax over the top k alone, so its weights are renormalized, which OLMoE's are not. The forward pass routes in `model.c` |
-| Expert store and asynchronous reads | `engine/src/expert_store.c`, `engine/src/async_io.c` | Untested. Shards are opened with direct I/O off |
+| A mixture of experts' experts read from the drive with direct I/O, into a cache in memory of a set size: reads on four threads, each with its own handles; the least used expert given up first; and, before each layer's experts run, the next layer's guessed and prefetched | `engine/src/expert_stream.c`, `engine/src/model.c` | Tested on files made for the test: parts that start mid-sector, parts that run together, an expert in two files, the end of a file, a read past it, a prefetch, and which expert is given up. With OLMoE, the logits and greedy tokens through a cache of 256 MiB equal the mapped run's, byte for byte. Its speed was measured by hand ([below](#speed-with-the-experts-read-from-a-drive)). It replaces an earlier expert store and asynchronous reader that were never used or tested, and opened their files with direct I/O off |
 | Prefix tree over token ids | `engine/src/radix_kv.c` | Untested. It holds no key-value tensors |
 | JSON Schema to pushdown automaton compiler | `runtime/grammar.mjs` | Tested. Used by the Node.js command line's `schema` command, not by the engine. Its C counterpart, `grammar.c`, rejected every object with a key (`{"key": 1}` at byte 2) and accepted `{abc}`; A6 deleted it |
 | OpenAI-compatible HTTP API: chat and text completions, streamed or not, usage from tokens | `engine/src/api.c`, `engine/src/server.c` | A greedy completion through it equals the reference's greedy output, with prompt and completion tokens counted exactly, on all six reference prompts. Streaming, stop sequences, seeds, refusals, a client hanging up mid-stream and a step that fails are tested, the last with a hook that makes a step fail on the CPU |
@@ -108,6 +108,13 @@ node scripts/fetch-model.mjs olmoe-1b-7b
 ./engine/vitna-anchor run --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 20
 ```
 
+With `--expert-cache <MiB>`, the engine does not map OLMoE's experts, 12.9 GB of its 13.8: it reads each one from the drive when a layer wants it, with direct I/O, past the operating system's file cache, into a cache in memory of that many MiB, and gives up the least used one when it needs room. Before a layer's experts run, the next layer's router scores the residual stream as it stands and the experts it would choose start being read: a guess, which costs a read when it is wrong and decides nothing. The rest of the model, under a gigabyte, stays mapped. The logits are the same as without it, bit for bit, and `--timing` says how the cache did:
+
+```bash
+./engine/vitna-anchor generate --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 32 --greedy --timing --expert-cache 2048
+./engine/vitna-anchor read-experts --model models/olmoe-1b-7b    # how fast this drive feeds the cache
+```
+
 | Command | What it does |
 |---|---|
 | `run --model <dir> --prompt <text>` | Prints the prompt's continuation as it is generated |
@@ -118,6 +125,7 @@ node scripts/fetch-model.mjs olmoe-1b-7b
 | `info --model <file.safetensors>` | Lists the tensors in a SafeTensors file |
 | `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501. `--parallel <n>` runs up to n requests at once, 1 by default and at most 64 (see Requests at once below). `--speculate <k>` drafts and checks tokens as `generate --speculate` does (see Speculation below) |
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
+| `read-experts --model <dir> [--expert-cache <MiB>]` | Reads every expert of a mixture once from the drive, as `--expert-cache` reads them, computing nothing, and says how fast |
 
 `run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs a dense model on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, or expert weights renormalized over those a token uses.
 
@@ -175,7 +183,7 @@ npm test
 
 A test that talks to servers, when it fails, adds to its error what each server it started printed on stderr while the test ran, and whether the server has exited since (`tests/server-stderr.mjs`, itself checked by `tests/server-stderr.test.mjs`). That is where the engine says why a step failed, a CUDA error on the GPU for one, which the 500 a client sees does not. It takes Node 22.14 or later, where node:test tells a hook how its test ended; on an older Node a failure is reported as before.
 
-`tests/reference-moe.test.mjs` checks OLMoE's fixture with nothing but the repository, so `npm test` runs that much everywhere. Its comparisons with the engine need the engine and the model: the tokenizer's needs only `tokenizer.json`, which CI fetches on its own (`node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json`) and requires to match, with `VITNA_REQUIRE_MOE_TOKENIZER=1`; the rest need all 13.8 GB, which CI does not fetch, and are required with `VITNA_REQUIRE_MOE=1`. `engine/tools/check_nfc.py` compares the engine's NFC with Python's on every code point and on random strings; it needs Python and a model whose normalizer is NFC, and CI does not run it.
+`tests/reference-moe.test.mjs` checks OLMoE's fixture with nothing but the repository, so `npm test` runs that much everywhere. Its comparisons with the engine need the engine and the model: the tokenizer's needs only `tokenizer.json`, which CI fetches on its own (`node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json`) and requires to match, with `VITNA_REQUIRE_MOE_TOKENIZER=1`; the rest need all 13.8 GB, which CI does not fetch, and are required with `VITNA_REQUIRE_MOE=1`. Among those, the experts read from the drive into a cache of 256 MiB must give the mapped run's logits and greedy tokens byte for byte. The expert cache's own unit tests, in `engine/tests/`, need no model and run in CI on all three systems, each with its own direct I/O. `engine/tools/check_nfc.py` compares the engine's NFC with Python's on every code point and on random strings; it needs Python and a model whose normalizer is NFC, and CI does not run it.
 
 With `VITNA_DEVICE=cuda`, the last four run the model on the GPU, in an engine built with the CUDA path; nothing else about them changes, the fixture and the tolerance included. `tests/device.test.mjs` checks that an engine refuses a device it cannot use. CI's CUDA job runs it against an engine built without the CUDA path and one built with it, on a runner with no GPU.
 
@@ -217,17 +225,41 @@ $env:VITNA_REQUIRE_MOE = "1"
 node --test --test-reporter=spec tests/reference-moe.test.mjs
 ```
 
-Eleven of its twelve tests passed, in 194 s with the six prompts run side by side; the twelfth, for an engine with the CUDA path, is skipped without `VITNA_DEVICE=cuda`. The tolerances are the ones gate A1 set for logits and step 1 of A5 set for routing, before the engine could route a token:
+Thirteen of its fourteen tests passed, in 258 s with the six prompts run side by side; the fourteenth, for an engine with the CUDA path, is skipped without `VITNA_DEVICE=cuda`. The tolerances are the ones gate A1 set for logits and step 1 of A5 set for routing, before the engine could route a token:
 
 - The engine's tokenizer gave the ids of the model's own `tokenizer.json` for all 60 strings, NFC and the added tokens included.
 - With each position's experts pinned to the reference's, which a near-tie decided the other way could otherwise make impossible to compare, every compared logit was within 1e-2 of the reference's: the largest difference was 4.96e-5, and 3.03e-5 for logsumexp. The router logits differed by at most 2.25e-5, against a band of 1e-3.
 - Greedy decoding with the experts pinned gave 192 of 192 tokens equal, the top logits at each step within 2.67e-5.
 - The engine's own router chose the reference's 8 experts in all 6,848 routing decisions, prompts and greedy tokens alike, the two that came within 1e-5 of a tie included. Where it chooses as the pins do, a pinned run is the run it makes unpinned, bit for bit, and unpinned it decoded the same 192 tokens.
 - Pinning the runner-up in place of an expert moves the logits after it: by 9.36e-2 at the closest call in the shortest prompt, where `reference/routing_sensitivity.py` measures transformers moving them by 9.357e-2 with the same experts pinned. So the pins are what the tokens go through, and the tests that pin the reference's own experts do not pass because the pins are ignored.
+- Read from the drive into a cache of 256 MiB (`--expert-cache`), nearly every expert read as it was wanted or guessed, the experts gave the mapped run's logits and greedy tokens byte for byte, on two of the prompts. How fast that runs is [below](#speed-with-the-experts-read-from-a-drive).
+
+## Speed with the experts read from a drive
+
+Measured on 2026-10-01 on the machine above: AMD Ryzen 7 3700X, 64 GB of memory, Windows 11, the engine built by MSVC 19.44 through CMake, and the model on a Crucial P5 500 GB (CT500P5SSD8), an NVMe drive. One thread computes; four read. The commands:
+
+```powershell
+node scripts/bench-experts.mjs --tokens 64 --runs 3
+.\engine\build\Release\vitna-anchor.exe read-experts --model models\olmoe-1b-7b
+```
+
+`bench-experts.mjs` decodes 64 greedy tokens after "The capital of France is", three times at each size of the expert cache, and reports the median of the 63 steps it times. The cache starts empty in every run, so the figures include the reads that fill it, and "MiB read a position" is what a run read over all 68 of its positions, the prompt's included. "Mapped" is the same run with nothing streamed, every weight read through the operating system's file cache, warm.
+
+| Expert cache | ms a token | Tokens a second | MiB read a position | Already read when asked for | Being read for a prefetch then |
+|---|---|---|---|---|---|
+| Mapped, 13.8 GB in the file cache | 163.7 | 6.11 | | | |
+| 16 GiB, every expert | 160.6 | 6.23 | 140 | 94% | 5% |
+| 8 GiB | 172.6 | 5.80 | 175 | 94% | 4% |
+| 4 GiB | 450.2 | 2.22 | 657 | 74% | 18% |
+| 2 GiB | 786.1 | 1.27 | 1,152 | 49% | 38% |
+| 1 GiB | 997.8 | 1.00 | 1,455 | 32% | 52% |
+| 512 MiB | 1,152.9 | 0.87 | 1,677 | 19% | 63% |
+
+`read-experts` read all 1,024 experts, 12,292 MiB, at 1,726 to 1,748 MB/s in three passes. Below 8 GiB, decoding runs at about that rate: a token takes about as long as reading its share does, 1,677 MiB of it at 512 MiB. From 8 GiB the cache holds nearly every expert the run uses, and the time is the computing's: one thread, as without the cache. The lookahead named 80.4% of the experts the layers went on to use, in every run. These figures are this machine's, with this drive and one thread computing; another drive, more threads or the GPU would change them.
 
 ## Measurements
 
-A performance figure appears in this repository only with the hardware and the command that produced it, and it says whether it was measured or estimated. No speed figure is published here yet: tokens per second belong to gate A5. `scripts/bench-decode.mjs` times decoding with `generate --timing` and prints the machine and the command with every result, so that a figure, when there is one, carries both.
+A performance figure appears in this repository only with the hardware and the command that produced it, and it says whether it was measured or estimated. The first published are gate A5's, [above](#speed-with-the-experts-read-from-a-drive). `scripts/bench-decode.mjs` times decoding with `generate --timing` and prints the machine and the command with every result, so that a figure, when there is one, carries both.
 
 ## License
 

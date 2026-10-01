@@ -549,6 +549,43 @@ test("unpinned, the engine decodes the reference's tokens until its routing depa
   t.diagnostic(notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`);
 });
 
+// Gate A5, step 3: the experts read from the drive (--expert-cache), with
+// direct I/O, into a cache in memory far smaller than they are, so that
+// nearly every one is read when a layer wants it or a prefetch guessed it.
+// What is computed must not change at all: the same bytes, run through the
+// same arithmetic, give the mapped run's logits bit for bit.
+test("read from the drive into a small cache, the experts give the mapped run's logits and tokens, bit for bit", MODEL, async (t) => {
+  const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
+  const dir = mkdtempSync(join(tmpdir(), "vitna-moe-stream-"));
+  try {
+    for (const p of prompts) {
+      const run = async (extra, name) => {
+        const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...CTX,
+          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
+        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...CTX, ...extra]);
+        return JSON.parse(out).ids;
+      };
+      const [mapped, streamed] = await Promise.all([run([], "mapped"), run(["--expert-cache", "256"], "streamed")]);
+      assert.deepEqual(streamed, mapped, p.id);
+      for (const kind of ["logits", "greedy"]) {
+        const a = readFileSync(join(dir, `${p.id}.mapped.${kind}`));
+        const b = readFileSync(join(dir, `${p.id}.streamed.${kind}`));
+        assert.ok(a.length > 0 && a.equals(b), `${p.id} ${kind}: the streamed run's ${b.length} bytes are not the mapped run's ${a.length}`);
+      }
+    }
+    t.diagnostic(`${prompts.map((p) => p.id).join(" and ")}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte, read through a cache of 256 MiB`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an expert cache too small for twice the experts a token goes through is refused, saying how large it must be", MODEL, async () => {
+  await assert.rejects(
+    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), ...CTX, "--expert-cache", "64"]),
+    /expert cache must hold twice the experts a token goes through: \d+ MiB or more/,
+  );
+});
+
 // The CUDA path does not run a mixture of experts yet. An engine without it
 // refuses --device cuda before loading anything, so this needs one built
 // with it, on a GPU: VITNA_DEVICE=cuda, as for gate A4.

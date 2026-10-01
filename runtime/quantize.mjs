@@ -2,7 +2,7 @@
 //
 // Converts FP16, BF16 or FP32 tensors into INT4 or INT8 slabs with every tensor
 // at a 4096-byte offset, following the vitna_quant_type_t values in
-// engine/include/expert_store.h. The alignment is what direct I/O would need;
+// engine/include/kernels.h. The alignment is what direct I/O would need;
 // nothing reads these slabs with direct I/O yet, and no model has run on them.
 //
 // Rules:

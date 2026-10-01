@@ -44,9 +44,13 @@ static void print_usage(const char* prog) {
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
     printf("               [--speculate <k>] [--parallel <n>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
-    printf("  %s bench    [--iterations <n>]\n\n", prog);
+    printf("  %s bench    [--iterations <n>]\n", prog);
+    printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
+    printf("--expert-cache <MiB> reads a mixture of experts' experts from the drive as they are needed, with direct I/O,\n");
+    printf("into a cache in memory of that size, rather than mapping them; the logits are the same, bit for bit. With\n");
+    printf("--timing, generate also says how the cache did.\n");
     printf("--device cpu|cuda runs the model on the CPU (the default) or on the first CUDA device, which needs an\n");
     printf("engine built with the CUDA path. Asked for a device it cannot use, the engine says why and stops.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
@@ -73,6 +77,8 @@ static void print_usage(const char* prog) {
     printf("          together in each pass on a GPU; every response is the one it gets alone\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
+    printf("read-experts reads every expert of a mixture once from the drive, as --expert-cache does (512 MiB unless\n");
+    printf("          given), computing nothing, and says how fast: what this drive can feed the cache\n");
 }
 
 typedef struct {
@@ -90,6 +96,7 @@ typedef struct {
     const char* experts_in;
     size_t max_new;
     size_t ctx;
+    size_t expert_cache_mib; /* read a mixture of experts' experts from the drive into a cache this large */
     int iterations;
     uint16_t port;
     bool stop_at_special;
@@ -129,6 +136,10 @@ static bool parse_args(int argc, char** argv, args_t* a) {
             if (a->parallel == 0) a->parallel = SIZE_MAX; /* refused in cmd_serve, as too many would be */
         }
         else if (TAKE("--ctx")) a->ctx = (size_t)strtoull(v, NULL, 10);
+        else if (TAKE("--expert-cache")) {
+            a->expert_cache_mib = (size_t)strtoull(v, NULL, 10);
+            if (a->expert_cache_mib == 0) a->expert_cache_mib = 1; /* refused on load as too small, not taken as off */
+        }
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
         else if (TAKE("--temperature")) a->sampling.temperature = (float)atof(v);
@@ -314,6 +325,11 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
     /* Asked for the GPU, the model runs there or not at all. */
     if (wants_cuda(a) && !vitna_llama_use_cuda(m, err, sizeof(err))) {
         fprintf(stderr, "--device cuda: %s\n", err);
+        vitna_llama_free(m);
+        return false;
+    }
+    if (a->expert_cache_mib && !vitna_llama_stream_experts(m, a->expert_cache_mib << 20, err, sizeof(err))) {
+        fprintf(stderr, "--expert-cache: %s\n", err);
         vitna_llama_free(m);
         return false;
     }
@@ -574,6 +590,8 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         fprintf(stderr, "timing: %zu prompt tokens in %.3f ms; %zu tokens after the first new one in %.3f ms, %.4f ms each\n",
                 prompt->count, t_first - t_prompt, out->count - 1, ms, ms / (double)(out->count - 1));
         if (k) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", passes, drafted, accepted);
+        char report[768];
+        if (*vitna_llama_stream_report(m, report, sizeof(report))) fprintf(stderr, "%s\n", report);
     }
     vitna_sampler_free(&sampler);
     free(row);
@@ -707,6 +725,26 @@ static int cmd_info(const char* model_path) {
 
     vitna_safetensors_close(&st);
     return 0;
+}
+
+/* read-experts: every expert of a mixture read once through the expert
+ * cache, with nothing computed: how fast this drive feeds --expert-cache. */
+static int cmd_read_experts(const args_t* a) {
+    if (!a->model) { fprintf(stderr, "--model <dir> is required\n"); return 1; }
+    args_t b = *a;
+    if (!b.expert_cache_mib) b.expert_cache_mib = 512;
+    vitna_llama_t m;
+    if (!load_model(&b, &m)) return 1;
+    double mib = 0, ms = 0;
+    const bool ok = vitna_llama_read_experts(&m, &mib, &ms);
+    if (ok) {
+        printf("read %.1f MiB of experts in %.0f ms: %.0f MB/s, through a cache of %zu MiB\n", mib, ms, mib * 1.048576 / (ms / 1000.0),
+               b.expert_cache_mib);
+    } else {
+        fprintf(stderr, "reading the experts failed\n");
+    }
+    vitna_llama_free(&m);
+    return ok ? 0 : 1;
 }
 
 static int cmd_bench(int iterations) {
@@ -870,6 +908,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "normalize") == 0) return cmd_normalize(&a);
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
+    if (strcmp(cmd, "read-experts") == 0) return cmd_read_experts(&a);
     if (strcmp(cmd, "serve") == 0) return cmd_serve(&a);
     print_usage(argv[0]);
     return 1;

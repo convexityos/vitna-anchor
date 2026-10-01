@@ -17,6 +17,7 @@
 
 #include "api.h"
 #include "crypto.h"
+#include "expert_stream.h"
 #include "json.h"
 #include "jsonpfx.h"
 #include "kernels.h"
@@ -774,6 +775,117 @@ static void test_sampler_matches_reference(void) {
 
 /* --- JSON output, UTF-8 boundaries and ChatML, for the HTTP API --- */
 
+/* --- Experts read from the drive --- */
+
+/* The byte at offset o of test file f: a pattern no two nearby offsets share. */
+static unsigned char pattern_byte(size_t f, uint64_t o) {
+    return (unsigned char)((o * 131u + f * 17u + (o >> 8)) & 0xFF);
+}
+
+static bool part_is(const void* data, size_t f, uint64_t offset, uint64_t length) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (uint64_t i = 0; i < length; i++) {
+        if (p[i] != pattern_byte(f, offset + i)) return false;
+    }
+    return true;
+}
+
+static void test_expert_stream(void) {
+    /* Two files whose sizes are not sector multiples. */
+    const char* paths[2] = { "vitna-unit-test-experts-a.bin", "vitna-unit-test-experts-b.bin" };
+    const size_t sizes[2] = { 3 * 4096 + 1000, 2 * 4096 + 77 };
+    for (size_t f = 0; f < 2; f++) {
+        unsigned char* bytes = (unsigned char*)malloc(sizes[f]);
+        for (size_t i = 0; i < sizes[f]; i++) bytes[i] = pattern_byte(f, i);
+        CHECK(write_file(paths[f], bytes, sizes[f]), "write test file %zu", f);
+        free(bytes);
+    }
+    /* p0: one part, starting mid-sector and crossing one. p1: three parts that
+     * follow one another, given out of order: one run. p2: parts in both
+     * files. p3: a part ending at the end of its file. p4: past it. */
+    const vitna_expert_place_t places[5] = {
+        { { { 0, 100, 5000 } }, 1 },
+        { { { 0, 5400, 200 }, { 0, 5100, 300 }, { 0, 5600, 1000 } }, 3 },
+        { { { 1, 10, 50 }, { 0, 9000, 3000 } }, 2 },
+        { { { 1, 8100, 169 } }, 1 },
+        { { { 0, 13000, 1000 } }, 1 },
+    };
+    CHECK(vitna_expert_stream_slot_bytes_for(places, 4, 2) == 8192, "the widest place, in whole sectors: 8192 bytes");
+    const vitna_extent_t empty = { 0, 0, 0 };
+    const vitna_expert_place_t bad = { { empty }, 1 };
+    CHECK(vitna_expert_stream_slot_bytes_for(&bad, 1, 2) == 0, "an empty part is not a place");
+
+    char err[256] = "";
+    vitna_expert_stream_t* s = vitna_expert_stream_open(paths, 2, places, 5, 4, 2, err, sizeof(err));
+    CHECK(s != NULL, "the stream opens its files for direct I/O: %s", err);
+    if (s) {
+        vitna_expert_data_t d[2];
+        uint32_t ids[2];
+        bool ok = true;
+        for (uint32_t p = 0; p < 4; p++) {
+            ids[0] = p;
+            ok = vitna_expert_stream_acquire(s, ids, 1, d) && ok;
+            const vitna_expert_place_t* pl = &places[p];
+            for (size_t j = 0; j < pl->n_parts; j++) {
+                CHECK(part_is(d[0].part[j], pl->part[j].file, pl->part[j].offset, pl->part[j].length), "place %u part %zu holds its bytes", p, j);
+            }
+            vitna_expert_stream_release(s, ids, 1);
+        }
+        CHECK(ok, "four places are read");
+        vitna_expert_stream_stats_t st = vitna_expert_stream_stats(s);
+        CHECK(st.acquired == 4 && st.misses == 4 && st.hits == 0 && st.reads == 5, "four misses, read in five runs (p2's two files)");
+
+        ids[0] = 3;
+        ids[1] = 0;
+        CHECK(vitna_expert_stream_acquire(s, ids, 2, d) && part_is(d[1].part[0], 0, 100, 5000), "held twice over, still there");
+        vitna_expert_stream_release(s, ids, 2);
+        st = vitna_expert_stream_stats(s);
+        CHECK(st.hits == 2 && st.misses == 4, "what the cache holds is not read again");
+
+        ids[0] = 4;
+        CHECK(!vitna_expert_stream_acquire(s, ids, 1, d), "a part past the end of its file is a failed read");
+        ids[0] = 0;
+        CHECK(vitna_expert_stream_acquire(s, ids, 1, d) && part_is(d[0].part[0], 0, 100, 5000), "and the stream goes on");
+        vitna_expert_stream_release(s, ids, 1);
+        vitna_expert_stream_close(s);
+    }
+
+    /* A prefetch is read without anyone waiting, and counted when used. */
+    s = vitna_expert_stream_open(paths, 2, places, 5, 4, 2, err, sizeof(err));
+    if (s) {
+        uint32_t ids[1] = { 2 };
+        vitna_expert_data_t d[1];
+        vitna_expert_stream_prefetch(s, ids, 1);
+        CHECK(vitna_expert_stream_acquire(s, ids, 1, d) && part_is(d[0].part[1], 0, 9000, 3000), "a prefetched place holds its bytes");
+        vitna_expert_stream_release(s, ids, 1);
+        const vitna_expert_stream_stats_t st = vitna_expert_stream_stats(s);
+        CHECK(st.prefetched == 1 && st.prefetch_used == 1 && st.misses == 0 && st.hits + st.in_flight == 1, "the prefetch served the acquisition");
+        vitna_expert_stream_close(s);
+    }
+    /* Two slots. The least used is given up first: p0, used twice, outlasts
+     * p1, used once and more recently, which the least recently used would
+     * have kept instead. */
+    s = vitna_expert_stream_open(paths, 2, places, 5, 2, 1, err, sizeof(err));
+    if (s) {
+        const uint32_t sequence[5] = { 0, 0, 1, 3, 0 };
+        vitna_expert_data_t d[1];
+        bool ok = true;
+        for (size_t i = 0; i < 5; i++) {
+            ok = vitna_expert_stream_acquire(s, &sequence[i], 1, d) && ok;
+            vitna_expert_stream_release(s, &sequence[i], 1);
+        }
+        const vitna_expert_stream_stats_t st = vitna_expert_stream_stats(s);
+        CHECK(ok && st.misses == 3 && st.hits == 2, "p3 takes p1's slot, not p0's: %llu misses, %llu hits",
+              (unsigned long long)st.misses, (unsigned long long)st.hits);
+        vitna_expert_stream_close(s);
+    }
+    const char* missing[1] = { "vitna-unit-test-no-such-file.bin" };
+    CHECK(vitna_expert_stream_open(missing, 1, places, 1, 4, 1, err, sizeof(err)) == NULL && strstr(err, "direct I/O") != NULL,
+          "a file that cannot be opened is refused with the reason: %s", err);
+    remove(paths[0]);
+    remove(paths[1]);
+}
+
 /* The CUDA path does not run a mixture of experts: a model with experts is
  * refused before anything is moved to a device, in any build. */
 static void test_moe_stays_on_cpu(void) {
@@ -999,6 +1111,7 @@ static void test_jsonpfx(void) {
 }
 
 int main(void) {
+    test_expert_stream();
     test_moe_stays_on_cpu();
     test_api_helpers();
     test_jsonpfx();
