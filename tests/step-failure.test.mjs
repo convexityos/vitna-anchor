@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadFixture } from "../reference/compare.mjs";
+import { keepStderr } from "./server-stderr.mjs";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const fixture = loadFixture(here("../reference/smollm2-135m/fixture.json"));
@@ -66,6 +67,7 @@ async function start(failAt) {
   });
   const server = { child, base: null, stderr: "" };
   child.stderr.on("data", (chunk) => (server.stderr += chunk));
+  keepStderr(child, { VITNA_TEST_FAIL_STEP: failAt });
   server.base = await new Promise((resolve, reject) => {
     let out = "";
     const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}${server.stderr}`)), 30_000);
@@ -77,7 +79,8 @@ async function start(failAt) {
         resolve(m[1]);
       }
     });
-    child.on("exit", (code) => reject(new Error(`the server exited with ${code}: ${out}${server.stderr}`)));
+    // "close", not "exit": by then its stderr has all been read.
+    child.on("close", (code) => reject(new Error(`the server exited with ${code}: ${out}${server.stderr}`)));
   });
   return server;
 }
