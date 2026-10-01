@@ -255,12 +255,25 @@ void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
     m->fail_at = pos;
 }
 
+/* The step at pos fails, as a test asked. On a GPU, what earlier steps queued
+ * runs to its end first, so the failure is reported with nothing of the
+ * model's still running there, as after a device error. A test may end the
+ * server as soon as it reads the failure: on Windows, a server ended while a
+ * chunk of a prompt it had queued still ran made kernels in other CUDA
+ * processes fault with an illegal address. */
+static void fail_step_as_asked(vitna_llama_t* m, size_t pos) {
+    m->fail_armed = false;
+#if defined(VITNA_CUDA)
+    if (m->cuda) vitna_cuda_wait(m->cuda);
+#endif
+    fprintf(stderr, "The step at position %zu failed, as a test asked.\n", pos);
+}
+
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
     if (seq >= m->seqs || token < 0 || (size_t)token >= c->vocab || m->past[seq] >= m->ctx) return false;
     if (m->fail_armed && m->past[seq] == m->fail_at) {
-        m->fail_armed = false;
-        fprintf(stderr, "The step at position %zu failed, as a test asked.\n", m->fail_at);
+        fail_step_as_asked(m, m->fail_at);
         return false;
     }
 
@@ -470,8 +483,7 @@ static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_
         const int32_t t = rows[i].token;
         if (seq >= m->seqs || t < 0 || (size_t)t >= c->vocab || pos >= m->ctx || (m->fail_armed && pos == m->fail_at)) {
             if (seq < m->seqs && m->fail_armed && pos == m->fail_at && t >= 0 && (size_t)t < c->vocab && pos < m->ctx) {
-                m->fail_armed = false;
-                fprintf(stderr, "The step at position %zu failed, as a test asked.\n", pos);
+                fail_step_as_asked(m, pos);
             }
             stopped[n_stopped++] = seq;
             continue;
