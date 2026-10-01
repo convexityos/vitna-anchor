@@ -91,6 +91,9 @@ bool vitna_cuda_steps(struct vitna_cuda_model* g, size_t seq, const int32_t* tok
 /** The device, for a person to read: its name and compute capability. */
 const char* vitna_cuda_device_name(const struct vitna_cuda_model* g);
 
+/** Wait until everything queued on the model's stream has run. */
+void vitna_cuda_wait(struct vitna_cuda_model* g);
+
 void vitna_cuda_free(struct vitna_cuda_model* g);
 
 #ifdef __cplusplus
