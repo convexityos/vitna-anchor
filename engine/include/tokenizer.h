@@ -1,10 +1,12 @@
 /**
  * tokenizer.h - Byte-level BPE, read from a Hugging Face tokenizer.json.
  *
- * Encoding follows the tokenizers library step by step. Added (special)
- * tokens are matched first, leftmost and longest. The text between them is
- * split by the pre-tokenizer: optionally each numeric character on its own
- * (Digits), then the GPT-2 pattern
+ * Encoding follows the tokenizers library step by step. Added tokens are
+ * matched first, leftmost and longest, in two passes: those not normalized in
+ * the text as written, then, in each piece between them after the normalizer
+ * has run, those that are. The text between them all is split by the
+ * pre-tokenizer: optionally each numeric character on its own (Digits), then
+ * the GPT-2 pattern
  *
  *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
  *
@@ -12,11 +14,12 @@
  * is dropped (there is no unknown token), and merges are applied lowest rank
  * first, the leftmost pair first among equal ranks.
  *
- * Only what the tokenizer.json in hand needs is supported: no normalizer, a
- * ByteLevel pre-tokenizer alone or after Digits, no post-processor (so no
- * BOS is added), a ByteLevel decoder, and a BPE model without dropout,
- * unknown token or byte fallback. Anything else is refused on load, not
- * approximated.
+ * Only what the tokenizer.json files in hand need is supported: no
+ * normalizer or NFC (with the Unicode tables of vitna_uni_version()), a
+ * ByteLevel pre-tokenizer alone or after Digits, a post-processor that adds
+ * no tokens (so no BOS is added), a ByteLevel decoder, and a BPE model
+ * without dropout, unknown token or byte fallback. Anything else is refused
+ * on load, not approximated.
  */
 
 #ifndef VITNA_TOKENIZER_H
@@ -52,6 +55,13 @@ size_t vitna_tokenizer_vocab_size(const vitna_tokenizer_t* tok);
 
 /** Encode len bytes of UTF-8 text, appending ids to out. False only if memory runs out. */
 bool vitna_tokenizer_encode(const vitna_tokenizer_t* tok, const char* text, size_t len, vitna_token_list_t* out);
+
+/**
+ * The text the tokenizer's normalizer makes of len bytes: their NFC, or the
+ * bytes as they are when it has none. Returns a new buffer of *out_len bytes,
+ * which the caller frees, or NULL if memory runs out.
+ */
+unsigned char* vitna_tokenizer_normalize(const vitna_tokenizer_t* tok, const char* text, size_t len, size_t* out_len);
 
 /** The bytes a token stands for, or NULL for an id outside the vocabulary. */
 const unsigned char* vitna_tokenizer_token_bytes(const vitna_tokenizer_t* tok, int32_t id, size_t* len);

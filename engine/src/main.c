@@ -26,16 +26,21 @@
 
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
-        printf("vitna-anchor engine: a dense Llama-architecture model in float32, on the CPU or, with --device cuda, on an NVIDIA GPU.\n\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU\n");
+        printf("or, a dense one, with --device cuda on an NVIDIA GPU.\n\n");
     } else {
-        printf("vitna-anchor engine: a dense Llama-architecture model on the CPU, in float32. This build has no CUDA path.\n\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU.\n");
+        printf("This build has no CUDA path.\n\n");
     }
     printf("Usage:\n");
     printf("  %s run      --model <dir> --prompt <text> [--max-new <n>] [sampling]\n", prog);
     printf("  %s generate --model <dir> (--prompt <text> | --ids <a,b,...>) [--max-new <n>] [sampling]\n", prog);
     printf("               [--logits-out <file>] [--stop-at-special] [--timing] [--speculate <k>]\n");
+    printf("               [--router-out <file>] [--experts-out <file>] [--experts-in <file>]\n");
     printf("  %s logits   --model <dir> (--prompt <text> | --ids <a,b,...>) --out <file>\n", prog);
+    printf("               [--router-out <file>] [--experts-out <file>] [--experts-in <file>]\n");
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
+    printf("  %s normalize --model <dir> [--text <text>]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
     printf("               [--speculate <k>] [--parallel <n>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
@@ -52,8 +57,14 @@ static void print_usage(const char* prog) {
     printf("          together: the same tokens and logits as without it. On a GPU they run in one pass (k at\n");
     printf("          most 7); on the CPU a step at a time, which is no faster\n");
     printf("logits    writes the logits at every position of the prompt, positions x vocab, float32 LE\n");
+    printf("          --router-out, --experts-out and --experts-in, with logits or generate, are for tests of a\n");
+    printf("          mixture of experts: for each position run, positions x layers x n, little-endian, they write\n");
+    printf("          the router's logits (float32) and the experts it chose (int32), and read experts to send the\n");
+    printf("          token through instead of those, for the positions the file holds\n");
     printf("tokenize  prints the ids of --text as a JSON array; without --text it reads one JSON string\n");
     printf("          per line from stdin and prints one array per line\n");
+    printf("normalize prints, as a JSON string, the text the tokenizer's normalizer makes of --text (NFC, or\n");
+    printf("          the text as it is when there is none); without --text, of each JSON string on a line of stdin\n");
     printf("serve     serves the model over an OpenAI-compatible HTTP API at /v1, on 127.0.0.1:8765 unless told\n");
     printf("          otherwise, under the model directory's name unless --model-id says another. Without\n");
     printf("          --model its generation endpoints answer 501. --speculate k drafts and checks tokens as\n");
@@ -74,6 +85,9 @@ typedef struct {
     const char* model_id;
     const char* host;
     const char* device;
+    const char* router_out;   /* tests of a mixture of experts: see routing_begin */
+    const char* experts_out;
+    const char* experts_in;
     size_t max_new;
     size_t ctx;
     int iterations;
@@ -105,6 +119,9 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--model-id")) a->model_id = v;
         else if (TAKE("--host")) a->host = v;
         else if (TAKE("--device")) a->device = v;
+        else if (TAKE("--router-out")) a->router_out = v;
+        else if (TAKE("--experts-out")) a->experts_out = v;
+        else if (TAKE("--experts-in")) a->experts_in = v;
         else if (TAKE("--max-new")) a->max_new = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--speculate")) a->speculate = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--parallel")) {
@@ -206,19 +223,39 @@ static bool prompt_ids(const args_t* a, const vitna_tokenizer_t* tok, vitna_toke
     return true;
 }
 
-static int cmd_tokenize(const args_t* a) {
+/* What tokenize and normalize do with one text: print a line for it. False if memory runs out. */
+typedef bool (*text_fn)(const vitna_tokenizer_t* tok, const char* s, size_t n);
+
+static bool print_encoding(const vitna_tokenizer_t* tok, const char* s, size_t n) {
+    vitna_token_list_t ids = {0};
+    bool ok = vitna_tokenizer_encode(tok, s, n, &ids);
+    print_ids(stdout, ids.ids, ids.count);
+    fputc('\n', stdout);
+    vitna_token_list_free(&ids);
+    return ok;
+}
+
+static bool print_normalized(const vitna_tokenizer_t* tok, const char* s, size_t n) {
+    size_t len = 0;
+    unsigned char* norm = vitna_tokenizer_normalize(tok, s, n, &len);
+    if (!norm) return false;
+    print_json_string(stdout, norm, len);
+    fputc('\n', stdout);
+    free(norm);
+    return true;
+}
+
+/* Run fn on --text, or on each line of stdin, each a JSON string. */
+static int each_text(const args_t* a, text_fn fn) {
     if (!a->model) { fprintf(stderr, "--model <dir> is required\n"); return 1; }
     vitna_tokenizer_t* tok = load_tokenizer(a->model);
     if (!tok) return 1;
     binary_stdio();
     int rc = 0;
-    vitna_token_list_t ids = {0};
     if (a->text) {
-        if (!vitna_tokenizer_encode(tok, a->text, strlen(a->text), &ids)) rc = 1;
-        print_ids(stdout, ids.ids, ids.count);
-        fputc('\n', stdout);
+        if (!fn(tok, a->text, strlen(a->text))) rc = 1;
     } else {
-        /* One JSON string per line in, one array per line out. */
+        /* One JSON string per line in, one line out for each. */
         size_t cap = 1 << 16, len = 0;
         char* buf = (char*)malloc(cap);
         for (size_t got; buf && (got = fread(buf + len, 1, cap - len, stdin)) > 0;) {
@@ -242,11 +279,8 @@ static int cmd_tokenize(const args_t* a) {
                 if (!v || v->type != VITNA_JSON_STRING) {
                     fprintf(stderr, "line is not a JSON string: %s\n", doc ? "wrong type" : err);
                     rc = 1;
-                } else {
-                    ids.count = 0;
-                    if (!vitna_tokenizer_encode(tok, v->u.string.ptr, v->u.string.len, &ids)) rc = 1;
-                    print_ids(stdout, ids.ids, ids.count);
-                    fputc('\n', stdout);
+                } else if (!fn(tok, v->u.string.ptr, v->u.string.len)) {
+                    rc = 1;
                 }
                 vitna_json_free(doc);
             }
@@ -254,10 +288,17 @@ static int cmd_tokenize(const args_t* a) {
         }
         free(buf);
     }
-    vitna_token_list_free(&ids);
     vitna_tokenizer_free(tok);
     fflush(stdout);
     return rc;
+}
+
+static int cmd_tokenize(const args_t* a) {
+    return each_text(a, print_encoding);
+}
+
+static int cmd_normalize(const args_t* a) {
+    return each_text(a, print_normalized);
 }
 
 static bool wants_cuda(const args_t* a) {
@@ -279,6 +320,97 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
     return true;
 }
 
+/* For tests of a mixture of experts (vitna_llama_trace_routing). Each file
+ * holds positions x layers x n rows, little-endian, for the positions a
+ * command runs from the first: --router-out writes every layer's router
+ * logits (n = experts, float32), --experts-out the experts the router chose
+ * (n = experts per token, int32, the highest scoring first), and
+ * --experts-in reads experts to send the tokens through instead, for as
+ * many positions as it holds (int32, each row distinct experts in range). */
+typedef struct {
+    float* logits;
+    int32_t* chosen;
+    int32_t* pin;
+    size_t positions;
+} routing_io_t;
+
+static void routing_free(routing_io_t* r) {
+    free(r->logits);
+    free(r->chosen);
+    free(r->pin);
+    memset(r, 0, sizeof(*r));
+}
+
+static bool routing_begin(const args_t* a, vitna_llama_t* m, size_t positions, routing_io_t* r) {
+    memset(r, 0, sizeof(*r));
+    if (!a->router_out && !a->experts_out && !a->experts_in) return true;
+    const vitna_llama_config_t* c = &m->cfg;
+    if (!c->n_experts) {
+        fprintf(stderr, "--router-out, --experts-out and --experts-in need a model with a mixture of experts\n");
+        return false;
+    }
+    const size_t row = c->n_layers * c->n_experts_used; /* experts per position */
+    r->positions = positions;
+    if ((a->router_out && !(r->logits = (float*)calloc(positions * c->n_layers * c->n_experts, sizeof(float)))) ||
+        (a->experts_out && !(r->chosen = (int32_t*)calloc(positions * row, sizeof(int32_t))))) {
+        fprintf(stderr, "out of memory\n");
+        routing_free(r);
+        return false;
+    }
+    size_t pinned = 0;
+    if (a->experts_in) {
+        size_t len = 0;
+        unsigned char* bytes = (unsigned char*)vitna_read_file(a->experts_in, &len);
+        if (!bytes || len == 0 || len % (row * 4) != 0) {
+            fprintf(stderr, "--experts-in: %s is not positions x %zu layers x %zu experts of int32\n", a->experts_in, c->n_layers,
+                    c->n_experts_used);
+            free(bytes);
+            return false;
+        }
+        pinned = len / (row * 4);
+        r->pin = (int32_t*)malloc(pinned * row * sizeof(int32_t));
+        bool ok = r->pin != NULL;
+        for (size_t i = 0; ok && i < pinned * row; i++) {
+            const unsigned char* b = bytes + i * 4;
+            r->pin[i] = (int32_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+            ok = r->pin[i] >= 0 && (size_t)r->pin[i] < c->n_experts;
+            /* Distinct within the experts of one layer at one position. */
+            for (size_t j = i - i % c->n_experts_used; ok && j < i; j++) ok = r->pin[j] != r->pin[i];
+            if (!ok) fprintf(stderr, "--experts-in: value %zu is out of range or repeats an expert of its layer\n", i);
+        }
+        free(bytes);
+        if (!ok) {
+            routing_free(r);
+            return false;
+        }
+    }
+    vitna_llama_trace_routing(m, r->logits, r->chosen, positions, r->pin, pinned);
+    return true;
+}
+
+/* Write the routing of the first ran positions, and free the buffers. */
+static bool routing_end(const args_t* a, vitna_llama_t* m, routing_io_t* r, size_t ran) {
+    vitna_llama_trace_routing(m, NULL, NULL, 0, NULL, 0);
+    const vitna_llama_config_t* c = &m->cfg;
+    if (ran > r->positions) ran = r->positions;
+    bool ok = true;
+    const struct { const char* path; const void* data; size_t n; } outs[] = {
+        { a->router_out, r->logits, ran * c->n_layers * c->n_experts },
+        { a->experts_out, r->chosen, ran * c->n_layers * c->n_experts_used },
+    };
+    for (size_t i = 0; i < 2; i++) {
+        if (!outs[i].path || !outs[i].data) continue;
+        FILE* f = fopen(outs[i].path, "wb");
+        if (!f || fwrite(outs[i].data, 4, outs[i].n, f) != outs[i].n) {
+            fprintf(stderr, "cannot write %s\n", outs[i].path);
+            ok = false;
+        }
+        if (f) fclose(f);
+    }
+    routing_free(r);
+    return ok;
+}
+
 static int cmd_logits(const args_t* a) {
     if (!a->model || !a->out) { fprintf(stderr, "--model <dir> and --out <file> are required\n"); return 1; }
     vitna_tokenizer_t* tok = a->ids ? NULL : load_tokenizer(a->model);
@@ -286,6 +418,7 @@ static int cmd_logits(const args_t* a) {
     vitna_token_list_t ids = {0};
     int rc = 1;
     vitna_llama_t m;
+    routing_io_t routing;
     if (prompt_ids(a, tok, &ids) && load_model(a, &m)) {
         /* Every position's logits, up to 256 positions at a time. */
         const size_t chunk = 256, V = m.cfg.vocab;
@@ -293,7 +426,7 @@ static int cmd_logits(const args_t* a) {
         float* rows = (float*)malloc(chunk * V * sizeof(float));
         if (!f || !rows) {
             fprintf(stderr, "cannot write %s\n", a->out);
-        } else {
+        } else if (routing_begin(a, &m, ids.count, &routing)) {
             rc = 0;
             for (size_t t = 0; t < ids.count && rc == 0; t += chunk) {
                 const size_t n = ids.count - t < chunk ? ids.count - t : chunk;
@@ -306,6 +439,7 @@ static int cmd_logits(const args_t* a) {
                     rc = 1;
                 }
             }
+            if (!routing_end(a, &m, &routing, m.past[0])) rc = 1;
         }
         if (f) fclose(f);
         free(rows);
@@ -470,12 +604,15 @@ static int cmd_generate(const args_t* a) {
     vitna_token_list_t prompt = {0}, out = {0};
     int rc = 1;
     vitna_llama_t m;
+    routing_io_t routing;
     if (prompt_ids(a, tok, &prompt) && load_model(a, &m)) {
         FILE* lf = a->logits_out ? fopen(a->logits_out, "wb") : NULL;
         if (a->logits_out && !lf) {
             fprintf(stderr, "cannot write %s\n", a->logits_out);
-        } else {
+        } else if (routing_begin(a, &m, prompt.count + a->max_new, &routing)) {
             rc = generate(a, &m, tok, &prompt, &out, lf, NULL);
+            /* The prompt's positions, then those of the new tokens that went back through the model. */
+            if (!routing_end(a, &m, &routing, m.past[0])) rc = 1;
         }
         if (lf) fclose(lf);
         vitna_llama_free(&m);
@@ -730,6 +867,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "generate") == 0) return cmd_generate(&a);
     if (strcmp(cmd, "logits") == 0) return cmd_logits(&a);
     if (strcmp(cmd, "tokenize") == 0) return cmd_tokenize(&a);
+    if (strcmp(cmd, "normalize") == 0) return cmd_normalize(&a);
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
     if (strcmp(cmd, "serve") == 0) return cmd_serve(&a);

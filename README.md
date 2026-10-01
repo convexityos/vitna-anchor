@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. It does not run on the GPU or stream its experts from a drive yet. Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -20,27 +20,28 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | A2, a forward pass on a CPU | Tokenizer, embeddings, RMSNorm, attention over a real key-value cache, MLP and sampling in C. Logits match A1 within a stated tolerance, and greedy output matches token for token | Passed, [#5](https://github.com/convexityos/vitna-anchor/pull/5). CI checks it on every push |
 | A3, serving | An OpenAI-compatible `/v1` with streaming, and usage counted from the tokens actually produced | Passed, [#7](https://github.com/convexityos/vitna-anchor/pull/7). CI checks it on every push |
 | A4, one GPU | The A2 comparison passes on CUDA | Passed, [#11](https://github.com/convexityos/vitna-anchor/pull/11), on one GPU, an NVIDIA GeForce RTX 3070, checked by hand with the command [below](#how-gate-a4-was-checked). CI compiles the CUDA path and does not run it: GitHub's runners have no GPU |
-| A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Started. Its reference is recorded: OLMoE-1B-7B is pinned, with logits and every layer's routing recorded, in [`reference/`](reference/README.md#a-mixture-of-experts-gate-a5). The engine does not run it yet |
+| A5, experts from a drive | A mixture-of-experts checkpoint streams from NVMe with direct I/O and prefetch, and tokens per second are published only as measured, with the hardware named | Started. Step 1, the reference: OLMoE-1B-7B pinned, with logits and every layer's routing recorded, in [`reference/`](reference/README.md#a-mixture-of-experts-gate-a5). Step 2, the forward pass on a CPU: matches it, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)). Streaming the experts from a drive, and measuring the speed, are next |
 | A6, reuse and constraints | Prefix reuse over real key-value tensors, and constrained decoding that masks real logits | Passed, [#9](https://github.com/convexityos/vitna-anchor/pull/9), for reuse of the previous request's cache and for JSON object mode. CI checks it on every push. Constraining output to a JSON Schema is not built |
 
 ## What is in the repository
 
-"Matches the reference" means `tests/reference.test.mjs` compares it with the fixture in [`reference/`](reference/README.md). "Tested" means the repository's own tests exercise it, on inputs they build themselves: the C unit tests in `engine/tests/` check each part against published test vectors, a formula evaluated in double precision, or an input worked by hand.
+"Matches the reference" means `tests/reference.test.mjs` compares it with the fixture in [`reference/`](reference/README.md), or for OLMoE `tests/reference-moe.test.mjs` with that model's fixture. "Tested" means the repository's own tests exercise it, on inputs they build themselves: the C unit tests in `engine/tests/` check each part against published test vectors, a formula evaluated in double precision, or an input worked by hand.
 
 | Component | Where | State |
 |---|---|---|
 | Llama forward pass in float32: embeddings, RMSNorm, grouped-query attention over a key-value cache, half-split rotary embeddings, SwiGLU MLP, tied output layer | `engine/src/model.c`, `engine/src/ops.c` | Matches the reference: every compared logit within the stated tolerance of 1e-2, and 192 of 192 greedy tokens equal. The largest difference on the machine that recorded the reference was 2.2e-4 |
 | The same forward pass on an NVIDIA GPU, in float32: five fused kernels a layer, attention split across blocks by position, and each token a replay of CUDA graphs; the weights uploaded once, the key-value cache on the device, logits copied back only when a step asks for them | `engine/src/model_cuda.cu` | Matches the reference on one GPU, checked by hand: every compared logit within 1e-2, the largest difference 2.25e-4, and 192 of 192 greedy tokens equal. CI compiles it and does not run it |
-| Byte-level BPE tokenizer read from `tokenizer.json` | `engine/src/tokenizer.c`, `engine/src/unicode.c` | Matches the model's own `tokenizer.json` on all 48 reference strings, and tested on a vocabulary worked by hand. Refuses tokenizer features it does not implement |
+| OLMoE's mixture of experts in float32: an RMSNorm over all of each query and key projection, a router over 64 experts, the 8 with the largest weights each a SwiGLU MLP, weighted by the router's softmax without renormalizing; a checkpoint in shards, read through its index | `engine/src/model.c` | Matches its reference on the CPU, checked by hand: with every token's experts pinned to the reference's, every compared logit within the tolerance of 1e-2, the largest difference 4.96e-5, and 192 of 192 greedy tokens equal; the engine's own router chose the reference's experts in all 6,848 decisions, and unpinned it decodes the same 192 tokens. CI does not run it: the weights are 13.8 GB. The CUDA path refuses it |
+| Byte-level BPE tokenizer read from `tokenizer.json`, with NFC normalization and added tokens matched before and after it, as the tokenizers library does | `engine/src/tokenizer.c`, `engine/src/unicode.c` | Matches each model's own `tokenizer.json` on all of its reference strings, 48 for SmolLM2 and 60 for OLMoE, both in CI. Tested on vocabularies worked by hand. NFC equals Python's `unicodedata` (Unicode 15.0, where the tables come from) on every code point and 1.2 million random strings of marks, composites and jamo (`engine/tools/check_nfc.py`). Refuses tokenizer features it does not implement |
 | Greedy decoding and seeded temperature, top-k and top-p sampling | `engine/src/sampler.c` | Greedy matches the reference. Sampling is tested for its proportions and its seed |
 | Float32 matrix-vector product over F32, BF16 or F16 weights, with scalar, AVX2 and NEON paths | `engine/src/ops.c` | Tested against double precision |
-| SafeTensors reader in C | `engine/src/safetensors.c`, `engine/src/json.c` | Tested: the `__metadata__` block is skipped, byte ranges are checked, and malformed files are refused. Reads the model in the A2 comparison |
+| SafeTensors reader in C | `engine/src/safetensors.c`, `engine/src/json.c` | Tested: the `__metadata__` block is skipped, byte ranges are checked, and malformed files are refused. Reads the model in the A2 comparison, and OLMoE's three shards |
 | RMSNorm and SwiGLU | `engine/src/kernels.c` | Tested against double precision. RMSNorm is used by the forward pass |
 | int2/3/4/8 matrix-vector products, with scalar, AVX2 and NEON paths | `engine/src/kernels.c` | Tested against their documented packing formats. No model uses them yet |
 | Interleaved rotary position embedding | `engine/src/kv_cache.c` | Tested against its formula. Unused: Hugging Face Llama checkpoints need the half-split form in `ops.c` |
 | Paged key-value cache | `engine/src/kv_cache.c` | Unused, untested. Known defect: all layers share one block pool sized for a single layer. The forward pass uses a contiguous cache |
 | SHA-256 | `engine/src/crypto.c` | Tested against the FIPS 180-2 examples |
-| Top-k softmax routing over experts | `engine/src/router.c` | Untested |
+| Top-k softmax routing over experts | `engine/src/router.c` | Untested, and unused: it takes the softmax over the top k alone, so its weights are renormalized, which OLMoE's are not. The forward pass routes in `model.c` |
 | Expert store and asynchronous reads | `engine/src/expert_store.c`, `engine/src/async_io.c` | Untested. Shards are opened with direct I/O off |
 | Prefix tree over token ids | `engine/src/radix_kv.c` | Untested. It holds no key-value tensors |
 | JSON Schema to pushdown automaton compiler | `runtime/grammar.mjs` | Tested. Used by the Node.js command line's `schema` command, not by the engine. Its C counterpart, `grammar.c`, rejected every object with a key (`{"key": 1}` at byte 2) and accepted `{abc}`; A6 deleted it |
@@ -100,17 +101,27 @@ node scripts/fetch-model.mjs
 ./engine/vitna-anchor run --model models/smollm2-135m --prompt "The capital of France is" --max-new 20
 ```
 
+OLMoE-1B-7B, 13.8 GB, runs the same way, on the CPU only. The engine maps its three files rather than reading them in:
+
+```bash
+node scripts/fetch-model.mjs olmoe-1b-7b
+./engine/vitna-anchor run --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 20
+```
+
 | Command | What it does |
 |---|---|
 | `run --model <dir> --prompt <text>` | Prints the prompt's continuation as it is generated |
 | `generate --model <dir> (--prompt <text> \| --ids <a,b,...>)` | Prints JSON: the prompt's ids, the new ids and their text. `--logits-out <file>` writes each step's logits, and `--timing` prints to stderr how long the prompt and the new tokens took. `--speculate <k>` drafts up to k tokens after each one taken, from the place the text's last two or three tokens occur earlier in it, and checks them together, drafting nothing for a while after a pass whose drafts were all refused; the ids and logits are the ones decoding a token at a time gives, byte for byte, which `tests/speculate.test.mjs` checks. On a GPU the drafts are checked in one pass, k at most 7; on the CPU a step at a time |
 | `logits --model <dir> (--prompt <text> \| --ids <a,b,...>) --out <file>` | Writes the logits at every position of the prompt, as float32 |
 | `tokenize --model <dir> [--text <text>]` | Prints token ids as JSON |
+| `normalize --model <dir> [--text <text>]` | Prints, as a JSON string, the text the tokenizer's normalizer makes of the input: its NFC for OLMoE, the text unchanged for SmolLM2 |
 | `info --model <file.safetensors>` | Lists the tensors in a SafeTensors file |
 | `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501. `--parallel <n>` runs up to n requests at once, 1 by default and at most 64 (see Requests at once below). `--speculate <k>` drafts and checks tokens as `generate --speculate` does (see Speculation below) |
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
 
-`run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json` and a single `model.safetensors`. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, or a sharded checkpoint.
+`run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs a dense model on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, or expert weights renormalized over those a token uses.
+
+For tests of a mixture of experts, `logits` and `generate` take `--router-out <file>`, which writes every layer's router logits at every position run, `--experts-out <file>`, the experts the router chose there, and `--experts-in <file>`, experts to send each position's token through in place of those, weighted as the router weighs them: positions x layers x n, little-endian, float32 for logits and int32 for experts. The router's own choice is still what `--experts-out` writes, so a run with its experts pinned also says where the router would have gone.
 
 ## Serve the model
 
@@ -164,6 +175,8 @@ npm test
 
 A test that talks to servers, when it fails, adds to its error what each server it started printed on stderr while the test ran, and whether the server has exited since (`tests/server-stderr.mjs`, itself checked by `tests/server-stderr.test.mjs`). That is where the engine says why a step failed, a CUDA error on the GPU for one, which the 500 a client sees does not. It takes Node 22.14 or later, where node:test tells a hook how its test ended; on an older Node a failure is reported as before.
 
+`tests/reference-moe.test.mjs` checks OLMoE's fixture with nothing but the repository, so `npm test` runs that much everywhere. Its comparisons with the engine need the engine and the model: the tokenizer's needs only `tokenizer.json`, which CI fetches on its own (`node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json`) and requires to match, with `VITNA_REQUIRE_MOE_TOKENIZER=1`; the rest need all 13.8 GB, which CI does not fetch, and are required with `VITNA_REQUIRE_MOE=1`. `engine/tools/check_nfc.py` compares the engine's NFC with Python's on every code point and on random strings; it needs Python and a model whose normalizer is NFC, and CI does not run it.
+
 With `VITNA_DEVICE=cuda`, the last four run the model on the GPU, in an engine built with the CUDA path; nothing else about them changes, the fixture and the tolerance included. `tests/device.test.mjs` checks that an engine refuses a device it cannot use. CI's CUDA job runs it against an engine built without the CUDA path and one built with it, on a runner with no GPU.
 
 ## How gate A4 was checked
@@ -191,6 +204,26 @@ Checked again on 2026-09-30, on the same machine with the same commands, at the 
 The GPU kernels were then rewritten for speed: CUDA graphs, fused kernels, and attention split across blocks by position, each position scored by a lane of its own. The same commands on the same machine, on the same day, passed again, with a largest difference of 2.25e-4, 1.65e-4 for logsumexp, 192 of 192 greedy tokens equal, and at most 5.15e-5 between the top logits at a step.
 
 On the GPU the arithmetic is float32 on CUDA cores. No tensor cores are used, so TF32 does not apply, and the build does not pass `--use_fast_math`, so division, square root and `expf` keep their accurate forms. nvcc's default fused multiply-add is on; the CPU path's AVX2 matrix-vector product uses FMA too.
+
+## How gate A5's forward pass was checked
+
+By hand, on 2026-10-01, on the machine that checked A4 (AMD Ryzen 7 3700X, 64 GB, Windows 11, Node.js 24.19.0), with the engine built by MSVC 19.44 through CMake. CI does not run it: its runners would have to fetch 13.8 GB of weights for every run, and hold them. CI does check OLMoE's tokenizer, which needs only `tokenizer.json`.
+
+```powershell
+cmake -B engine/build -S engine
+cmake --build engine/build --config Release
+node scripts/fetch-model.mjs olmoe-1b-7b
+$env:VITNA_REQUIRE_MOE = "1"
+node --test --test-reporter=spec tests/reference-moe.test.mjs
+```
+
+Eleven of its twelve tests passed, in 194 s with the six prompts run side by side; the twelfth, for an engine with the CUDA path, is skipped without `VITNA_DEVICE=cuda`. The tolerances are the ones gate A1 set for logits and step 1 of A5 set for routing, before the engine could route a token:
+
+- The engine's tokenizer gave the ids of the model's own `tokenizer.json` for all 60 strings, NFC and the added tokens included.
+- With each position's experts pinned to the reference's, which a near-tie decided the other way could otherwise make impossible to compare, every compared logit was within 1e-2 of the reference's: the largest difference was 4.96e-5, and 3.03e-5 for logsumexp. The router logits differed by at most 2.25e-5, against a band of 1e-3.
+- Greedy decoding with the experts pinned gave 192 of 192 tokens equal, the top logits at each step within 2.67e-5.
+- The engine's own router chose the reference's 8 experts in all 6,848 routing decisions, prompts and greedy tokens alike, the two that came within 1e-5 of a tie included. Where it chooses as the pins do, a pinned run is the run it makes unpinned, bit for bit, and unpinned it decoded the same 192 tokens.
+- Pinning the runner-up in place of an expert moves the logits after it: by 9.36e-2 at the closest call in the shortest prompt, where `reference/routing_sensitivity.py` measures transformers moving them by 9.357e-2 with the same experts pinned. So the pins are what the tokens go through, and the tests that pin the reference's own experts do not pass because the pins are ignored.
 
 ## Measurements
 

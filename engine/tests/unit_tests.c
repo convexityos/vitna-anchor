@@ -174,6 +174,64 @@ static void test_unicode(void) {
     CHECK(vitna_utf8_decode(surrogate, 3, &cp) == 1 && cp >= 0x110000, "an encoded surrogate is invalid");
 }
 
+static size_t put_utf8(uint32_t cp, unsigned char* out) {
+    if (cp < 0x80) { out[0] = (unsigned char)cp; return 1; }
+    if (cp < 0x800) { out[0] = (unsigned char)(0xC0 | (cp >> 6)); out[1] = (unsigned char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) {
+        out[0] = (unsigned char)(0xE0 | (cp >> 12));
+        out[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (unsigned char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (unsigned char)(0xF0 | (cp >> 18));
+    out[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (unsigned char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* One case for each part of NFC, the expected forms from Python 3.12's
+ * unicodedata.normalize, which has the Unicode version of the engine's
+ * tables. engine/tools/check_nfc.py compares every code point, and a million
+ * random strings of marks, composites and jamo, the same way. */
+static void test_nfc(void) {
+    static const struct {
+        uint32_t in[4];
+        uint32_t out[4];
+        const char* what;
+    } cases[] = {
+        { { 0x65, 0x301 }, { 0xE9 }, "a mark composes with its starter" },
+        { { 0x212B }, { 0xC5 }, "a singleton decomposes, and stays decomposed" },
+        { { 0x1100, 0x1161, 0x11A8 }, { 0xAC01 }, "Hangul jamo compose into a syllable" },
+        { { 0xAC00, 0x11A8 }, { 0xAC01 }, "a syllable takes a trailing consonant" },
+        { { 0x958 }, { 0x915, 0x93C }, "a composition exclusion stays decomposed" },
+        { { 0x344 }, { 0x308, 0x301 }, "a decomposition starting with a mark stays decomposed" },
+        { { 0x65, 0x302, 0x323 }, { 0x1EC7 }, "marks reorder by class, then compose" },
+        { { 0x3C9, 0x300, 0xE4B }, { 0x1F7C, 0xE4B }, "a mark composes past a mark of a lower class it moved behind" },
+        { { 0x61, 0x300, 0x300 }, { 0xE0, 0x300 }, "a second mark of the same class is blocked" },
+        { { 0xB47, 0xB3E }, { 0xB4B }, "two starters compose" },
+        { { 0xFB01 }, { 0xFB01 }, "a compatibility ligature is left alone" },
+        { { 0x301, 0x65 }, { 0x301, 0x65 }, "a leading mark has no starter to join" },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        unsigned char in[16], want[16];
+        size_t n_in = 0, n_want = 0;
+        for (size_t i = 0; i < 4 && cases[c].in[i]; i++) n_in += put_utf8(cases[c].in[i], in + n_in);
+        for (size_t i = 0; i < 4 && cases[c].out[i]; i++) n_want += put_utf8(cases[c].out[i], want + n_want);
+        size_t n = 0;
+        unsigned char* got = vitna_uni_nfc(in, n_in, &n);
+        CHECK(got && n == n_want && memcmp(got, want, n) == 0, "NFC: %s", cases[c].what);
+        free(got);
+    }
+    /* A byte that is not UTF-8 passes through as a starter that composes with nothing. */
+    const unsigned char odd[] = { 'e', 0xFF, 0xCC, 0x81 };
+    size_t n = 0;
+    unsigned char* got = vitna_uni_nfc(odd, sizeof(odd), &n);
+    CHECK(got && n == sizeof(odd) && memcmp(got, odd, n) == 0, "NFC: an invalid byte stays, and blocks composition across it");
+    free(got);
+    CHECK(vitna_uni_combining_class(0x301) == 230 && vitna_uni_combining_class(0x323) == 220 && vitna_uni_combining_class('a') == 0, "combining classes");
+}
+
 /* --- Tokenizer, on a vocabulary small enough to work by hand --- */
 
 static const char* TINY_TOKENIZER =
@@ -227,12 +285,67 @@ static void test_tokenizer(void) {
         vitna_tokenizer_free(tok);
     }
     /* Anything the loader does not implement is refused, not approximated. */
-    const char* unsupported = "{\"normalizer\":{\"type\":\"NFC\"},\"pre_tokenizer\":{\"type\":\"ByteLevel\"},"
+    const char* unsupported = "{\"normalizer\":{\"type\":\"NFKC\"},\"pre_tokenizer\":{\"type\":\"ByteLevel\"},"
                               "\"model\":{\"type\":\"BPE\",\"vocab\":{},\"merges\":[]}}";
     write_file(path, unsupported, strlen(unsupported));
     tok = vitna_tokenizer_load(path, err, sizeof(err));
-    CHECK(tok == NULL && strstr(err, "normalizer") != NULL, "a normalizer is refused");
+    CHECK(tok == NULL && strstr(err, "normalizer") != NULL, "a normalizer other than NFC is refused");
     vitna_tokenizer_free(tok);
+    const char* adds_bos = "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"post_processor\":{\"type\":\"TemplateProcessing\","
+                           "\"single\":[{\"SpecialToken\":{\"id\":\"<s>\",\"type_id\":0}},{\"Sequence\":{\"id\":\"A\",\"type_id\":0}}],"
+                           "\"special_tokens\":{\"<s>\":{\"id\":\"<s>\",\"ids\":[0],\"tokens\":[\"<s>\"]}}},"
+                           "\"model\":{\"type\":\"BPE\",\"vocab\":{},\"merges\":[]}}";
+    write_file(path, adds_bos, strlen(adds_bos));
+    tok = vitna_tokenizer_load(path, err, sizeof(err));
+    CHECK(tok == NULL && strstr(err, "post_processor") != NULL, "a post-processor that adds a token is refused");
+    vitna_tokenizer_free(tok);
+    remove(path);
+}
+
+/* NFC, and added tokens matched as the tokenizers library matches them:
+ * those not normalized in the text as written, then those that are, in
+ * normalized text, as their own content normalized. Token 16 is written
+ * decomposed, e and a combining acute; 17 overlaps the special <s>. The
+ * post-processor is a template that adds nothing, as OLMoE's is. */
+static const char* TINY_NFC_TOKENIZER =
+    "{\"version\":\"1.0\",\"added_tokens\":["
+    "{\"id\":11,\"content\":\"<s>\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true},"
+    "{\"id\":16,\"content\":\"e\\u0301\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":true,\"special\":false},"
+    "{\"id\":17,\"content\":\"a<\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":true,\"special\":false}],"
+    "\"normalizer\":{\"type\":\"NFC\"},"
+    "\"pre_tokenizer\":{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":true},"
+    "\"post_processor\":{\"type\":\"TemplateProcessing\",\"single\":[{\"Sequence\":{\"id\":\"A\",\"type_id\":0}}],"
+    "\"pair\":[{\"Sequence\":{\"id\":\"A\",\"type_id\":0}},{\"Sequence\":{\"id\":\"B\",\"type_id\":1}}],\"special_tokens\":{}},"
+    "\"decoder\":{\"type\":\"ByteLevel\"},"
+    "\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":null,"
+    "\"end_of_word_suffix\":null,\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,"
+    "\"vocab\":{\"a\":0,\"b\":1,\"<s>\":11},\"merges\":[]}}";
+
+static void test_tokenizer_nfc(void) {
+    const char* path = "vitna-unit-test-tokenizer-nfc.json";
+    write_file(path, TINY_NFC_TOKENIZER, strlen(TINY_NFC_TOKENIZER));
+    char err[256];
+    vitna_tokenizer_t* tok = vitna_tokenizer_load(path, err, sizeof(err));
+    CHECK(tok != NULL, "the NFC tokenizer loads: %s", err);
+    if (tok) {
+        struct { const char* text; int32_t ids[4]; size_t n; const char* why; } cases[] = {
+            { "\xC3\xA9", { 16 }, 1, "a normalized added token is matched as its content normalized" },
+            { "e\xCC\x81", { 16 }, 1, "and in the text normalized" },
+            { "a<s>", { 0, 11 }, 2, "a token not normalized is matched first, even where a normalized one starts earlier" },
+            { "a<b", { 17, 1 }, 2, "a normalized token is matched where nothing else is" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            vitna_token_list_t got = {0};
+            vitna_tokenizer_encode(tok, cases[i].text, strlen(cases[i].text), &got);
+            CHECK(ids_equal(&got, cases[i].ids, cases[i].n), "%s (%zu ids)", cases[i].why, got.count);
+            vitna_token_list_free(&got);
+        }
+        size_t n = 0;
+        unsigned char* norm = vitna_tokenizer_normalize(tok, "e\xCC\x81", 3, &n);
+        CHECK(norm && n == 2 && memcmp(norm, "\xC3\xA9", 2) == 0, "the normalizer is NFC");
+        free(norm);
+        vitna_tokenizer_free(tok);
+    }
     remove(path);
 }
 
@@ -661,6 +774,17 @@ static void test_sampler_matches_reference(void) {
 
 /* --- JSON output, UTF-8 boundaries and ChatML, for the HTTP API --- */
 
+/* The CUDA path does not run a mixture of experts: a model with experts is
+ * refused before anything is moved to a device, in any build. */
+static void test_moe_stays_on_cpu(void) {
+    vitna_llama_t m;
+    memset(&m, 0, sizeof(m));
+    m.cfg.n_experts = 64;
+    char err[256] = "";
+    CHECK(!vitna_llama_use_cuda(&m, err, sizeof(err)) && strstr(err, "mixture of experts") != NULL && m.cuda == NULL,
+          "a mixture of experts is refused the GPU, saying so: \"%s\"", err);
+}
+
 static void test_api_helpers(void) {
     vitna_strbuf_t sb;
     vitna_sb_init(&sb);
@@ -875,12 +999,15 @@ static void test_jsonpfx(void) {
 }
 
 int main(void) {
+    test_moe_stays_on_cpu();
     test_api_helpers();
     test_jsonpfx();
     test_json();
     test_safetensors();
     test_unicode();
+    test_nfc();
     test_tokenizer();
+    test_tokenizer_nfc();
     test_conversions();
     test_matvec();
     test_rope();

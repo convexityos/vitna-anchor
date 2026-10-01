@@ -1,21 +1,34 @@
 /**
- * model.h - A dense Llama-architecture model in float32, on the CPU or, in an
- * engine built with the CUDA path, on an NVIDIA GPU.
+ * model.h - A Llama-architecture model in float32: dense, on the CPU or, in
+ * an engine built with the CUDA path, on an NVIDIA GPU; or OLMoE's mixture
+ * of experts, on the CPU.
  *
- * Reads config.json and a single model.safetensors from a model directory,
- * and runs one token at a time: embedding, then per layer RMSNorm,
- * grouped-query attention with half-split rotary embeddings over a
- * key-value cache, a residual add, RMSNorm, a SwiGLU MLP and a residual add;
- * then a final RMSNorm and the output projection, tied to the embedding
- * when the config says so. This is the computation of Hugging Face's
- * LlamaForCausalLM with eager attention.
+ * Reads config.json and model.safetensors, or the shards an index names
+ * (model.safetensors.index.json), from a model directory, and runs one
+ * token at a time: embedding, then per layer RMSNorm, grouped-query
+ * attention with half-split rotary embeddings over a key-value cache, a
+ * residual add, RMSNorm, a SwiGLU MLP and a residual add; then a final
+ * RMSNorm and the output projection, tied to the embedding when the config
+ * says so. This is the computation of Hugging Face's LlamaForCausalLM with
+ * eager attention.
+ *
+ * OLMoE (model_type "olmoe", Hugging Face's OlmoeForCausalLM) differs in two
+ * places. Before the rotary embeddings, the query and key projections each
+ * pass through an RMSNorm of their own, over all of their values at once,
+ * not head by head. And each layer's MLP is a mixture of experts: a router
+ * scores every expert for the token, the token goes through the
+ * n_experts_used experts that score highest, each a SwiGLU MLP of its own,
+ * and their outputs are added in order of expert, each weighted by its
+ * share of the router's softmax over all the experts, not renormalized over
+ * those used. That is transformers' eager experts implementation.
  *
  * What the config asks for and this does not do (rope scaling, attention or
- * MLP biases, another activation, sharded checkpoints) is refused on load.
+ * MLP biases, another activation, clipped activations, renormalized expert
+ * weights) is refused on load.
  *
- * A model loads on the CPU. vitna_llama_use_cuda moves its forward pass to
- * the GPU, where model_cuda.cu runs the same computation; nothing falls back
- * from one device to the other.
+ * A model loads on the CPU. vitna_llama_use_cuda moves a dense model's
+ * forward pass to the GPU, where model_cuda.cu runs the same computation;
+ * nothing falls back from one device to the other.
  */
 
 #ifndef VITNA_MODEL_H
@@ -42,6 +55,9 @@ typedef struct {
     float rms_eps;
     float rope_theta;
     bool tied_embeddings;
+    bool qk_norm;             /* RMSNorm over the query and key projections (OLMoE) */
+    size_t n_experts;         /* experts in each layer's MLP; 0 for a dense model */
+    size_t n_experts_used;    /* experts each token goes through */
 } vitna_llama_config_t;
 
 typedef struct {
@@ -51,10 +67,22 @@ typedef struct {
     size_t cols;
 } vitna_matrix_t;
 
+/* The most experts a token may go through. */
+#define VITNA_EXPERTS_USED_MAX 64
+
+/* One expert of a mixture: a SwiGLU MLP, intermediate wide. */
+typedef struct {
+    vitna_matrix_t gate, up, down;
+} vitna_expert_t;
+
 typedef struct {
     float* attn_norm;
     float* mlp_norm;
-    vitna_matrix_t q, k, v, o, gate, up, down;
+    vitna_matrix_t q, k, v, o, gate, up, down;  /* gate, up and down for a dense model */
+    float* q_norm;            /* qk_norm: over all n_heads * head_dim values of q */
+    float* k_norm;            /* and all n_kv_heads * head_dim of k */
+    vitna_matrix_t router;    /* a mixture of experts: n_experts x hidden */
+    vitna_expert_t* experts;  /* [n_experts] */
 } vitna_llama_layer_t;
 
 /* The model's state on a GPU, in model_cuda.cu. */
@@ -62,7 +90,8 @@ struct vitna_cuda_model;
 
 typedef struct {
     vitna_llama_config_t cfg;
-    vitna_safetensors_t st;
+    vitna_safetensors_t* shards;   /* the checkpoint's files: one, or those its index names */
+    size_t n_shards;
     vitna_matrix_t embed;
     vitna_matrix_t lm_head;
     float* final_norm;
@@ -77,6 +106,14 @@ typedef struct {
 
     /* scratch */
     float *x, *xn, *q, *k, *v, *att, *proj, *gate, *up, *scores, *cos_t, *sin_t;
+    float *router_logits, *expert_out;   /* a mixture of experts: n_experts, and hidden */
+
+    /* For tests, set by vitna_llama_trace_routing. */
+    float* trace_logits;
+    int32_t* trace_chosen;
+    size_t trace_positions;
+    const int32_t* pin;
+    size_t pin_positions;
 
     /* Set by vitna_llama_use_cuda: the forward pass then runs on the GPU,
      * with its own key-value cache there, and k_cache and v_cache go unused. */
@@ -201,6 +238,22 @@ size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
  */
 void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos);
 
+/**
+ * For tests of a mixture of experts, on the CPU. At every position p below
+ * positions, each step writes each layer's router logits to
+ * logits[(p * n_layers + layer) * n_experts ...] and the experts the router
+ * chose there, the highest scoring first, to
+ * chosen[(p * n_layers + layer) * n_experts_used ...]; either may be NULL.
+ * At every position below pin_positions, the token goes through the experts
+ * pin gives in the same layout instead of those chosen, each weighted as the
+ * router weighs it; the router's own choice is still what chosen receives.
+ * Positions are a sequence's own, in whichever sequence runs: the commands
+ * that use this run one. Pinned experts must be distinct and in range, which
+ * the caller checks. NULL buffers turn each part off.
+ */
+void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen, size_t positions, const int32_t* pin,
+                               size_t pin_positions);
+
 /** True when this engine was built with the CUDA path (VITNA_CUDA). */
 bool vitna_llama_cuda_built(void);
 
@@ -215,8 +268,9 @@ bool vitna_llama_cuda_probe(char* err, size_t err_len);
  * Move a loaded model's forward pass to the first CUDA device: upload every
  * weight once, in its stored dtype, and hold the key-value cache on the
  * device. Call it once, straight after vitna_llama_load, before any step.
- * Returns false, with the reason in err, if this engine was built without
- * CUDA or the device cannot take the model. The model is then as it was, on
+ * Returns false, with the reason in err, if the model is a mixture of
+ * experts, this engine was built without CUDA, or the device cannot take
+ * the model. The model is then as it was, on
  * the CPU; a caller that asked for the GPU should stop, not run it there.
  */
 bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len);

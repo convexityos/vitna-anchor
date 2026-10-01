@@ -91,6 +91,19 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/reference.test.mjs
+      # Gate A5's model is 13.8 GB, more than CI fetches. Its tokenizer.json
+      # is 2 MB, and the engine's tokenizer, NFC and all, is compared with it.
+      - name: Cache OLMoE's tokenizer
+        uses: actions/cache@v6
+        with:
+          path: models/olmoe-1b-7b
+          key: olmoe-tokenizer-${{ hashFiles('reference/olmoe-1b-7b/model.json') }}
+      - name: Fetch OLMoE's tokenizer.json at the pinned revision, checking its SHA-256
+        run: node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json
+      - name: Gate A5, the engine's tokenizer against OLMoE's reference
+        env:
+          VITNA_REQUIRE_MOE_TOKENIZER: "1"
+        run: node --test --test-reporter=spec tests/reference-moe.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"
