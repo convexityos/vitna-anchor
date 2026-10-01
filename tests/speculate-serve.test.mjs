@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadFixture } from "../reference/compare.mjs";
+import { keepStderr } from "./server-stderr.mjs";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const fixture = loadFixture(here("../reference/smollm2-135m/fixture.json"));
@@ -51,9 +52,10 @@ function start(args, env = {}) {
   });
   const server = { child, stderr: "" };
   child.stderr.on("data", (chunk) => (server.stderr += chunk));
+  keepStderr(child, env);
   return new Promise((resolve, reject) => {
     let out = "";
-    const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}`)), 30_000);
+    const timer = setTimeout(() => reject(new Error(`the server did not start: ${out}${server.stderr}`)), 30_000);
     child.stdout.on("data", (chunk) => {
       out += chunk;
       const m = out.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/);
@@ -63,7 +65,8 @@ function start(args, env = {}) {
         resolve(server);
       }
     });
-    child.on("exit", (code) => reject(new Error(`the server exited with ${code}: ${out}`)));
+    // "close", not "exit": by then its stderr has all been read.
+    child.on("close", (code) => reject(new Error(`the server exited with ${code}: ${out}${server.stderr}`)));
   });
 }
 

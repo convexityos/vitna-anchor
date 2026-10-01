@@ -195,7 +195,9 @@ size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
  * sequence reaches it first, as a step on the GPU does when the device
  * reports an error, so that what its callers do then can be tested on a CPU.
  * That step returns false before computing anything, on either device, and
- * says so on stderr. A later step at pos runs as usual.
+ * says so on stderr. On a GPU it first lets what earlier steps queued there
+ * run to its end, so nothing of the model's is left running when the failure
+ * is reported, as after a device error. A later step at pos runs as usual.
  */
 void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos);
 

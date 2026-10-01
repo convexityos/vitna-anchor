@@ -1643,6 +1643,12 @@ const char* vitna_cuda_device_name(const struct vitna_cuda_model* g) {
     return g ? g->name : "";
 }
 
+void vitna_cuda_wait(struct vitna_cuda_model* g) {
+    if (!g) return;
+    cudaSetDevice(g->device);
+    if (g->stream) cudaStreamSynchronize(g->stream);
+}
+
 /* Whether the GPU kernels can take the model: every matrix in the dtype of
  * the embedding, and widths the 16-byte reads divide. */
 static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {
