@@ -15,7 +15,8 @@
 // unless VITNA_REQUIRE_MOE=1, or for the tokenizer
 // VITNA_REQUIRE_MOE_TOKENIZER=1 (as in CI), where they fail. They run on the
 // CPU, or with VITNA_DEVICE=cuda on the GPU (--device cuda), for an engine
-// built with the CUDA path, as gate A4's do; two more run only there.
+// built with the CUDA path, as gate A4's do; two more run only there. On a
+// GPU they need VITNA_REQUIRE_MOE=1 and this file run alone (below).
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -371,8 +372,14 @@ const TOKENIZER = {
   skip: required("VITNA_REQUIRE_MOE") || required("VITNA_REQUIRE_MOE_TOKENIZER") ? false
     : missing(["tokenizer.json"], "node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json"),
 };
+// On a GPU each engine takes what the device has free for its experts, so
+// beside the other files' servers, which VITNA_DEVICE=cuda also puts there,
+// one of them would find no memory. There these run only when asked for,
+// with VITNA_REQUIRE_MOE=1, and with this file alone.
 const MODEL = {
-  skip: required("VITNA_REQUIRE_MOE") ? false : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs olmoe-1b-7b"),
+  skip: required("VITNA_REQUIRE_MOE") ? false
+    : GPU ? "on a GPU these run only with VITNA_REQUIRE_MOE=1, and this file alone: each engine takes what the GPU has free"
+    : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs olmoe-1b-7b"),
 };
 
 /** Run the engine. Resolves with its stdout; rejects with its stderr if it exits other than 0. */

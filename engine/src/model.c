@@ -704,7 +704,10 @@ static bool moe_step_on_gpu(vitna_llama_t* m, size_t seq, int32_t token, float* 
     }
     if (ok && logits) ok = vitna_cuda_moe_head(m->cuda, logits, err, sizeof(err));
     if (!ok) {
-        fprintf(stderr, "CUDA: %s\n", err);
+        /* As a dense step's failure is: said, and the device probed. An
+         * expert the drive failed to give leaves the device usable, and the
+         * probe says so. */
+        cuda_failed(m, err);
         return false;
     }
     m->past[seq] = pos + 1;
