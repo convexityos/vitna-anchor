@@ -94,6 +94,17 @@ const char* vitna_cuda_device_name(const struct vitna_cuda_model* g);
 /** Wait until everything queued on the model's stream has run. */
 void vitna_cuda_wait(struct vitna_cuda_model* g);
 
+/**
+ * After one of the calls above has failed: whether the device can run
+ * anything more in this process. CUDA calls some errors sticky (an illegal
+ * address, a kernel that faulted or ran too long, and others): any further
+ * work returns them again, and only a new process can use the device. So this
+ * clears the error the failed call left, asks for further work, a wait on the
+ * model's stream, and returns true, with that work's error in err, when it
+ * fails too.
+ */
+bool vitna_cuda_lost(struct vitna_cuda_model* g, char* err, size_t err_len);
+
 void vitna_cuda_free(struct vitna_cuda_model* g);
 
 #ifdef __cplusplus

@@ -24,6 +24,12 @@
 /* The most requests serve --parallel runs at once. */
 #define PARALLEL_MAX 64
 
+/* What serve exits with once the GPU can run nothing more in its process
+ * (vitna_api_lost): EX_TEMPFAIL in sysexits.h, a failure that running it
+ * again can cure, and a status the engine exits with for nothing else (not
+ * 3, which is what abort() exits with on Windows). */
+#define EXIT_DEVICE_LOST 75
+
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
         printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU\n");
@@ -70,7 +76,9 @@ static void print_usage(const char* prog) {
     printf("          --model its generation endpoints answer 501. --speculate k drafts and checks tokens as\n");
     printf("          generate --speculate does; no response changes. --parallel n runs up to n requests at\n");
     printf("          once (default 1, at most %d), each with a key-value cache of its own, their tokens\n", PARALLEL_MAX);
-    printf("          together in each pass on a GPU; every response is the one it gets alone\n");
+    printf("          together in each pass on a GPU; every response is the one it gets alone. After a GPU\n");
+    printf("          error that leaves the device unable to run anything more in the process, it answers\n");
+    printf("          each request open with an error and exits with status %d, to be started again\n", EXIT_DEVICE_LOST);
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
 }
@@ -783,8 +791,19 @@ static int cmd_serve(const args_t* a) {
     }
     /* For tests only: VITNA_TEST_FAIL_STEP=<position> makes the step at that
      * position fail once, so tests/step-failure.test.mjs can check what a
-     * client sees when a step fails, with no GPU error to cause one. */
+     * client sees when a step fails, with no GPU error to cause one. With
+     * VITNA_TEST_LOSE_DEVICE=1 too, the device is lost with that step, as
+     * with a GPU error CUDA calls sticky, so the same file can check that
+     * the server answers what is open and exits. */
     const char* fail = getenv("VITNA_TEST_FAIL_STEP");
+    const char* lose = getenv("VITNA_TEST_LOSE_DEVICE");
+    const bool losing = lose && *lose;
+    if (losing && !(fail && *fail)) {
+        fprintf(stderr, "VITNA_TEST_LOSE_DEVICE needs VITNA_TEST_FAIL_STEP, the position of the step that loses the device\n");
+        vitna_llama_free(&m);
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
     if (fail && *fail) {
         char* end;
         unsigned long long pos = strtoull(fail, &end, 10);
@@ -794,8 +813,9 @@ static int cmd_serve(const args_t* a) {
             vitna_tokenizer_free(tok);
             return 1;
         }
-        vitna_llama_fail_step_once(&m, (size_t)pos);
+        vitna_llama_fail_step_once(&m, (size_t)pos, losing);
         fprintf(stderr, "VITNA_TEST_FAIL_STEP is set, for a test: the step at position %llu will fail once.\n", pos);
+        if (losing) fprintf(stderr, "VITNA_TEST_LOSE_DEVICE is set, for a test: the device is lost with that step.\n");
     }
     char id[128];
     if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
@@ -829,6 +849,9 @@ static int cmd_serve(const args_t* a) {
         printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;
         rc = vitna_server_run(&cfg);
+        /* Only a new process can use the device again: say so to whatever
+         * started this one. */
+        if (vitna_api_lost(api)) rc = EXIT_DEVICE_LOST;
         vitna_api_free(api);
     }
     vitna_llama_free(&m);

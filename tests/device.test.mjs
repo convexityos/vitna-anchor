@@ -33,7 +33,10 @@ const skip = !engine && !required && "no built engine found";
 
 function run(args) {
   assert.ok(engine, `no built engine found; looked in ${CANDIDATES.join(", ")}`);
-  return spawnSync(engine, args, { encoding: "utf8" });
+  // Each run here ends at once; one that has not ended in 2 minutes never will, and is killed.
+  const r = spawnSync(engine, args, { encoding: "utf8", timeout: 2 * 60_000 });
+  assert.notEqual(r.error?.code, "ETIMEDOUT", `${engine} ${args.join(" ")} timed out after 2 minutes and was killed: ${r.stderr}`);
+  return r;
 }
 
 // Whether this engine has the CUDA path, as its usage says.

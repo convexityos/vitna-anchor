@@ -109,6 +109,7 @@ struct vitna_api {
     job_t* queue_tail;
     bool stopping;
     bool started;                   /* the scheduler's thread is running */
+    bool lost;                      /* the GPU can run nothing more, so requests are refused (lose) */
     vitna_thread_t thread;
 };
 
@@ -153,6 +154,7 @@ static const char* reason_phrase(int status) {
         case 405: return "Method Not Allowed";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
+        case 503: return "Service Unavailable";
         default: return "Error";
     }
 }
@@ -1287,11 +1289,57 @@ static void job_end(vitna_api_t* api, job_t* j) {
     vitna_sb_free(&g->text);
 }
 
+/* What a request is refused with once the GPU can run nothing more (lose).
+ * The model's device_error was written before lost was set, and is not
+ * written again. */
+static void lost_error(const vitna_api_t* api, api_error_t* e) {
+    set_error(e, 503, "server_error", "device_lost", NULL,
+              "The GPU can run nothing more in this process after this error: %s. The server is stopping; start it again to use the GPU.",
+              api->model->device_error);
+}
+
+/* After a step that lost the GPU (vitna_llama_t.device_lost), which only a
+ * new process can use again: every request still running ends with the
+ * error a failed step gives, every one waiting for a sequence is refused, as
+ * is every one that comes later (run_job), and the server stops taking
+ * connections (vitna_api_lost). */
+static void lose(vitna_api_t* api, job_t* running) {
+    fprintf(stderr,
+            "The GPU can run nothing more in this process after this error: %s. Each request still open is answered with an error, "
+            "and the server stops: start it again to use the GPU.\n",
+            api->model->device_error);
+    vitna_mutex_lock(&api->lock);
+    api->lost = true;
+    job_t* waiting = api->queue;
+    api->queue = NULL;
+    api->queue_tail = NULL;
+    vitna_mutex_unlock(&api->lock);
+    for (job_t* j = running; j; j = j->next) {
+        if (!j->ended) {
+            j->ok = false;
+            j->ended = true;
+        }
+    }
+    while (waiting) {
+        job_t* j = waiting;
+        waiting = j->next; /* first: once done is set, its connection frees j */
+        api_error_t e;
+        lost_error(api, &e);
+        j->r.prompt_tokens = j->ids->count; /* as run_job reports a request it refuses */
+        j->r.status = respond_error(&j->sink, &e);
+        vitna_mutex_lock(&api->lock);
+        j->done = true;
+        vitna_cond_signal(&j->cv);
+        vitna_mutex_unlock(&api->lock);
+    }
+}
+
 /* The scheduler's thread: it lends free sequences to waiting requests, oldest
  * first, begins each (its prompt), runs rounds over every request that has
  * one, and hands each back to its connection when it ends. */
 static void scheduler(void* arg) {
     vitna_api_t* api = (vitna_api_t*)arg;
+    const vitna_llama_t* m = api->model;
     job_t* running = NULL; /* the requests with a sequence, in the order they got one */
     for (;;) {
         vitna_mutex_lock(&api->lock);
@@ -1324,12 +1372,13 @@ static void scheduler(void* arg) {
          * waits for them; otherwise a piece of the oldest between rounds. */
         bool decoding = false;
         for (job_t* j = running; j; j = j->next) decoding = decoding || (!j->ended && !j->prompting);
-        for (job_t* j = running; j; j = j->next) {
+        for (job_t* j = running; j && !m->device_lost; j = j->next) {
             if (j->ended || !j->prompting) continue;
             job_prompt(api, j, !decoding);
             if (decoding) break;
         }
-        run_round(api, running);
+        if (!m->device_lost) run_round(api, running);
+        if (m->device_lost) lose(api, running);
 
         /* Hand back the requests that ended; a connection frees its job once
          * done is set, so each leaves the list first. */
@@ -1390,11 +1439,15 @@ static vitna_api_result_t run_job(vitna_api_t* api, vitna_sink_t* sink, const pa
 
     vitna_mutex_lock(&api->lock);
     if (!api->started) api->started = vitna_thread_start(&api->thread, scheduler, api, false);
-    if (!api->started) {
+    if (!api->started || api->lost) {
+        /* Refused under the lock that queues, so no request joins the queue
+         * after lose has emptied it. */
+        const bool lost = api->lost;
         vitna_mutex_unlock(&api->lock);
         vitna_cond_destroy(&j->cv);
         free(j);
-        set_error(&e, 500, "server_error", NULL, NULL, "the server could not start the thread that runs requests");
+        if (lost) lost_error(api, &e);
+        else set_error(&e, 500, "server_error", NULL, NULL, "the server could not start the thread that runs requests");
         r.status = respond_error(sink, &e);
         return r;
     }
@@ -1471,6 +1524,13 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
 
 size_t vitna_api_parallel(const vitna_api_t* api) {
     return api ? api->model->seqs : 0;
+}
+
+bool vitna_api_lost(vitna_api_t* api) {
+    vitna_mutex_lock(&api->lock);
+    const bool lost = api->lost;
+    vitna_mutex_unlock(&api->lock);
+    return lost;
 }
 
 void vitna_api_set_test_logits(vitna_api_t* api, bool on) {

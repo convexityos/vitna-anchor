@@ -380,8 +380,9 @@ void vitna_llama_truncate(vitna_llama_t* m, size_t seq, size_t n) {
     if (seq < m->seqs && n < m->past[seq]) m->past[seq] = n;
 }
 
-void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos) {
+void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos, bool lose_device) {
     m->fail_armed = true;
+    m->fail_loses = lose_device;
     m->fail_at = pos;
 }
 
@@ -396,8 +397,21 @@ static void fail_step_as_asked(vitna_llama_t* m, size_t pos) {
 #if defined(VITNA_CUDA)
     if (m->cuda) vitna_cuda_wait(m->cuda);
 #endif
-    fprintf(stderr, "The step at position %zu failed, as a test asked.\n", pos);
+    if (m->fail_loses) {
+        m->device_lost = true;
+        snprintf(m->device_error, sizeof(m->device_error), "the step at position %zu failed, and the device with it, as a test asked", pos);
+    }
+    fprintf(stderr, "The step at position %zu failed%s, as a test asked.\n", pos, m->fail_loses ? ", and the device with it" : "");
 }
+
+#if defined(VITNA_CUDA)
+/* A step on the GPU failed, for the reason in err: say so, and find whether
+ * the device can run anything more in this process (device_lost). */
+static void cuda_failed(vitna_llama_t* m, const char* err) {
+    fprintf(stderr, "CUDA: %s\n", err);
+    m->device_lost = vitna_cuda_lost(m->cuda, m->device_error, sizeof(m->device_error));
+}
+#endif
 
 void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen, size_t positions, const int32_t* pin,
                                size_t pin_positions) {
@@ -469,7 +483,7 @@ static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
 
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
-    if (seq >= m->seqs || token < 0 || (size_t)token >= c->vocab || m->past[seq] >= m->ctx) return false;
+    if (seq >= m->seqs || token < 0 || (size_t)token >= c->vocab || m->past[seq] >= m->ctx || m->device_lost) return false;
     if (m->fail_armed && m->past[seq] == m->fail_at) {
         fail_step_as_asked(m, m->fail_at);
         return false;
@@ -479,7 +493,7 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
     if (m->cuda) {
         char err[512];
         if (!vitna_cuda_step(m->cuda, seq, token, m->past[seq], logits, err, sizeof(err))) {
-            fprintf(stderr, "CUDA: %s\n", err);
+            cuda_failed(m, err);
             return false;
         }
         m->past[seq]++;
@@ -576,7 +590,7 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
 
 size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits, size_t rows) {
     const vitna_llama_config_t* c = &m->cfg;
-    if (seq >= m->seqs) return 0;
+    if (seq >= m->seqs || m->device_lost) return 0;
     const size_t start = m->past[seq];
     if (rows > count) rows = count;
     /* The tokens that can run: those before the first that is out of range,
@@ -594,7 +608,7 @@ size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, si
     if (m->cuda && run >= vitna_cuda_prompt_min(m->cuda)) {
         char err[512];
         if (!vitna_cuda_steps(m->cuda, seq, tokens, run, start, out, out ? rows : 0, err, sizeof(err))) {
-            fprintf(stderr, "CUDA: %s\n", err);
+            cuda_failed(m, err);
             return 0;
         }
         m->past[seq] = start + run;
@@ -658,7 +672,7 @@ static size_t gpu_pass(vitna_llama_t* m, const vitna_cuda_row_t* pass, const siz
         for (size_t j = 0; j < k; j++) out[j] = logits ? logits + at[j] * V : NULL;
         ok = vitna_cuda_rows(m->cuda, pass, k, out, err, sizeof(err));
     }
-    if (!ok) fprintf(stderr, "CUDA: %s\n", err);
+    if (!ok) cuda_failed(m, err);
     for (size_t j = 0; j < k; j++) {
         const size_t seq = (size_t)pass[j].seq;
         if (ok) {
@@ -673,7 +687,8 @@ static size_t gpu_pass(vitna_llama_t* m, const vitna_cuda_row_t* pass, const siz
 
 /* The rows in passes of up to vitna_cuda_exact_max, in order. A row that
  * cannot run (out of range, past its sequence's cache, failed by a test)
- * fails before its pass, as its step would, and the rows ahead of it run. */
+ * fails before its pass, as its step would, and the rows ahead of it run.
+ * Once the device is lost, no pass runs, the one being filled included. */
 static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_t n, float* logits, bool* ran, size_t* stopped) {
     const vitna_llama_config_t* c = &m->cfg;
     size_t cap = vitna_cuda_exact_max(m->cuda);
@@ -681,7 +696,7 @@ static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_
     vitna_cuda_row_t pass[PASS_MAX];
     size_t at[PASS_MAX];
     size_t k = 0, done = 0, n_stopped = 0;
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n && !m->device_lost; i++) {
         const size_t seq = rows[i].seq;
         if (listed(stopped, n_stopped, seq)) continue;
         /* The sequence's next position, after its rows already in this pass. */
@@ -704,7 +719,7 @@ static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_
             k = 0;
         }
     }
-    if (k > 0) done += gpu_pass(m, pass, at, k, logits, ran, stopped, &n_stopped);
+    if (k > 0 && !m->device_lost) done += gpu_pass(m, pass, at, k, logits, ran, stopped, &n_stopped);
     return done;
 }
 #endif

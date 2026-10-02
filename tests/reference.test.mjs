@@ -150,11 +150,18 @@ const missing = !engine
     : null;
 const A2 = { skip: process.env.VITNA_REQUIRE_REFERENCE === "1" ? false : missing ?? false };
 
+// An engine run that has not finished in this many minutes never will: it is
+// killed, and fails its test instead of hanging the suite. The longest run
+// here, the CPU's logits for the 565-token prompt of the last test, takes
+// about a minute on a busy CPU.
+const RUN_MINUTES = 10;
+
 function runEngine(args, input) {
   assert.ok(engine, "no built engine found");
   assert.ok(existsSync(join(modelDir, "model.safetensors")), `no model in ${modelDir}; run node scripts/fetch-model.mjs`);
-  const r = spawnSync(engine, args, { input, encoding: "utf8", maxBuffer: 1 << 26 });
-  assert.equal(r.status, 0, `${engine} ${args.join(" ")} exited ${r.status}: ${r.stderr}`);
+  const r = spawnSync(engine, args, { input, encoding: "utf8", maxBuffer: 1 << 26, timeout: RUN_MINUTES * 60_000 });
+  const ended = r.error?.code === "ETIMEDOUT" ? `timed out after ${RUN_MINUTES} minutes and was killed` : `exited ${r.status}`;
+  assert.equal(r.status, 0, `${engine} ${args.join(" ")} ${ended}: ${r.stderr}`);
   return r.stdout;
 }
 
