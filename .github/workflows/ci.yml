@@ -116,6 +116,10 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/step-failure.test.mjs
+      - name: The command line says why a step did not run
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/step-failure-cli.test.mjs
       - name: Drafted tokens, checked together, change no reply
         env:
           VITNA_REQUIRE_REFERENCE: "1"
