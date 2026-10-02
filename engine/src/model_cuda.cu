@@ -62,6 +62,35 @@
  * server run together, without changing a reply (--speculate, serve
  * --parallel). The key-value cache holds several sequences, each ctx
  * positions, one per request a server runs at once.
+ *
+ * A mixture of experts (OLMoE) runs a token a layer at a time instead, with
+ * the host between the layers' halves, because which experts a layer needs
+ * is known only once its router has run. Everything but the experts is
+ * uploaded once. A layer's attention ends in the router, whose logits over
+ * every expert are copied back; model.c routes from them, as it does on the
+ * CPU, and names the experts and their weights; the experts' gate and up
+ * projections run in one kernel, and their down projections, each scaled by
+ * its weight and added up in the order given, in a second, which adds the
+ * sum to the residual. The query and key projections pass through QK-norm
+ * before their rotary embedding, in a kernel of its own.
+ *
+ * The experts live in memory, and the device keeps a cache of them: slots
+ * of one expert each, its gate, up and down matrices, given up least used
+ * first, least recently used between equals, as the expert stream's are
+ * (expert_stream.h). An expert the cache lacks is copied into it on a stream
+ * of its own, and the layer's kernels wait for that copy alone. The copies
+ * come from the expert stream's slots when the experts are read from the
+ * drive (--expert-cache), or else from the mapped checkpoint. Either is
+ * registered with the device, page-locked, so a copy runs at the bus's full
+ * speed; a mapped file is registered read-only, and the pages a copy needs
+ * are read in as it runs. Where registering fails, copies go from pageable
+ * memory, slower. With the router's logits, the next layer's router scores
+ * the same residual, as the CPU path's lookahead does, and the half of the
+ * experts it names that it ranks highest start being copied behind the
+ * layer's own: a guess, which costs a copy when it is wrong and decides
+ * nothing (vitna_cuda_moe_experts says why half). An expert's arithmetic does not
+ * depend on where it came from or which slot holds it, so neither the size
+ * of the cache nor where the copies come from changes any logit.
  */
 
 #define NOMINMAX
@@ -74,6 +103,7 @@
 
 #include <cuda_runtime.h>
 
+#include "expert_stream.h"
 #include "model_cuda.h"
 
 /* Threads per block for every kernel but set_row_kernel: eight warps. */
@@ -120,16 +150,81 @@
 /* Minus infinity, from its bits: MSVC's INFINITY macro overflows a constant to get it. */
 #define NEG_INF __uint_as_float(0xff800000u)
 
+/* A mixture of experts: the most experts a token may go through on the GPU,
+ * the copies whose source the expert stream holds for them until they
+ * finish, and the device memory left free when the expert cache takes what
+ * the device has (for the desktop, and whatever else shares the GPU). */
+#define EXPERTS_MAX 16
+#define PENDING_MAX 64
+#define EXPERT_MARGIN ((size_t)512 << 20)
+
 typedef struct {
     const void* w;
     int rows, cols;
 } dmat_t;
 
 typedef struct {
-    dmat_t q, k, v, o, gate, up, down;
+    dmat_t q, k, v, o, gate, up, down;  /* gate, up and down for a dense model */
     const float* attn_norm;
     const float* mlp_norm;
+    const float* q_norm;  /* QK-norm, or NULL */
+    const float* k_norm;
+    dmat_t router;        /* a mixture of experts */
 } dlayer_t;
+
+/* The experts a kernel runs, and their weights, passed by value: their
+ * gate, up and down matrices on the device, in the order their outputs are
+ * added. */
+typedef struct {
+    const void* gate[EXPERTS_MAX];
+    const void* up[EXPERTS_MAX];
+    const void* down[EXPERTS_MAX];
+    float weight[EXPERTS_MAX];
+    int k;
+} experts_t;
+
+/* A slot of the device's expert cache. */
+typedef struct {
+    int64_t place;        /* the expert it holds, layer * n_experts + expert; -1 when empty */
+    uint64_t last_use;
+    bool held;            /* wanted by the layer being run, or just copied for its guess: not to be given up now */
+    bool filling;         /* a copy into it was queued and is not known to have finished */
+    bool guessed;         /* copied for a guess, and not wanted since */
+    cudaEvent_t filled;   /* recorded after the latest copy into it */
+} eslot_t;
+
+/* A copy whose source the expert stream holds until it finishes. */
+typedef struct {
+    cudaEvent_t done;
+    uint32_t place;
+} pending_t;
+
+typedef struct {
+    unsigned char* mem;   /* n_slots slots of slot_bytes */
+    size_t slot_bytes;
+    size_t part_bytes[3]; /* gate, up and down, one after another in a slot */
+    int n_slots;
+    eslot_t* slots;
+    size_t n_places;
+    int32_t* where;       /* [n_places]: the slot holding each, or -1 */
+    uint32_t* uses;       /* [n_places]: times each was wanted, halved every 65,536 */
+    uint64_t clock, acquired;
+    cudaStream_t copy;    /* the copies run here, beside the kernels */
+
+    /* Where the experts are in memory: the expert stream's slots, or the
+     * mapped checkpoint, whose parts are in parts, [n_places][3]. */
+    vitna_expert_stream_t* stream;
+    const void** parts;
+    pending_t pending[PENDING_MAX]; /* a ring, finishing in order, as the copy stream runs them */
+    int p_head, p_len;
+    int p_max;            /* the most the stream may hold for copies, leaving room for a layer's reads */
+    void** registered;    /* host memory registered with the device, to unregister */
+    int n_registered;
+    bool pinned;          /* whether the copies come from page-locked memory */
+
+    uint64_t hits, in_flight, misses, prefetched, prefetch_used;
+    uint64_t copies, bytes_copied;
+} expert_cache_t;
 
 /* A token the graphs run, its position, and the sequence whose cache it
  * reads and writes: vitna_cuda_row_t, which the host fills. A step's is the
@@ -176,6 +271,17 @@ struct vitna_cuda_model {
     int capture_T;          /* the tokens enqueue_multi is capturing */
     float* host_multi;      /* pinned, MULTI_MAX x vocab, for its logits */
     float* host_logits;     /* pinned, for the copy back */
+
+    /* A mixture of experts (moe): the layers' gate, up and down go unused,
+     * and the experts are in the cache below. */
+    bool moe;
+    bool qk_norm;
+    int n_experts, n_used;
+    float* k_raw;           /* QK-norm: a token's keys before it, n_kv_heads * head_dim */
+    float* router_out;      /* [2][n_experts]: a layer's router logits, then the next layer's guess */
+    float* host_router;     /* pinned, the same */
+    float* moe_act;         /* [n_used][intermediate]: silu(gate) * up, expert by expert */
+    expert_cache_t ec;
 };
 
 static bool fail(char* err, size_t err_len, const char* fmt, ...) {
@@ -382,13 +488,17 @@ __global__ void embed_kernel(const void* __restrict__ table, const row_t* __rest
  * half-split rotary embedding of ops.c's vitna_rope_half pairs element j of a
  * head with element j + head_dim / 2, so a warp computes those two rows
  * together and writes them rotated. Keys and values go straight to the
- * position's slot in the cache; value rows are taken two at a time, unrotated. */
+ * position's slot in the cache; value rows are taken two at a time, unrotated.
+ * With k_raw, for QK-norm, which comes before the rotary embedding, the
+ * queries and keys are written as projected, the keys to k_raw, and
+ * qk_norm_rope_kernel finishes them. */
 template <vitna_dtype_t DT>
 __global__ void attn_in_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
                                const void* __restrict__ wq, const void* __restrict__ wk, const void* __restrict__ wv,
                                float* __restrict__ q, float* __restrict__ kc, float* __restrict__ vc,
                                const float* __restrict__ cos_all, const float* __restrict__ sin_all,
-                               const row_t* __restrict__ rows, size_t seq_stride, int hidden, int n_heads, int n_kv_heads, int head_dim) {
+                               const row_t* __restrict__ rows, size_t seq_stride, int hidden, int n_heads, int n_kv_heads, int head_dim,
+                               float* __restrict__ k_raw) {
     extern __shared__ float4 shared4[];
     __shared__ float red[WARPS];
     float* xs = reinterpret_cast<float*>(shared4);
@@ -413,7 +523,11 @@ __global__ void attn_in_kernel(const float* __restrict__ x, const float* __restr
             const void* w = is_q ? wq : wk;
             const float a = row_dot<DT>(w, ra, hidden, xs, lane);
             const float b = row_dot<DT>(w, rb, hidden, xs, lane);
-            if (lane == 0) {
+            if (lane == 0 && k_raw) {
+                float* out = is_q ? q : k_raw;
+                out[ra] = a;
+                out[rb] = b;
+            } else if (lane == 0) {
                 float* out = is_q ? q : k;
                 out[ra] = a * cos_t[j] - b * sin_t[j];
                 out[rb] = b * cos_t[j] + a * sin_t[j];
@@ -615,6 +729,106 @@ __global__ void head_kernel(const float* __restrict__ x, const float* __restrict
     for (int r = blockIdx.x * WARPS + warp; r < vocab; r += gridDim.x * WARPS) {
         const float s = row_dot<DT>(w, r, hidden, xs, lane);
         if (lane == 0) logits[r] = s;
+    }
+}
+
+/* --- A mixture of experts (vitna_cuda_moe_route and vitna_cuda_moe_experts) --- */
+
+/* QK-norm, then the rotary embedding: OLMoE normalizes the query projection
+ * with an RMSNorm over all of its values at once, across the heads, and the
+ * key projection the same way, as model.c does, then rotates each head as
+ * attn_in_kernel would have. Block 0 takes the queries, in place; block 1
+ * the keys, from k_raw into the position's slot in the cache. */
+__global__ void qk_norm_rope_kernel(float* __restrict__ q, const float* __restrict__ k_raw, float* __restrict__ kc,
+                                    const float* __restrict__ q_norm, const float* __restrict__ k_norm, float eps,
+                                    const float* __restrict__ cos_all, const float* __restrict__ sin_all, const row_t* __restrict__ rows,
+                                    size_t seq_stride, int n_heads, int n_kv_heads, int head_dim) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[WARPS];
+    float* vs = reinterpret_cast<float*>(shared4);
+    const bool keys = blockIdx.x == 1;
+    const int n = (keys ? n_kv_heads : n_heads) * head_dim;
+    norm_to_shared(keys ? k_raw : q, keys ? k_norm : q_norm, vs, n, eps, red);
+    const int half = head_dim / 2;
+    const size_t pos = (size_t)rows[0].pos;
+    const float* cos_t = cos_all + pos * half;
+    const float* sin_t = sin_all + pos * half;
+    float* out = keys ? kc + (size_t)rows[0].seq * seq_stride + pos * n : q;
+    for (int u = threadIdx.x; u < n / 2; u += THREADS) {
+        const int j = u % half;
+        const int ra = (u / half) * head_dim + j, rb = ra + half;
+        const float a = vs[ra], b = vs[rb];
+        out[ra] = a * cos_t[j] - b * sin_t[j];
+        out[rb] = b * cos_t[j] + a * sin_t[j];
+    }
+}
+
+/* RMSNorm with the layer's MLP norm, then its router: a logit for every
+ * expert, into out. The blocks with blockIdx.y 1 do the same with the next
+ * layer's norm and router, on the same residual, into out + n_experts: the
+ * guess of the CPU path's lookahead. */
+template <vitna_dtype_t DT>
+__global__ void router_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, const void* __restrict__ w,
+                              const float* __restrict__ next_norm_w, const void* __restrict__ next_w, float eps, float* __restrict__ out,
+                              int hidden, int n_experts) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[WARPS];
+    float* xs = reinterpret_cast<float*>(shared4);
+    const bool next = blockIdx.y == 1;
+    norm_to_shared(x, next ? next_norm_w : norm_w, xs, hidden, eps, red);
+    const void* router = next ? next_w : w;
+    float* o = out + (next ? n_experts : 0);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = blockIdx.x * WARPS + warp; r < n_experts; r += gridDim.x * WARPS) {
+        const float s = row_dot<DT>(router, r, hidden, xs, lane);
+        if (lane == 0) o[r] = s;
+    }
+}
+
+/* RMSNorm with the layer's MLP norm, then the gate and up projections of
+ * each expert, as mlp_in_kernel computes a dense layer's: unit u is row
+ * u % intermediate of expert u / intermediate, and silu(gate) * up goes to
+ * act[u]. */
+template <vitna_dtype_t DT>
+__global__ void experts_in_kernel(const float* __restrict__ x, const float* __restrict__ norm_w, float eps, experts_t e,
+                                  float* __restrict__ act, int hidden, int intermediate) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[WARPS];
+    float* xs = reinterpret_cast<float*>(shared4);
+    norm_to_shared(x, norm_w, xs, hidden, eps, red);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int units = e.k * intermediate;
+    for (int u = blockIdx.x * WARPS + warp; u < units; u += gridDim.x * WARPS) {
+        const int k = u / intermediate, r = u % intermediate;
+        const float g = row_dot<DT>(e.gate[k], r, hidden, xs, lane);
+        const float v = row_dot<DT>(e.up[k], r, hidden, xs, lane);
+        if (lane == 0) act[u] = (g / (1.0f + expf(-g))) * v;
+    }
+}
+
+/* The experts' down projections, added to the residual: a warp takes row r
+ * of every expert, and its output there is each expert's, multiplied by the
+ * expert's weight and rounded, added to the sum so far and rounded, from
+ * zero, expert after expert in the order given; then the sum is added to
+ * the residual. That is transformers' eager experts, which scale each
+ * expert's output and index_add_ it in order of expert, then the decoder
+ * layer's residual add; model.c's mixture_of_experts adds the same way. The
+ * activations of every expert are read into shared memory first. */
+template <vitna_dtype_t DT>
+__global__ void experts_down_kernel(const float* __restrict__ act, experts_t e, float* __restrict__ x, int hidden, int intermediate) {
+    extern __shared__ float4 shared4[];
+    float* as = reinterpret_cast<float*>(shared4);
+    const int n4 = e.k * intermediate / 4;
+    for (int i = threadIdx.x; i < n4; i += THREADS) shared4[i] = reinterpret_cast<const float4*>(act)[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = blockIdx.x * WARPS + warp; r < hidden; r += gridDim.x * WARPS) {
+        float sum = 0.0f;
+        for (int k = 0; k < e.k; k++) {
+            const float y = row_dot<DT>(e.down[k], r, intermediate, as + (size_t)k * intermediate, lane);
+            sum = __fadd_rn(sum, __fmul_rn(y, e.weight[k]));
+        }
+        if (lane == 0) x[r] = x[r] + sum;
     }
 }
 
@@ -1434,31 +1648,45 @@ static size_t attention_shared(const struct vitna_cuda_model* g) {
     return group * ((size_t)g->head_dim + per) * sizeof(float);
 }
 
-/* The embedding and every layer, in model.c's order. Captured once, into g->body. */
-static void enqueue_body(const struct vitna_cuda_model* g) {
+/* Layer l's attention for the token g->rows names, in model.c's order: RMSNorm
+ * and the query, key and value projections, QK-norm where the model has it,
+ * the rotary embedding, attention over the cache, and the output projection
+ * added to the residual. */
+static void enqueue_attention(const struct vitna_cuda_model* g, int l) {
     const cudaStream_t s = g->stream;
     const int H = g->hidden, hd = g->head_dim, half = hd / 2;
     const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
     const int group = g->n_heads / g->n_kv_heads;
+    const size_t seq_stride = (size_t)g->ctx * kv_dim;
+    const dlayer_t* L = &g->layers[l];
+    float* kc = g->k_cache + (size_t)l * g->seqs * seq_stride;
+    float* vc = g->v_cache + (size_t)l * g->seqs * seq_stride;
+
+    LAUNCH(g->dtype, attn_in_kernel, grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2), (size_t)H * sizeof(float), s, g->x,
+           L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w, g->q, kc, vc, g->cos_t, g->sin_t, g->rows, seq_stride, H, g->n_heads, g->n_kv_heads,
+           hd, L->q_norm ? g->k_raw : (float*)NULL);
+    if (L->q_norm) {
+        qk_norm_rope_kernel<<<2, THREADS, (size_t)(q_dim > kv_dim ? q_dim : kv_dim) * sizeof(float), s>>>(
+            g->q, g->k_raw, kc, L->q_norm, L->k_norm, g->eps, g->cos_t, g->sin_t, g->rows, seq_stride, g->n_heads, g->n_kv_heads, hd);
+    }
+    attention_kernel<<<dim3(1, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
+        g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 0);
+    LAUNCH(g->dtype, matvec_add_kernel, grid_for(g, H), 0, s, L->o.w, g->att, g->x, H, q_dim);
+}
+
+/* The embedding and every layer, in model.c's order. Captured once, into g->body. */
+static void enqueue_body(const struct vitna_cuda_model* g) {
+    const cudaStream_t s = g->stream;
+    const int H = g->hidden;
     const size_t norm_shared = (size_t)H * sizeof(float);
-    const unsigned int attn_in_blocks = grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2);
     const unsigned int mlp_in_blocks = grid_for(g, g->intermediate);
     const unsigned int out_blocks = grid_for(g, H);
     const unsigned int embed_blocks = blocks_for((size_t)H, THREADS);
 
-    const size_t seq_stride = (size_t)g->ctx * kv_dim;
-
     LAUNCH(g->dtype, embed_kernel, embed_blocks, 0, s, g->embed.w, g->rows, H, g->x);
     for (int l = 0; l < g->n_layers; l++) {
         const dlayer_t* L = &g->layers[l];
-        float* kc = g->k_cache + (size_t)l * g->seqs * seq_stride;
-        float* vc = g->v_cache + (size_t)l * g->seqs * seq_stride;
-
-        LAUNCH(g->dtype, attn_in_kernel, attn_in_blocks, norm_shared, s, g->x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w,
-               g->q, kc, vc, g->cos_t, g->sin_t, g->rows, seq_stride, H, g->n_heads, g->n_kv_heads, hd);
-        attention_kernel<<<dim3(1, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
-            g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 0);
-        LAUNCH(g->dtype, matvec_add_kernel, out_blocks, 0, s, L->o.w, g->att, g->x, H, q_dim);
+        enqueue_attention(g, l);
         LAUNCH(g->dtype, mlp_in_kernel, mlp_in_blocks, norm_shared, s, g->x, L->mlp_norm, g->eps, L->gate.w, L->up.w, g->act, H, g->intermediate);
         LAUNCH(g->dtype, matvec_add_kernel, out_blocks, 0, s, L->down.w, g->act, g->x, H, g->intermediate);
     }
@@ -1622,10 +1850,39 @@ bool vitna_cuda_probe(char* err, size_t err_len) {
     return true;
 }
 
+/* The expert cache's part of vitna_cuda_free: the copies finished and their
+ * sources released to the expert stream, which the model closes after
+ * this, and the memory registered for them unregistered. */
+static void free_experts(struct vitna_cuda_model* g) {
+    expert_cache_t* c = &g->ec;
+    if (c->copy) cudaStreamSynchronize(c->copy);
+    while (c->p_len > 0) {
+        vitna_expert_stream_release(c->stream, &c->pending[c->p_head].place, 1);
+        c->p_head = (c->p_head + 1) % PENDING_MAX;
+        c->p_len--;
+    }
+    for (int i = 0; i < PENDING_MAX; i++) {
+        if (c->pending[i].done) cudaEventDestroy(c->pending[i].done);
+    }
+    for (int i = 0; c->slots && i < c->n_slots; i++) {
+        if (c->slots[i].filled) cudaEventDestroy(c->slots[i].filled);
+    }
+    for (int i = 0; i < c->n_registered; i++) cudaHostUnregister(c->registered[i]);
+    if (c->copy) cudaStreamDestroy(c->copy);
+    if (c->mem) cudaFree(c->mem);
+    free(c->registered);
+    free(c->slots);
+    free(c->where);
+    free(c->uses);
+    free((void*)c->parts);
+    if (g->host_router) cudaFreeHost(g->host_router);
+}
+
 void vitna_cuda_free(struct vitna_cuda_model* g) {
     if (!g) return;
     cudaSetDevice(g->device);
     if (g->stream) cudaStreamSynchronize(g->stream);
+    free_experts(g);
     if (g->body) cudaGraphExecDestroy(g->body);
     if (g->head) cudaGraphExecDestroy(g->head);
     for (int t = 0; t <= MULTI_MAX; t++) {
@@ -1650,7 +1907,9 @@ void vitna_cuda_wait(struct vitna_cuda_model* g) {
 }
 
 /* Whether the GPU kernels can take the model: every matrix in the dtype of
- * the embedding, and widths the 16-byte reads divide. */
+ * the embedding, widths the 16-byte reads divide, and, for a mixture of
+ * experts, experts all of one shape, few enough for a kernel's arguments,
+ * whose activations fit in shared memory together. */
 static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {
     const vitna_llama_config_t* c = &m->cfg;
     const vitna_dtype_t dt = m->embed.dtype;
@@ -1660,17 +1919,148 @@ static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {
     if (c->hidden * sizeof(float) > 48 * 1024) {
         return fail(err, err_len, "the GPU path needs hidden to be at most 12288");
     }
+    if (c->qk_norm && (c->n_heads * c->head_dim * sizeof(float) > 48 * 1024 || c->n_kv_heads * c->head_dim * sizeof(float) > 48 * 1024)) {
+        return fail(err, err_len, "the GPU path's QK-norm needs n_heads * head_dim to be at most 12288");
+    }
+    if (c->n_experts && c->n_experts_used > EXPERTS_MAX) {
+        return fail(err, err_len, "the GPU path takes a mixture whose tokens go through at most %d experts, and this one's go through %zu",
+                    EXPERTS_MAX, c->n_experts_used);
+    }
+    if (c->n_experts && c->n_experts_used * c->intermediate * sizeof(float) > 48 * 1024) {
+        return fail(err, err_len, "the GPU path needs the experts a token goes through times their intermediate width to be at most 12288");
+    }
     bool same = m->lm_head.dtype == dt;
     for (size_t l = 0; same && l < c->n_layers; l++) {
         const vitna_llama_layer_t* L = &m->layers[l];
-        same = L->q.dtype == dt && L->k.dtype == dt && L->v.dtype == dt && L->o.dtype == dt &&
-               L->gate.dtype == dt && L->up.dtype == dt && L->down.dtype == dt;
+        same = L->q.dtype == dt && L->k.dtype == dt && L->v.dtype == dt && L->o.dtype == dt;
+        if (!c->n_experts) {
+            same = same && L->gate.dtype == dt && L->up.dtype == dt && L->down.dtype == dt;
+            continue;
+        }
+        same = same && L->router.dtype == dt;
+        for (size_t e = 0; same && e < c->n_experts; e++) {
+            const vitna_expert_t* x = &L->experts[e];
+            const vitna_expert_t* x0 = &m->layers[0].experts[0];
+            same = x->gate.dtype == dt && x->up.dtype == dt && x->down.dtype == dt;
+            if (same && (x->gate.rows != x0->gate.rows || x->gate.cols != x0->gate.cols || x->up.rows != x0->up.rows ||
+                         x->up.cols != x0->up.cols || x->down.rows != x0->down.rows || x->down.cols != x0->down.cols)) {
+                return fail(err, err_len, "the GPU path needs every expert to have the same shape");
+            }
+        }
     }
     if (!same) return fail(err, err_len, "the GPU path needs every weight matrix in one dtype, and this model mixes them");
     return true;
 }
 
-struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, char* err, size_t err_len) {
+/* A mixture of experts' cache on the device: as many slots as
+ * expert_cache_bytes holds, or for 0 as the device has free less
+ * EXPERT_MARGIN, and no more than one for every expert; the stream the
+ * copies run on and the events that mark them; and the memory they come
+ * from, registered with the device so they run at the bus's full speed. */
+static bool create_experts(struct vitna_cuda_model* g, const vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len) {
+    const vitna_llama_config_t* c = &m->cfg;
+    expert_cache_t* ec = &g->ec;
+    const vitna_expert_t* x0 = &m->layers[0].experts[0];
+    ec->part_bytes[0] = matrix_bytes(&x0->gate);
+    ec->part_bytes[1] = matrix_bytes(&x0->up);
+    ec->part_bytes[2] = matrix_bytes(&x0->down);
+    ec->slot_bytes = padded(ec->part_bytes[0] + ec->part_bytes[1] + ec->part_bytes[2]);
+    ec->n_places = c->n_layers * c->n_experts;
+    const size_t need = 2 * c->n_experts_used; /* a layer's experts, and its guess at the next layer's */
+
+    size_t free_b = 0, total_b = 0;
+    cudaError_t e = cudaMemGetInfo(&free_b, &total_b);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot ask the device what memory it has free", e);
+    size_t slots = expert_cache_bytes ? expert_cache_bytes / ec->slot_bytes
+                                      : (free_b > EXPERT_MARGIN ? (free_b - EXPERT_MARGIN) / ec->slot_bytes : 0);
+    if (slots > ec->n_places) slots = ec->n_places; /* a slot for every expert holds them all */
+    if (slots < need || !fits_int(slots)) {
+        return fail(err, err_len,
+                    "the GPU's expert cache must hold twice the experts a token goes through: %zu MiB or more, with %.0f MiB of the device's %.0f MiB free",
+                    (need * ec->slot_bytes + ((size_t)1 << 20) - 1) >> 20, free_b / 1048576.0, total_b / 1048576.0);
+    }
+    e = cudaMalloc((void**)&ec->mem, slots * ec->slot_bytes);
+    if (e != cudaSuccess) {
+        ec->mem = NULL;
+        cudaGetLastError(); /* clear the allocation error */
+        return fail(err, err_len, "the GPU's expert cache of %zu MiB does not fit, with %.0f MiB of the device's %.0f MiB free (%s); --gpu-expert-cache asks for less",
+                    (slots * ec->slot_bytes) >> 20, free_b / 1048576.0, total_b / 1048576.0, cudaGetErrorName(e));
+    }
+    ec->n_slots = (int)slots;
+    ec->slots = (eslot_t*)calloc(slots, sizeof(eslot_t));
+    ec->where = (int32_t*)malloc(ec->n_places * sizeof(int32_t));
+    ec->uses = (uint32_t*)calloc(ec->n_places, sizeof(uint32_t));
+    ec->registered = (void**)calloc(m->n_shards + 1, sizeof(void*));
+    if (!ec->slots || !ec->where || !ec->uses || !ec->registered) return fail(err, err_len, "out of memory");
+    for (size_t p = 0; p < ec->n_places; p++) ec->where[p] = -1;
+    e = cudaStreamCreateWithFlags(&ec->copy, cudaStreamNonBlocking);
+    for (int i = 0; e == cudaSuccess && i < ec->n_slots; i++) {
+        ec->slots[i].place = -1;
+        e = cudaEventCreateWithFlags(&ec->slots[i].filled, cudaEventDisableTiming);
+    }
+    for (int i = 0; e == cudaSuccess && i < PENDING_MAX; i++) e = cudaEventCreateWithFlags(&ec->pending[i].done, cudaEventDisableTiming);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot set up the GPU's expert cache", e);
+
+    ec->pinned = true;
+    if (m->stream) {
+        /* The expert stream's slots. Each copy holds its source there until
+         * it finishes, and no more are held than leave a layer's reads room. */
+        ec->stream = m->stream;
+        const size_t host_slots = vitna_expert_stream_slots(m->stream);
+        ec->p_max = host_slots >= need + PENDING_MAX ? PENDING_MAX : (host_slots > need ? (int)(host_slots - need) : 0);
+        size_t bytes = 0;
+        void* mem = vitna_expert_stream_memory(m->stream, &bytes);
+        if (cudaHostRegister(mem, bytes, cudaHostRegisterDefault) == cudaSuccess) {
+            ec->registered[ec->n_registered++] = mem;
+        } else {
+            cudaGetLastError();
+            ec->pinned = false;
+        }
+    } else {
+        /* The mapped checkpoint, registered read-only: its pages are read in
+         * as the copies need them, and stay the operating system's. */
+        ec->parts = (const void**)malloc(ec->n_places * 3 * sizeof(void*));
+        if (!ec->parts) return fail(err, err_len, "out of memory");
+        for (size_t l = 0; l < c->n_layers; l++) {
+            for (size_t x = 0; x < c->n_experts; x++) {
+                const vitna_expert_t* ex = &m->layers[l].experts[x];
+                const void** p = ec->parts + (l * c->n_experts + x) * 3;
+                p[0] = ex->gate.data;
+                p[1] = ex->up.data;
+                p[2] = ex->down.data;
+            }
+        }
+        int read_only = 0;
+        if (cudaDeviceGetAttribute(&read_only, cudaDevAttrHostRegisterReadOnlySupported, g->device) != cudaSuccess) read_only = 0;
+        for (size_t i = 0; i < m->n_shards; i++) {
+            void* base = m->shards[i].mmap.data;
+            const size_t bytes = (m->shards[i].mmap.size + 4095) / 4096 * 4096;
+            if (read_only && cudaHostRegister(base, bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
+                ec->registered[ec->n_registered++] = base;
+            } else {
+                cudaGetLastError();
+                ec->pinned = false;
+            }
+        }
+    }
+    /* Registered memory is made resident for the device at the first work
+     * submitted after it, which locks every page, reading in those not in
+     * memory: seconds for a whole checkpoint. Submit that now, so loading
+     * pays for it rather than the first token. */
+    set_row_kernel<<<1, 1, 0, g->stream>>>(g->rows, 0, 0, 0);
+    e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+    if (e != cudaSuccess) {
+        return fail(err, err_len,
+                    "the memory the experts are copied from cannot be locked for the device: %s (%s); --expert-cache <MiB> copies them from "
+                    "a cache that size in memory instead of the whole checkpoint",
+                    cudaGetErrorString(e), cudaGetErrorName(e));
+    }
+    return true;
+}
+
+struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, size_t expert_cache_bytes,
+                                           char* err, size_t err_len) {
     const vitna_llama_config_t* c = &m->cfg;
     if (!vitna_cuda_probe(err, err_len)) return NULL;
     if (c->head_dim > THREADS || c->head_dim % 4 != 0) {
@@ -1708,13 +2098,19 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     g->eps = c->rms_eps;
     g->scale = 1.0f / sqrtf((float)c->head_dim); /* as model.c */
     g->dtype = m->embed.dtype;
-    g->prompt = prompt_batches(g);
+    g->moe = c->n_experts > 0;
+    g->qk_norm = c->qk_norm;
+    g->n_experts = (int)c->n_experts;
+    g->n_used = (int)c->n_experts_used;
+    /* A mixture of experts runs a token at a time, its prompts too. */
+    g->prompt = !g->moe && prompt_batches(g);
 
     cudaError_t e = cudaSetDevice(g->device);
     cudaDeviceProp prop;
     if (e == cudaSuccess) e = cudaGetDeviceProperties(&prop, g->device);
     if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&g->stream, cudaStreamNonBlocking);
     if (e == cudaSuccess) e = cudaMallocHost((void**)&g->host_logits, c->vocab * sizeof(float));
+    if (e == cudaSuccess && g->moe) e = cudaMallocHost((void**)&g->host_router, 2 * c->n_experts * sizeof(float));
     /* Several steps at once take up to MULTI_MAX tokens, as many as fit their
      * normalized rows in 48 KB of shared memory, in the prompt's scratch. */
     g->multi_max = g->prompt ? (int)(48 * 1024 / (c->hidden * sizeof(float))) : 0;
@@ -1734,14 +2130,21 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         return NULL;
     }
 
-    /* One allocation: the weights, the rotary tables, the key-value cache and the scratch. */
+    /* One allocation: the weights, the rotary tables, the key-value cache and
+     * the scratch. A mixture of experts' experts are not among the weights:
+     * they go in the expert cache, allocated after this. */
     const bool tied = m->lm_head.data == m->embed.data;
     size_t total = 0;
     for (size_t l = 0; l < c->n_layers; l++) {
         const vitna_llama_layer_t* L = &m->layers[l];
-        const vitna_matrix_t* mats[7] = { &L->q, &L->k, &L->v, &L->o, &L->gate, &L->up, &L->down };
-        for (int i = 0; i < 7; i++) total += padded(matrix_bytes(mats[i]));
+        const vitna_matrix_t* mats[8] = { &L->q, &L->k, &L->v, &L->o, &L->gate, &L->up, &L->down, &L->router };
+        for (int i = 0; i < 8; i++) total += padded(matrix_bytes(mats[i])); /* those a model lacks are empty */
         total += 2 * padded(c->hidden * sizeof(float));
+        if (c->qk_norm) total += padded(q_dim * sizeof(float)) + padded(kv_dim * sizeof(float));
+    }
+    if (g->moe) {
+        total += padded(kv_dim * sizeof(float)) + padded(2 * c->n_experts * sizeof(float)) +
+                 padded(c->n_experts_used * c->intermediate * sizeof(float));
     }
     total += padded(matrix_bytes(&m->embed));
     if (!tied) total += padded(matrix_bytes(&m->lm_head));
@@ -1805,11 +2208,19 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         UPLOAD_MATRIX(D->k, L->k);
         UPLOAD_MATRIX(D->v, L->v);
         UPLOAD_MATRIX(D->o, L->o);
-        UPLOAD_MATRIX(D->gate, L->gate);
-        UPLOAD_MATRIX(D->up, L->up);
-        UPLOAD_MATRIX(D->down, L->down);
+        if (g->moe) {
+            UPLOAD_MATRIX(D->router, L->router);
+        } else {
+            UPLOAD_MATRIX(D->gate, L->gate);
+            UPLOAD_MATRIX(D->up, L->up);
+            UPLOAD_MATRIX(D->down, L->down);
+        }
         UPLOAD_FLOATS(D->attn_norm, L->attn_norm, c->hidden);
         UPLOAD_FLOATS(D->mlp_norm, L->mlp_norm, c->hidden);
+        if (c->qk_norm) {
+            UPLOAD_FLOATS(D->q_norm, L->q_norm, q_dim);
+            UPLOAD_FLOATS(D->k_norm, L->k_norm, kv_dim);
+        }
     }
     UPLOAD_MATRIX(g->embed, m->embed);
     if (tied) {
@@ -1847,6 +2258,11 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
             g->p_logits = (float*)carve(&cv, (size_t)LOGIT_ROWS * c->vocab * sizeof(float));
             g->p_tokens = (int32_t*)carve(&cv, m->ctx * sizeof(int32_t));
         }
+        if (g->moe) {
+            g->k_raw = (float*)carve(&cv, kv_dim * sizeof(float));
+            g->router_out = (float*)carve(&cv, 2 * c->n_experts * sizeof(float));
+            g->moe_act = (float*)carve(&cv, c->n_experts_used * c->intermediate * sizeof(float));
+        }
         /* A position is always written before it is read; zeros make a mistake there repeatable. */
         e = cudaMemset(g->k_cache, 0, 2 * padded(cache_floats * sizeof(float)));
         /* Attention counts finished slices up from zero, and leaves the count at zero. */
@@ -1862,21 +2278,32 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         return NULL;
     }
 
-    e = capture(g, enqueue_body, &g->body);
-    if (e == cudaSuccess) e = capture(g, enqueue_head, &g->head);
-    if (e != cudaSuccess) {
-        fail_cuda(err, err_len, "capturing the forward pass as a CUDA graph failed", e);
-        vitna_cuda_free(g);
-        return NULL;
+    /* A mixture of experts runs layer by layer, routed in between, so its
+     * forward pass is not captured. */
+    if (!g->moe) {
+        e = capture(g, enqueue_body, &g->body);
+        if (e == cudaSuccess) e = capture(g, enqueue_head, &g->head);
+        if (e != cudaSuccess) {
+            fail_cuda(err, err_len, "capturing the forward pass as a CUDA graph failed", e);
+            vitna_cuda_free(g);
+            return NULL;
+        }
     }
 
     /* Run the graphs once, at position 0 of the first sequence, so a build
      * with no code for this GPU fails on load, not at the first token. What
-     * it writes to that position is written again before it is read. */
+     * it writes to that position is written again before it is read. A
+     * mixture of experts runs its embedding and head instead, as there are
+     * no experts on the device yet. */
     set_row_kernel<<<1, 1, 0, g->stream>>>(g->rows, 0, 0, 0);
     e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaGraphLaunch(g->body, g->stream);
-    if (e == cudaSuccess) e = cudaGraphLaunch(g->head, g->stream);
+    if (e == cudaSuccess && g->moe) {
+        LAUNCH(g->dtype, embed_kernel, blocks_for(c->hidden, THREADS), 0, g->stream, g->embed.w, g->rows, g->hidden, g->x);
+        enqueue_head(g);
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess && !g->moe) e = cudaGraphLaunch(g->body, g->stream);
+    if (e == cudaSuccess && !g->moe) e = cudaGraphLaunch(g->head, g->stream);
     if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
     if (e != cudaSuccess) {
         if (e == cudaErrorNoKernelImageForDevice || e == cudaErrorUnsupportedPtxVersion) {
@@ -1887,10 +2314,15 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         vitna_cuda_free(g);
         return NULL;
     }
+    if (g->moe && !create_experts(g, m, expert_cache_bytes, err, err_len)) {
+        vitna_cuda_free(g);
+        return NULL;
+    }
     return g;
 }
 
 bool vitna_cuda_step(struct vitna_cuda_model* g, size_t seq, int32_t token, size_t pos, float* logits, char* err, size_t err_len) {
+    if (g->moe) return fail(err, err_len, "a mixture of experts runs a layer at a time, routed in between (vitna_cuda_moe_route)");
     cudaError_t e = cudaSetDevice(g->device);
     if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
 
@@ -1997,4 +2429,309 @@ bool vitna_cuda_rows(struct vitna_cuda_model* g, const vitna_cuda_row_t* rows, s
         if (logits[i]) memcpy(logits[i], g->host_multi + i * g->vocab, g->vocab * sizeof(float));
     }
     return true;
+}
+
+/* --- A mixture of experts, layer by layer --- */
+
+/* The copies that have finished, oldest first, their sources released to
+ * the expert stream. */
+static void settle(expert_cache_t* c) {
+    while (c->p_len > 0) {
+        const cudaError_t e = cudaEventQuery(c->pending[c->p_head].done);
+        if (e != cudaSuccess) {
+            if (e == cudaErrorNotReady) cudaGetLastError(); /* not an error: the copy is still running */
+            return;
+        }
+        vitna_expert_stream_release(c->stream, &c->pending[c->p_head].place, 1);
+        c->p_head = (c->p_head + 1) % PENDING_MAX;
+        c->p_len--;
+    }
+}
+
+/* Wait for the oldest copies until at most n are left, releasing their sources. */
+static cudaError_t drain(expert_cache_t* c, int n) {
+    while (c->p_len > n) {
+        const cudaError_t e = cudaEventSynchronize(c->pending[c->p_head].done);
+        if (e != cudaSuccess) return e;
+        vitna_expert_stream_release(c->stream, &c->pending[c->p_head].place, 1);
+        c->p_head = (c->p_head + 1) % PENDING_MAX;
+        c->p_len--;
+    }
+    return cudaSuccess;
+}
+
+/* A slot to give an expert: an empty one, or else the least used of those
+ * not held, the least recently used between equals, as the expert stream
+ * chooses (expert_stream.c). -1 if every slot is held. */
+static int free_slot(const expert_cache_t* c) {
+    int best = -1;
+    for (int i = 0; i < c->n_slots; i++) {
+        const eslot_t* x = &c->slots[i];
+        if (x->held) continue;
+        if (x->place < 0) return i;
+        if (best < 0) {
+            best = i;
+            continue;
+        }
+        const eslot_t* b = &c->slots[best];
+        const uint32_t cx = c->uses[x->place], cb = c->uses[b->place];
+        if (cx < cb || (cx == cb && x->last_use < b->last_use)) best = i;
+    }
+    return best;
+}
+
+/* Give slot s to the expert at place and queue the copy of its gate, up and
+ * down matrices from data into it, on the copy stream, then the event that
+ * marks the copy done. The slot is held. A source the expert stream holds
+ * stays held until the copy has finished (settle, drain). */
+static cudaError_t fill(expert_cache_t* c, int s, uint32_t place, const vitna_expert_data_t* data, bool guessed) {
+    eslot_t* x = &c->slots[s];
+    if (x->place >= 0) c->where[x->place] = -1;
+    x->place = (int64_t)place;
+    c->where[place] = s;
+    x->held = true;
+    x->guessed = guessed;
+    x->last_use = ++c->clock;
+    x->filling = true;
+    unsigned char* dst = c->mem + (size_t)s * c->slot_bytes;
+    cudaError_t e = cudaSuccess;
+    for (int p = 0; p < 3 && e == cudaSuccess; p++) {
+        e = cudaMemcpyAsync(dst, data->part[p], c->part_bytes[p], cudaMemcpyHostToDevice, c->copy);
+        dst += c->part_bytes[p];
+        c->bytes_copied += c->part_bytes[p];
+    }
+    if (e == cudaSuccess) e = cudaEventRecord(x->filled, c->copy);
+    c->copies++;
+    if (c->stream) {
+        if (e == cudaSuccess && c->p_len == PENDING_MAX) e = drain(c, PENDING_MAX - 1);
+        pending_t* p = &c->pending[(c->p_head + c->p_len) % PENDING_MAX];
+        if (e == cudaSuccess) e = cudaEventRecord(p->done, c->copy);
+        if (e == cudaSuccess) {
+            p->place = place;
+            c->p_len++;
+        } else {
+            vitna_expert_stream_release(c->stream, &place, 1);
+        }
+    }
+    if (e != cudaSuccess) {
+        /* The slot cannot be trusted: let it be empty. */
+        c->where[place] = -1;
+        x->place = -1;
+    }
+    return e;
+}
+
+bool vitna_cuda_moe_route(struct vitna_cuda_model* g, size_t seq, int32_t token, size_t pos, size_t layer, float* logits, float* next,
+                          char* err, size_t err_len) {
+    if (!g->moe || layer >= (size_t)g->n_layers || (next && layer + 1 >= (size_t)g->n_layers)) {
+        return fail(err, err_len, "layer %zu of this model cannot be routed", layer);
+    }
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
+    const cudaStream_t s = g->stream;
+    const int H = g->hidden, E = g->n_experts, l = (int)layer;
+    if (l == 0) {
+        set_row_kernel<<<1, 1, 0, s>>>(g->rows, token, (int)pos, (int)seq);
+        LAUNCH(g->dtype, embed_kernel, blocks_for((size_t)H, THREADS), 0, s, g->embed.w, g->rows, H, g->x);
+    }
+    enqueue_attention(g, l);
+    const dlayer_t* L = &g->layers[l];
+    const dlayer_t* N = next ? &g->layers[l + 1] : L;
+    LAUNCH(g->dtype, router_kernel, dim3(blocks_for((size_t)E, WARPS), next ? 2 : 1), (size_t)H * sizeof(float), s, g->x, L->mlp_norm,
+           L->router.w, N->mlp_norm, N->router.w, g->eps, g->router_out, H, E);
+    e = cudaGetLastError();
+    const size_t n = (next ? 2 : 1) * (size_t)E;
+    if (e == cudaSuccess) e = cudaMemcpyAsync(g->host_router, g->router_out, n * sizeof(float), cudaMemcpyDeviceToHost, s);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
+    memcpy(logits, g->host_router, (size_t)E * sizeof(float));
+    if (next) memcpy(next, g->host_router + E, (size_t)E * sizeof(float));
+    return true;
+}
+
+bool vitna_cuda_moe_experts(struct vitna_cuda_model* g, size_t layer, const int32_t* ids, const float* weights, size_t k,
+                            const int32_t* guess, char* err, size_t err_len) {
+    expert_cache_t* c = &g->ec;
+    const size_t E = (size_t)g->n_experts;
+    /* moe_act holds n_used experts' activations, and the cache's slots are
+     * at least twice n_used, so that this layer's and its guess fit. */
+    if (!g->moe || layer >= (size_t)g->n_layers || k < 1 || k > (size_t)g->n_used || (guess && layer + 1 >= (size_t)g->n_layers)) {
+        return fail(err, err_len, "%zu experts of layer %zu cannot be run", k, layer);
+    }
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
+    if (c->stream) settle(c);
+
+    /* The experts the device holds already, and those it lacks. Each is held
+     * until this returns, so neither a copy for another nor the guess can
+     * take its slot. Before this call the device finished every earlier
+     * layer (vitna_cuda_moe_route waited for this layer's router), so a
+     * slot nobody holds is read by nothing queued. */
+    int slot_of[EXPERTS_MAX], held[2 * EXPERTS_MAX], n_held = 0;
+    uint32_t missing[EXPERTS_MAX];
+    int miss_at[EXPERTS_MAX], n_missing = 0;
+    for (size_t i = 0; i < k; i++) {
+        const uint32_t place = (uint32_t)(layer * E + (size_t)ids[i]);
+        c->uses[place]++;
+        if (++c->acquired % 65536 == 0) {
+            for (size_t p = 0; p < c->n_places; p++) c->uses[p] /= 2;
+        }
+        const int s = c->where[place];
+        slot_of[i] = s;
+        if (s < 0) {
+            missing[n_missing] = place;
+            miss_at[n_missing++] = (int)i;
+            c->misses++;
+            continue;
+        }
+        eslot_t* x = &c->slots[s];
+        x->held = true;
+        held[n_held++] = s;
+        x->last_use = ++c->clock;
+        if (x->filling) {
+            const cudaError_t q = cudaEventQuery(x->filled);
+            if (q == cudaSuccess) x->filling = false;
+            else if (q == cudaErrorNotReady) cudaGetLastError();
+        }
+        if (x->filling) c->in_flight++;
+        else c->hits++;
+        if (x->guessed) {
+            c->prefetch_used++;
+            x->guessed = false;
+        }
+    }
+
+    /* The guess's places, in the next layer, and those of them the device
+     * lacks: only those will be wanted from memory, so only those are
+     * worth reading from the drive ahead. */
+    uint32_t next_places[EXPERTS_MAX], lacking[EXPERTS_MAX];
+    size_t n_lacking = 0;
+    for (size_t j = 0; guess && j < k; j++) {
+        next_places[j] = (uint32_t)((layer + 1) * E + (size_t)guess[j]);
+        if (c->where[next_places[j]] < 0) lacking[n_lacking++] = next_places[j];
+    }
+
+    /* Those it lacks, copied in. Read from the drive where the expert
+     * stream lacks them too: hold, start reading the guess there as the
+     * CPU path does, then wait. */
+    bool ok = true;
+    if (n_missing) {
+        vitna_expert_data_t data[EXPERTS_MAX];
+        if (c->stream) {
+            e = drain(c, c->p_max);
+            ok = e == cudaSuccess;
+            if (ok) {
+                vitna_expert_stream_hold(c->stream, missing, (size_t)n_missing);
+                if (n_lacking) vitna_expert_stream_prefetch(c->stream, lacking, n_lacking);
+                if (!vitna_expert_stream_wait(c->stream, missing, (size_t)n_missing, data)) {
+                    for (int i = 0; i < n_held; i++) c->slots[held[i]].held = false;
+                    return fail(err, err_len, "reading an expert from the drive failed");
+                }
+            }
+        } else {
+            for (int j = 0; j < n_missing; j++) {
+                for (int p = 0; p < 3; p++) data[j].part[p] = c->parts[(size_t)missing[j] * 3 + p];
+            }
+        }
+        for (int j = 0; ok && j < n_missing; j++) {
+            /* At most k slots are held, and there are at least twice k. */
+            const int s = free_slot(c);
+            e = fill(c, s, missing[j], &data[j], false);
+            ok = e == cudaSuccess;
+            held[n_held++] = s;
+            slot_of[miss_at[j]] = s;
+            if (!ok && c->stream) vitna_expert_stream_release(c->stream, missing + j + 1, (size_t)(n_missing - j - 1));
+        }
+    } else if (c->stream && n_lacking) {
+        vitna_expert_stream_prefetch(c->stream, lacking, n_lacking);
+    }
+
+    /* The layer's kernels, after the copies into their slots. */
+    experts_t ex;
+    memset(&ex, 0, sizeof(ex));
+    ex.k = (int)k;
+    for (size_t i = 0; ok && i < k; i++) {
+        const eslot_t* x = &c->slots[slot_of[i]];
+        if (x->filling) {
+            e = cudaStreamWaitEvent(g->stream, x->filled, 0);
+            ok = e == cudaSuccess;
+        }
+        const unsigned char* base = c->mem + (size_t)slot_of[i] * c->slot_bytes;
+        ex.gate[i] = base;
+        ex.up[i] = base + c->part_bytes[0];
+        ex.down[i] = base + c->part_bytes[0] + c->part_bytes[1];
+        ex.weight[i] = weights[i];
+    }
+    if (ok) {
+        const dlayer_t* L = &g->layers[layer];
+        LAUNCH(g->dtype, experts_in_kernel, grid_for(g, (int)k * g->intermediate), (size_t)g->hidden * sizeof(float), g->stream, g->x,
+               L->mlp_norm, g->eps, ex, g->moe_act, g->hidden, g->intermediate);
+        LAUNCH(g->dtype, experts_down_kernel, grid_for(g, g->hidden), k * (size_t)g->intermediate * sizeof(float), g->stream, g->moe_act, ex,
+               g->x, g->hidden, g->intermediate);
+        e = cudaGetLastError();
+        ok = e == cudaSuccess;
+    }
+
+    /* The guess: experts of the next layer the device lacks, copied behind
+     * this layer's, from memory that has them now; one the expert stream is
+     * still reading is left to be copied when it is wanted. Only the half
+     * the next layer's router ranks highest are copied. A token's time goes
+     * to copies, so a wrong one costs what a right one saves, and the lower
+     * half is wrong too often: on OLMoE with an RTX 3070 (PCIe 4.0 x16,
+     * 2026-10-01), of the copies made for each rank of the guess, the layer
+     * then wanted 98% of the first two's, 90% of the third and fourth's,
+     * 74% of the fifth and sixth's and 48% of the last two's. Copying the
+     * first four decoded at 16.1 ms a token with the cache the device
+     * allowed and 38.5 ms with 2 GiB, against 17.1 and 45.6 copying all
+     * eight, 16.0 and 39.9 copying six, and 18.0 and 43.5 copying none. */
+    for (size_t j = 0; ok && guess && j < (k + 1) / 2; j++) {
+        uint32_t place = next_places[j];
+        if (c->where[place] >= 0) continue;
+        vitna_expert_data_t d;
+        if (c->stream) {
+            if (c->p_len >= c->p_max || !vitna_expert_stream_hold_ready(c->stream, place, &d)) continue;
+        } else {
+            for (int p = 0; p < 3; p++) d.part[p] = c->parts[(size_t)place * 3 + p];
+        }
+        const int s = free_slot(c);
+        if (s < 0) {
+            if (c->stream) vitna_expert_stream_release(c->stream, &place, 1);
+            break;
+        }
+        e = fill(c, s, place, &d, true);
+        ok = e == cudaSuccess;
+        held[n_held++] = s;
+        c->prefetched++;
+    }
+    for (int i = 0; i < n_held; i++) c->slots[held[i]].held = false;
+    if (!ok) return fail_cuda(err, err_len, "the experts could not be run on the device", e);
+    return true;
+}
+
+bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, size_t err_len) {
+    cudaError_t e = cudaSetDevice(g->device);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "cannot use the CUDA device", e);
+    enqueue_head(g);
+    e = cudaGetLastError();
+    const size_t bytes = (size_t)g->vocab * sizeof(float);
+    if (e == cudaSuccess) e = cudaMemcpyAsync(g->host_logits, g->logits, bytes, cudaMemcpyDeviceToHost, g->stream);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(g->stream);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the forward pass failed on the device", e);
+    memcpy(logits, g->host_logits, bytes);
+    return true;
+}
+
+const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len) {
+    if (len == 0) return buf;
+    buf[0] = '\0';
+    if (!g || !g->moe) return buf;
+    const expert_cache_t* c = &g->ec;
+    snprintf(buf, len,
+             "experts on the GPU: %d slots, %.0f MiB, copied from %s, %s. %llu acquired: %llu already on the GPU, %llu still being copied "
+             "for a guess, %llu copied when asked for. %llu copied for a guess, %llu of those used. %.1f MiB copied in %llu copies",
+             c->n_slots, (double)c->n_slots * (double)c->slot_bytes / 1048576.0, c->stream ? "the expert cache in memory" : "the mapped checkpoint",
+             c->pinned ? "page-locked" : "pageable", (unsigned long long)c->acquired, (unsigned long long)c->hits,
+             (unsigned long long)c->in_flight, (unsigned long long)c->misses, (unsigned long long)c->prefetched,
+             (unsigned long long)c->prefetch_used, (double)c->bytes_copied / 1048576.0, (unsigned long long)c->copies);
+    return buf;
 }

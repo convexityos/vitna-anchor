@@ -474,6 +474,29 @@ void vitna_expert_stream_release(vitna_expert_stream_t* s, const uint32_t* ids, 
     vitna_mutex_unlock(&s->lock);
 }
 
+bool vitna_expert_stream_hold_ready(vitna_expert_stream_t* s, uint32_t id, vitna_expert_data_t* out) {
+    vitna_mutex_lock(&s->lock);
+    const int64_t x = s->where[id];
+    const bool ready = x >= 0 && s->slots[x].state == READY;
+    if (ready) {
+        slot_t* sl = &s->slots[x];
+        sl->users++;
+        const plan_t* plan = &s->plans[id];
+        for (size_t j = 0; j < plan->n_parts; j++) out->part[j] = sl->buf + plan->part_at[j];
+    }
+    vitna_mutex_unlock(&s->lock);
+    return ready;
+}
+
+size_t vitna_expert_stream_slots(const vitna_expert_stream_t* s) {
+    return s->n_slots;
+}
+
+void* vitna_expert_stream_memory(const vitna_expert_stream_t* s, size_t* bytes) {
+    *bytes = s->n_slots * s->slot_bytes;
+    return s->memory;
+}
+
 void vitna_expert_stream_prefetch(vitna_expert_stream_t* s, const uint32_t* ids, size_t k) {
     vitna_mutex_lock(&s->lock);
     for (size_t i = 0; i < k; i++) {

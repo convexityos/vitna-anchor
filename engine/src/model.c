@@ -451,6 +451,8 @@ bool vitna_llama_stream_experts(vitna_llama_t* m, size_t cache_bytes, char* err,
     const vitna_llama_config_t* c = &m->cfg;
     if (!c->n_experts) return fail(err, err_len, "this model has no experts to read from the drive%s%s", NULL, NULL);
     if (m->stream) return true;
+    /* The GPU copies its experts from wherever they were when it took the model. */
+    if (m->cuda) return fail(err, err_len, "the experts must be streamed before the GPU takes the model%s%s", NULL, NULL);
     const size_t E = c->n_experts, K = c->n_experts_used, n = c->n_layers * E;
     vitna_expert_place_t* places = (vitna_expert_place_t*)calloc(n, sizeof(*places));
     if (!places) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
@@ -567,31 +569,25 @@ static void prefetch_layer(vitna_llama_t* m, size_t layer) {
     vitna_expert_stream_prefetch(m->stream, places, K);
 }
 
-/* Layer l's mixture of experts for the token at pos: m->xn in, m->proj out.
- * This is transformers' OlmoeSparseMoeBlock with its eager experts: the
- * router's logits over every expert; their softmax, in float32; the experts
- * with the n_experts_used largest weights, each weighted by its own share
- * of the softmax, not renormalized over those used; and their outputs, each
- * scaled by its weight, added to zeros one expert at a time in order of
- * expert, as the loop over experts and index_add_ add them. With the
- * experts streamed, the same arithmetic runs on the bytes read from the
- * drive; false if a read fails. */
-static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, size_t l, size_t pos) {
+/* Layer l's routing for the token at pos, from the router's logits over
+ * every expert, as transformers' OlmoeSparseMoeBlock routes: their softmax,
+ * in float32; the experts with the n_experts_used largest weights, which are
+ * the largest logits, largest first and the lower expert first between
+ * equals, into chosen; and each weighted by its own share of the softmax,
+ * not renormalized over those used. The experts the token goes through are
+ * written to order, in order of expert, with their weights in weights: the
+ * router's choice, or where a test pins them the pinned experts. The
+ * router's logits and choice are traced for tests. The CPU's
+ * mixture_of_experts and the GPU's step both route here. */
+static void route(vitna_llama_t* m, size_t l, size_t pos, const float* logits, int32_t* chosen, int32_t* order, float* weights) {
     const vitna_llama_config_t* c = &m->cfg;
-    const size_t E = c->n_experts, K = c->n_experts_used, H = c->hidden;
-    float* logits = m->router_logits;
-    vitna_matvec(L->router.data, L->router.dtype, m->xn, logits, L->router.rows, L->router.cols);
-
-    /* The router's choice: the K largest logits, which are the K largest
-     * weights, largest first, and the lower expert first between equals. */
-    int32_t chosen[VITNA_EXPERTS_USED_MAX];
+    const size_t E = c->n_experts, K = c->n_experts_used;
     top_k(logits, E, K, chosen);
     const size_t at = pos * c->n_layers + l;
     if (pos < m->trace_positions) {
         if (m->trace_logits) memcpy(m->trace_logits + at * E, logits, E * sizeof(float));
         if (m->trace_chosen) memcpy(m->trace_chosen + at * K, chosen, K * sizeof(int32_t));
     }
-    int32_t order[VITNA_EXPERTS_USED_MAX];
     memcpy(order, pos < m->pin_positions ? m->pin + at * K : chosen, K * sizeof(int32_t));
     for (size_t i = 1; i < K; i++) {
         const int32_t e = order[i];
@@ -599,6 +595,39 @@ static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
         for (; j > 0 && order[j - 1] > e; j--) order[j] = order[j - 1];
         order[j] = e;
     }
+    float max = logits[0];
+    for (size_t e = 1; e < E; e++) if (logits[e] > max) max = logits[e];
+    float sum = 0.0f;
+    for (size_t e = 0; e < E; e++) sum += expf(logits[e] - max);
+    for (size_t k = 0; k < K; k++) weights[k] = expf(logits[order[k]] - max) / sum;
+}
+
+/* How many of layer l's chosen experts the lookahead had named, when it
+ * guessed for this layer. */
+static void count_lookahead(vitna_llama_t* m, size_t l, const int32_t* chosen) {
+    const size_t K = m->cfg.n_experts_used;
+    if (m->predicted_layer != (int64_t)l) return;
+    for (size_t k = 0; k < K; k++) {
+        for (size_t j = 0; j < K; j++) m->predicted_right += m->predicted[j] == chosen[k];
+    }
+    m->predicted_total += K;
+}
+
+/* Layer l's mixture of experts for the token at pos: m->xn in, m->proj out.
+ * This is transformers' OlmoeSparseMoeBlock with its eager experts: the
+ * router's logits over every expert, routed as route() says, and the
+ * outputs of the experts it names, each scaled by its weight, added to
+ * zeros one expert at a time in order of expert, as the loop over experts
+ * and index_add_ add them. With the experts streamed, the same arithmetic
+ * runs on the bytes read from the drive; false if a read fails. */
+static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, size_t l, size_t pos) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const size_t E = c->n_experts, K = c->n_experts_used, H = c->hidden;
+    float* logits = m->router_logits;
+    vitna_matvec(L->router.data, L->router.dtype, m->xn, logits, L->router.rows, L->router.cols);
+    int32_t chosen[VITNA_EXPERTS_USED_MAX], order[VITNA_EXPERTS_USED_MAX];
+    float weights[VITNA_EXPERTS_USED_MAX];
+    route(m, l, pos, logits, chosen, order, weights);
 
     /* Streamed: hold this layer's experts, reading those the cache lacks,
      * then start reading what the next layer is guessed to want while
@@ -608,20 +637,10 @@ static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
     if (m->stream) {
         for (size_t k = 0; k < K; k++) places[k] = (uint32_t)(l * E + (size_t)order[k]);
         vitna_expert_stream_hold(m->stream, places, K);
-        if (m->predicted_layer == (int64_t)l) {
-            for (size_t k = 0; k < K; k++) {
-                for (size_t j = 0; j < K; j++) m->predicted_right += m->predicted[j] == chosen[k];
-            }
-            m->predicted_total += K;
-        }
+        count_lookahead(m, l, chosen);
         if (l + 1 < c->n_layers) prefetch_layer(m, l + 1);
         if (!vitna_expert_stream_wait(m->stream, places, K, data)) return false;
     }
-
-    float max = logits[0];
-    for (size_t e = 1; e < E; e++) if (logits[e] > max) max = logits[e];
-    float sum = 0.0f;
-    for (size_t e = 0; e < E; e++) sum += expf(logits[e] - max);
 
     memset(m->proj, 0, H * sizeof(float));
     for (size_t k = 0; k < K; k++) {
@@ -630,7 +649,7 @@ static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
         const void* gate = m->stream ? data[k].part[0] : x->gate.data;
         const void* up = m->stream ? data[k].part[1] : x->up.data;
         const void* down = m->stream ? data[k].part[2] : x->down.data;
-        const float w = expf(logits[order[k]] - max) / sum;
+        const float w = weights[k];
         vitna_matvec(gate, x->gate.dtype, m->xn, m->gate, x->gate.rows, x->gate.cols);
         vitna_matvec(up, x->up.dtype, m->xn, m->up, x->up.rows, x->up.cols);
         vitna_silu_mul(m->gate, m->up, m->gate, c->intermediate);
@@ -644,6 +663,41 @@ static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
     return true;
 }
 
+#if defined(VITNA_CUDA)
+/* A step of a mixture of experts on the GPU, a layer at a time: the device
+ * runs each layer up to its router, this routes as mixture_of_experts does
+ * on the CPU, and the device runs the experts named. With the router's
+ * logits come the next layer's router's on the same residual, the guess the
+ * CPU's lookahead makes, and the device starts copying the experts it names. */
+static bool moe_step_on_gpu(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const size_t pos = m->past[seq], K = c->n_experts_used;
+    char err[512];
+    bool ok = true;
+    for (size_t l = 0; ok && l < c->n_layers; l++) {
+        const bool guess = l + 1 < c->n_layers;
+        ok = vitna_cuda_moe_route(m->cuda, seq, token, pos, l, m->router_logits, guess ? m->pred_logits : NULL, err, sizeof(err));
+        if (!ok) break;
+        int32_t chosen[VITNA_EXPERTS_USED_MAX], order[VITNA_EXPERTS_USED_MAX];
+        float weights[VITNA_EXPERTS_USED_MAX];
+        route(m, l, pos, m->router_logits, chosen, order, weights);
+        count_lookahead(m, l, chosen);
+        if (guess) {
+            top_k(m->pred_logits, c->n_experts, K, m->predicted);
+            m->predicted_layer = (int64_t)(l + 1);
+        }
+        ok = vitna_cuda_moe_experts(m->cuda, l, order, weights, K, guess ? m->predicted : NULL, err, sizeof(err));
+    }
+    if (ok && logits) ok = vitna_cuda_moe_head(m->cuda, logits, err, sizeof(err));
+    if (!ok) {
+        fprintf(stderr, "CUDA: %s\n", err);
+        return false;
+    }
+    m->past[seq] = pos + 1;
+    return true;
+}
+#endif
+
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
     if (seq >= m->seqs || token < 0 || (size_t)token >= c->vocab || m->past[seq] >= m->ctx) return false;
@@ -653,6 +707,7 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
     }
 
 #if defined(VITNA_CUDA)
+    if (m->cuda && c->n_experts) return moe_step_on_gpu(m, seq, token, logits);
     if (m->cuda) {
         char err[512];
         if (!vitna_cuda_step(m->cuda, seq, token, m->past[seq], logits, err, sizeof(err))) {
@@ -974,15 +1029,18 @@ static bool rope_tables(const vitna_llama_t* m, float** cos_out, float** sin_out
 }
 #endif
 
-bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len) {
-    if (m->cfg.n_experts) {
-        return fail(err, err_len, "the CUDA path does not run a mixture of experts yet; it runs on the CPU%s%s", NULL, NULL);
-    }
+bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len) {
 #if defined(VITNA_CUDA)
     if (m->cuda) return true;
+    if (m->cfg.n_experts && !m->pred_logits) {
+        /* The lookahead's logits, which the GPU computes with the router's. */
+        m->pred_logits = (float*)malloc(m->cfg.n_experts * sizeof(float));
+        if (!m->pred_logits) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+        m->predicted_layer = -1;
+    }
     float *ct = NULL, *st = NULL;
     if (!rope_tables(m, &ct, &st)) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
-    m->cuda = vitna_cuda_create(m, ct, st, err, err_len);
+    m->cuda = vitna_cuda_create(m, ct, st, expert_cache_bytes, err, err_len);
     free(ct);
     free(st);
     if (!m->cuda) return false;
@@ -994,8 +1052,25 @@ bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len) {
     return true;
 #else
     (void)m;
+    (void)expert_cache_bytes;
     return fail(err, err_len, "%s%s", NO_CUDA, NULL);
 #endif
+}
+
+const char* vitna_llama_gpu_report(vitna_llama_t* m, char* buf, size_t len) {
+    if (len == 0) return buf;
+    buf[0] = '\0';
+#if defined(VITNA_CUDA)
+    if (m->cuda && m->cfg.n_experts) {
+        vitna_cuda_moe_report(m->cuda, buf, len);
+        const size_t at = strlen(buf);
+        snprintf(buf + at, len - at, ". The lookahead named %.1f%% of the experts the layers routed to",
+                 m->predicted_total ? 100.0 * (double)m->predicted_right / (double)m->predicted_total : 0.0);
+    }
+#else
+    (void)m;
+#endif
+    return buf;
 }
 
 const char* vitna_llama_device(const vitna_llama_t* m, char* buf, size_t len) {

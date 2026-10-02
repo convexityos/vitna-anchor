@@ -27,7 +27,7 @@
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
         printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU\n");
-        printf("or, a dense one, with --device cuda on an NVIDIA GPU.\n\n");
+        printf("or, with --device cuda, on an NVIDIA GPU.\n\n");
     } else {
         printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU.\n");
         printf("This build has no CUDA path.\n\n");
@@ -52,7 +52,11 @@ static void print_usage(const char* prog) {
     printf("into a cache in memory of that size, rather than mapping them; the logits are the same, bit for bit. With\n");
     printf("--timing, generate also says how the cache did.\n");
     printf("--device cpu|cuda runs the model on the CPU (the default) or on the first CUDA device, which needs an\n");
-    printf("engine built with the CUDA path. Asked for a device it cannot use, the engine says why and stops.\n\n");
+    printf("engine built with the CUDA path. Asked for a device it cannot use, the engine says why and stops.\n");
+    printf("--gpu-expert-cache <MiB>, with --device cuda, is how much of the GPU holds a mixture of experts' experts, each\n");
+    printf("copied in when a layer wants it, from --expert-cache's cache or else the mapped checkpoint (default: what\n");
+    printf("the GPU has free once the rest of the model is there, less 512 MiB); the logits are the same, bit for bit,\n");
+    printf("whatever its size.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
@@ -97,6 +101,7 @@ typedef struct {
     size_t max_new;
     size_t ctx;
     size_t expert_cache_mib; /* read a mixture of experts' experts from the drive into a cache this large */
+    size_t gpu_expert_cache_mib; /* --device cuda: the GPU memory that holds a mixture of experts' experts */
     int iterations;
     uint16_t port;
     bool stop_at_special;
@@ -139,6 +144,10 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--expert-cache")) {
             a->expert_cache_mib = (size_t)strtoull(v, NULL, 10);
             if (a->expert_cache_mib == 0) a->expert_cache_mib = 1; /* refused on load as too small, not taken as off */
+        }
+        else if (TAKE("--gpu-expert-cache")) {
+            a->gpu_expert_cache_mib = (size_t)strtoull(v, NULL, 10);
+            if (a->gpu_expert_cache_mib == 0) a->gpu_expert_cache_mib = 1; /* refused on load as too small, not taken as the default */
         }
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
@@ -322,14 +331,20 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
         fprintf(stderr, "%s\n", err);
         return false;
     }
-    /* Asked for the GPU, the model runs there or not at all. */
-    if (wants_cuda(a) && !vitna_llama_use_cuda(m, err, sizeof(err))) {
-        fprintf(stderr, "--device cuda: %s\n", err);
+    if (a->expert_cache_mib && !vitna_llama_stream_experts(m, a->expert_cache_mib << 20, err, sizeof(err))) {
+        fprintf(stderr, "--expert-cache: %s\n", err);
         vitna_llama_free(m);
         return false;
     }
-    if (a->expert_cache_mib && !vitna_llama_stream_experts(m, a->expert_cache_mib << 20, err, sizeof(err))) {
-        fprintf(stderr, "--expert-cache: %s\n", err);
+    if (a->gpu_expert_cache_mib && !m->cfg.n_experts) {
+        fprintf(stderr, "--gpu-expert-cache: this model has no experts\n");
+        vitna_llama_free(m);
+        return false;
+    }
+    /* Asked for the GPU, the model runs there or not at all. A mixture of
+     * experts copies its experts there from the cache above, if there is one. */
+    if (wants_cuda(a) && !vitna_llama_use_cuda(m, a->gpu_expert_cache_mib << 20, err, sizeof(err))) {
+        fprintf(stderr, "--device cuda: %s\n", err);
         vitna_llama_free(m);
         return false;
     }
@@ -592,6 +607,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         if (k) fprintf(stderr, "speculation: %zu passes, %zu tokens drafted, %zu of them taken\n", passes, drafted, accepted);
         char report[768];
         if (*vitna_llama_stream_report(m, report, sizeof(report))) fprintf(stderr, "%s\n", report);
+        if (*vitna_llama_gpu_report(m, report, sizeof(report))) fprintf(stderr, "%s\n", report);
     }
     vitna_sampler_free(&sampler);
     free(row);
@@ -889,6 +905,10 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, &a)) return 1;
     /* A device the engine cannot use is refused before anything is loaded,
      * and nothing falls back to the CPU in its place. */
+    if (a.gpu_expert_cache_mib && !wants_cuda(&a)) {
+        fprintf(stderr, "--gpu-expert-cache needs --device cuda\n");
+        return 1;
+    }
     if (a.device && strcmp(a.device, "cpu") != 0) {
         char err[512];
         if (!wants_cuda(&a)) {

@@ -26,8 +26,56 @@ bool vitna_cuda_probe(char* err, size_t err_len);
  * the key-value cache, m->seqs sequences of m->ctx positions, and scratch
  * there. m stays as loaded; its weights are read once, here. Returns NULL,
  * with the reason in err, on failure.
+ *
+ * A mixture of experts' experts are not uploaded. The device keeps a cache
+ * of them instead, expert_cache_bytes (or, for 0, what the device has free
+ * once the rest is in place, less 512 MiB), and copies each into it when a
+ * layer wants it: from the expert stream's slots if m->stream is set
+ * (vitna_llama_stream_experts), from the mapped checkpoint otherwise. The
+ * cache must hold twice the experts a token goes through. m must outlive
+ * the returned model, and its expert stream too.
  */
-struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, char* err, size_t err_len);
+struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, size_t expert_cache_bytes,
+                                           char* err, size_t err_len);
+
+/*
+ * A mixture of experts runs a token a layer at a time, its prompts too:
+ * vitna_cuda_moe_route for layer 0, which also embeds the token, then
+ * vitna_cuda_moe_experts for it, then each later layer the same way, and
+ * vitna_cuda_moe_head when the token's logits are wanted. model.c routes in
+ * between, from the router's logits, as it does on the CPU. vitna_cuda_step,
+ * vitna_cuda_steps and vitna_cuda_rows refuse such a model.
+ */
+
+/**
+ * Run the token at position pos of sequence seq through layer up to its
+ * router: for layer 0 its embedding first; then the attention, its output
+ * added to the residual, and the router's logits over every expert, copied
+ * to logits. Unless next is NULL, the next layer's norm and router score
+ * the same residual into next, a guess at the experts that layer will
+ * want. Returns false, with the reason in err, on a device error.
+ */
+bool vitna_cuda_moe_route(struct vitna_cuda_model* g, size_t seq, int32_t token, size_t pos, size_t layer, float* logits, float* next,
+                          char* err, size_t err_len);
+
+/**
+ * Run the k experts ids of layer, distinct, their outputs scaled by weights
+ * and added in the order given, and add the sum to the residual. Experts the
+ * device's cache lacks are copied into it first. Unless guess is NULL, it
+ * names k experts of the next layer, the likeliest first: the first half
+ * start being copied behind these, as far as the cache takes them without
+ * giving up these, and, when the experts are streamed, those the expert
+ * stream lacks start being read from the drive. Returns false, with the
+ * reason in err, if an expert cannot be read or the device reports an error.
+ */
+bool vitna_cuda_moe_experts(struct vitna_cuda_model* g, size_t layer, const int32_t* ids, const float* weights, size_t k,
+                            const int32_t* guess, char* err, size_t err_len);
+
+/** The final RMSNorm and the output projection of the token the layers ran, its vocab logits copied to logits. */
+bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, size_t err_len);
+
+/** What the device's expert cache has done so far, in a sentence, for --timing; empty for a dense model. Returns buf. */
+const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len);
 
 /**
  * Run one token at position pos of sequence seq, writing its keys and values
