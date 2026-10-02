@@ -17,6 +17,13 @@
 extern "C" {
 #endif
 
+/** A row of a pass: a token, its position, and the sequence whose cache it reads and writes. */
+typedef struct {
+    int32_t token;
+    int32_t pos;
+    int32_t seq;
+} vitna_cuda_row_t;
+
 /** Whether the CUDA runtime finds a device. Returns false, with the reason in err, if not. */
 bool vitna_cuda_probe(char* err, size_t err_len);
 
@@ -43,7 +50,8 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
  * vitna_cuda_moe_route for layer 0, which also embeds the token, then
  * vitna_cuda_moe_experts for it, then each later layer the same way, and
  * vitna_cuda_moe_head when the token's logits are wanted. model.c routes in
- * between, from the router's logits, as it does on the CPU. vitna_cuda_step,
+ * between, from the router's logits, as it does on the CPU. Several rows run
+ * the same way together (vitna_cuda_moe_rows_*, below). vitna_cuda_step,
  * vitna_cuda_steps and vitna_cuda_rows refuse such a model.
  */
 
@@ -77,6 +85,46 @@ bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, s
 /** What the device's expert cache has done so far, in a sentence, for --timing; empty for a dense model. Returns buf. */
 const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len);
 
+/*
+ * Several rows of a mixture of experts at once, each a token at its position
+ * in its sequence (vitna_cuda_row_t), a layer at a time as one token runs
+ * above: vitna_cuda_moe_rows_route for layer 0, which also takes the rows
+ * and embeds them, vitna_cuda_moe_rows_experts for it, and so on for every
+ * layer, then vitna_cuda_moe_rows_head. Rows of one sequence hold
+ * consecutive positions, in order; each row's arithmetic is the one its step
+ * would do, in its step's order, so every value is the step's, bit for bit.
+ * An expert runs once for all the rows routed to it, and is copied to the
+ * device once a layer for them, where steps would copy it once a token.
+ */
+
+/** The most rows a pass takes: 0 for a dense model. */
+size_t vitna_cuda_moe_rows_max(const struct vitna_cuda_model* g);
+
+/**
+ * Run the n rows through layer up to its router, as vitna_cuda_moe_route
+ * runs one, and copy each row's router logits to logits, n x n_experts, and
+ * unless next is NULL the next layer's guess to next. rows is read for layer
+ * 0 alone; later layers take the same n rows. Returns false, with the reason
+ * in err, on a device error.
+ */
+bool vitna_cuda_moe_rows_route(struct vitna_cuda_model* g, const vitna_cuda_row_t* rows, size_t n, size_t layer, float* logits, float* next,
+                               char* err, size_t err_len);
+
+/**
+ * Run each row's k experts, ids n x k, distinct within a row and in the
+ * order its outputs are added, weighted by weights n x k, as
+ * vitna_cuda_moe_experts runs one row's, and add each row's sum to it.
+ * Unless guess is NULL, it holds n x k experts of the next layer, each row's
+ * likeliest first, which start being copied as for one row. Returns false,
+ * with the reason in err, if an expert cannot be read or the device reports
+ * an error.
+ */
+bool vitna_cuda_moe_rows_experts(struct vitna_cuda_model* g, size_t layer, size_t n, const int32_t* ids, const float* weights, size_t k,
+                                 const int32_t* guess, char* err, size_t err_len);
+
+/** The head of the pass's rows: row i's vocab logits copied to logits[i] where that is not NULL. */
+bool vitna_cuda_moe_rows_head(struct vitna_cuda_model* g, size_t n, float* const* logits, char* err, size_t err_len);
+
 /**
  * Run one token at position pos of sequence seq, writing its keys and values
  * into that sequence's cache at pos. Copies vocab logits back to logits
@@ -101,16 +149,10 @@ size_t vitna_cuda_prompt_piece_min(const struct vitna_cuda_model* g);
 
 /**
  * The most rows vitna_cuda_rows takes at once for this model, 0 for a model
- * that takes none.
+ * that takes none; for a mixture of experts, the most a pass of
+ * vitna_cuda_moe_rows_* takes.
  */
 size_t vitna_cuda_exact_max(const struct vitna_cuda_model* g);
-
-/** A row of a pass: a token, its position, and the sequence whose cache it reads and writes. */
-typedef struct {
-    int32_t token;
-    int32_t pos;
-    int32_t seq;
-} vitna_cuda_row_t;
 
 /**
  * Run count rows as count calls to vitna_cuda_step would, in one pass that

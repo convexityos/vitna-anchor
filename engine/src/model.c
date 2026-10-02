@@ -382,6 +382,13 @@ void vitna_llama_free(vitna_llama_t* m) {
     vitna_expert_stream_close(m->stream);
     free(m->pred_xn);
     free(m->pred_logits);
+    free(m->rows_logits);
+    free(m->rows_next);
+    free(m->rows_weights);
+    free(m->rows_order);
+    free(m->rows_pred);
+    free(m->rows_chunk);
+    free(m->rows_outs);
     for (size_t i = 0; i < m->n_shards; i++) {
         vitna_safetensors_close(&m->shards[i]);
         free(m->shard_paths[i]);
@@ -713,7 +720,43 @@ static bool moe_step_on_gpu(vitna_llama_t* m, size_t seq, int32_t token, float* 
     m->past[seq] = pos + 1;
     return true;
 }
+
+/* n rows of a mixture of experts on the GPU, each a token at its position in
+ * its sequence, a layer at a time: the device runs every row up to the
+ * layer's router, each row routes here as moe_step_on_gpu routes one, and
+ * the device runs each expert once for all the rows routed to it. Every
+ * value is the one n steps would give. logits[i], where logits and it are not
+ * NULL, receives row i's. Advances no sequence: the caller does, once this
+ * has returned true; on false err says why. */
+static bool moe_rows_on_gpu(vitna_llama_t* m, const vitna_cuda_row_t* rows, size_t n, float* const* logits, char* err, size_t err_len) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const size_t E = c->n_experts, K = c->n_experts_used;
+    bool ok = true;
+    for (size_t l = 0; ok && l < c->n_layers; l++) {
+        const bool guess = l + 1 < c->n_layers;
+        ok = vitna_cuda_moe_rows_route(m->cuda, rows, n, l, m->rows_logits, guess ? m->rows_next : NULL, err, err_len);
+        if (!ok) break;
+        for (size_t t = 0; t < n; t++) {
+            int32_t chosen[VITNA_EXPERTS_USED_MAX];
+            route(m, l, (size_t)rows[t].pos, m->rows_logits + t * E, chosen, m->rows_order + t * K, m->rows_weights + t * K);
+            if (l > 0) { /* the row's guess at this layer, made at the one before */
+                for (size_t a = 0; a < K; a++) {
+                    for (size_t b = 0; b < K; b++) m->predicted_right += m->rows_pred[t * K + b] == chosen[a];
+                }
+                m->predicted_total += K;
+            }
+            if (guess) top_k(m->rows_next + t * E, E, K, m->rows_pred + t * K);
+        }
+        ok = vitna_cuda_moe_rows_experts(m->cuda, l, n, m->rows_order, m->rows_weights, K, guess ? m->rows_pred : NULL, err, err_len);
+    }
+    if (ok && logits) ok = vitna_cuda_moe_rows_head(m->cuda, n, logits, err, err_len);
+    return ok;
+}
 #endif
+
+void vitna_llama_no_rows(vitna_llama_t* m) {
+    m->no_rows = true;
+}
 
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
@@ -842,7 +885,29 @@ size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, si
     const size_t first = count - rows; /* the first position whose logits are wanted */
 
 #if defined(VITNA_CUDA)
-    if (m->cuda && run >= vitna_cuda_prompt_min(m->cuda)) {
+    if (m->cuda && c->n_experts && !m->no_rows && run >= 2) {
+        /* A mixture of experts: the tokens as rows of one sequence, a chunk
+         * of up to rows_max at a time, each chunk confirmed before the next. */
+        char err[512];
+        vitna_cuda_row_t* chunk = m->rows_chunk;
+        float** outs = m->rows_outs;
+        for (size_t done = 0; done < run;) {
+            const size_t n = run - done < m->rows_max ? run - done : m->rows_max;
+            for (size_t i = 0; i < n; i++) {
+                chunk[i].token = tokens[done + i];
+                chunk[i].pos = (int32_t)(start + done + i);
+                chunk[i].seq = (int32_t)seq;
+                outs[i] = (out && done + i >= first) ? out + (done + i - first) * c->vocab : NULL;
+            }
+            if (!moe_rows_on_gpu(m, chunk, n, outs, err, sizeof(err))) {
+                cuda_failed(m, err);
+                m->past[seq] = start + done;
+                return done;
+            }
+            done += n;
+            m->past[seq] = start + done;
+        }
+    } else if (m->cuda && run >= vitna_cuda_prompt_min(m->cuda)) {
         char err[512];
         if (!vitna_cuda_steps(m->cuda, seq, tokens, run, start, out, out ? rows : 0, err, sizeof(err))) {
             cuda_failed(m, err);
@@ -871,8 +936,13 @@ size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m) {
     return 1;
 }
 
+/* The most rows a pass of vitna_llama_step_rows takes on a GPU. A prompt's
+ * chunks for a mixture of experts (vitna_llama_steps) are rows_max. */
+#define PASS_MAX 64
+
 size_t vitna_llama_exact_max(const vitna_llama_t* m) {
 #if defined(VITNA_CUDA)
+    if (m->cuda && m->cfg.n_experts) return m->no_rows || m->rows_max < 2 ? 1 : (m->rows_max < PASS_MAX ? m->rows_max : PASS_MAX);
     if (m->cuda) {
         const size_t k = vitna_cuda_exact_max(m->cuda);
         return k > 1 ? k : 1;
@@ -891,17 +961,21 @@ static bool listed(const size_t* list, size_t n, size_t seq) {
 }
 
 #if defined(VITNA_CUDA)
-#define PASS_MAX 64
 
 /* One GPU pass over k rows, which are rows at[0..k-1] of the caller's. A
- * pass of one row runs as a step. On a device error every row fails, and
- * their sequences stop. */
+ * pass of one row runs as a step, but a mixture of experts runs every pass
+ * as rows (moe_rows_on_gpu). On a device error every row fails, and their
+ * sequences stop. */
 static size_t gpu_pass(vitna_llama_t* m, const vitna_cuda_row_t* pass, const size_t* at, size_t k, float* logits, bool* ran,
                        size_t* stopped, size_t* n_stopped) {
     const size_t V = m->cfg.vocab;
     char err[512];
     bool ok;
-    if (k == 1) {
+    if (m->cfg.n_experts) {
+        float* out[PASS_MAX];
+        for (size_t j = 0; j < k; j++) out[j] = logits ? logits + at[j] * V : NULL;
+        ok = moe_rows_on_gpu(m, pass, k, logits ? out : NULL, err, sizeof(err));
+    } else if (k == 1) {
         ok = vitna_cuda_step(m->cuda, (size_t)pass[0].seq, pass[0].token, (size_t)pass[0].pos, logits ? logits + at[0] * V : NULL, err,
                              sizeof(err));
     } else {
@@ -928,7 +1002,7 @@ static size_t gpu_pass(vitna_llama_t* m, const vitna_cuda_row_t* pass, const siz
  * Once the device is lost, no pass runs, the one being filled included. */
 static size_t rows_on_gpu(vitna_llama_t* m, const vitna_llama_row_t* rows, size_t n, float* logits, bool* ran, size_t* stopped) {
     const vitna_llama_config_t* c = &m->cfg;
-    size_t cap = vitna_cuda_exact_max(m->cuda);
+    size_t cap = vitna_llama_exact_max(m);
     if (cap > PASS_MAX) cap = PASS_MAX;
     vitna_cuda_row_t pass[PASS_MAX];
     size_t at[PASS_MAX];
@@ -969,7 +1043,7 @@ size_t vitna_llama_step_rows(vitna_llama_t* m, const vitna_llama_row_t* rows, si
     if (!stopped) return 0;
     size_t done = 0;
 #if defined(VITNA_CUDA)
-    if (m->cuda && vitna_cuda_exact_max(m->cuda) >= 2) {
+    if (m->cuda && vitna_llama_exact_max(m) >= 2) {
         done = rows_on_gpu(m, rows, n, logits, ran, stopped);
         if (stopped != few) free(stopped);
         return done;
@@ -1062,6 +1136,23 @@ bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err
     free(ct);
     free(st);
     if (!m->cuda) return false;
+    if (m->cfg.n_experts) {
+        /* Room to route a pass of rows. */
+        const size_t R = vitna_cuda_moe_rows_max(m->cuda), E = m->cfg.n_experts, K = m->cfg.n_experts_used;
+        m->rows_logits = (float*)malloc(R * E * sizeof(float));
+        m->rows_next = (float*)malloc(R * E * sizeof(float));
+        m->rows_weights = (float*)malloc(R * K * sizeof(float));
+        m->rows_order = (int32_t*)malloc(R * K * sizeof(int32_t));
+        m->rows_pred = (int32_t*)malloc(R * K * sizeof(int32_t));
+        m->rows_chunk = (vitna_cuda_row_t*)malloc(R * sizeof(vitna_cuda_row_t));
+        m->rows_outs = (float**)malloc(R * sizeof(float*));
+        if (!m->rows_logits || !m->rows_next || !m->rows_weights || !m->rows_order || !m->rows_pred || !m->rows_chunk || !m->rows_outs) {
+            vitna_cuda_free(m->cuda);
+            m->cuda = NULL;
+            return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+        }
+        m->rows_max = R;
+    }
     /* The device holds the key-value cache from here on. */
     free(m->k_cache);
     free(m->v_cache);

@@ -383,10 +383,10 @@ const MODEL = {
 };
 
 /** Run the engine. Resolves with its stdout; rejects with its stderr if it exits other than 0. */
-function runEngine(args, input = "") {
+function runEngine(args, input = "", env = {}) {
   assert.ok(engine, "no built engine found");
   return new Promise((resolve, reject) => {
-    const child = spawn(engine, args);
+    const child = spawn(engine, args, { env: { ...process.env, ...env } });
     let out = "";
     let err = "";
     child.stdout.setEncoding("utf8").on("data", (d) => (out += d));
@@ -647,4 +647,50 @@ test("on the GPU, an expert cache there too small for twice the experts a token 
     runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), ...RUN, "--gpu-expert-cache", "100"]),
     /--device cuda: the GPU's expert cache must hold twice the experts a token goes through: 192 MiB or more/,
   );
+});
+
+// On a GPU, several tokens of a mixture run together as rows: a prompt's,
+// a layer at a time, each expert once for all the rows routed to it, and
+// drafted tokens with --speculate the same way. Each row's arithmetic is its
+// step's, so the logits must be those of every token run alone, which
+// VITNA_TEST_NO_ROWS=1 makes the engine do, byte for byte: every position's
+// for a prompt, and greedy decoding's with --speculate against without.
+// Then once more through a cache of 21 slots on the device, which cannot
+// hold a layer's experts for a long prompt at once, so they run in waves.
+test("on the GPU, tokens run together as rows give a token at a time's logits and tokens, byte for byte", {
+  skip: MODEL.skip || (!GPU && "VITNA_DEVICE is not cuda"),
+}, async (t) => {
+  const alone = { VITNA_TEST_NO_ROWS: "1" };
+  const dir = mkdtempSync(join(tmpdir(), "vitna-moe-rows-"));
+  try {
+    const same = (a, b, what) => {
+      const x = readFileSync(join(dir, a));
+      const y = readFileSync(join(dir, b));
+      assert.ok(x.length > 0 && x.equals(y), `${what}: rows gave ${x.length} bytes unlike a token at a time's ${y.length}`);
+    };
+    const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
+    for (const p of prompts) {
+      for (const [name, env] of [["rows", {}], ["alone", alone]]) {
+        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN], "", env);
+      }
+      const greedy = (name, extra, env) =>
+        runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
+          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra], "", env);
+      const drafted = JSON.parse(await greedy("rows", ["--speculate", "4"], {})).ids;
+      const stepped = JSON.parse(await greedy("alone", [], alone)).ids;
+      assert.deepEqual(drafted, stepped, p.id);
+      same(`${p.id}.rows.logits`, `${p.id}.alone.logits`, `${p.id}, every position's logits`);
+      same(`${p.id}.rows.greedy`, `${p.id}.alone.greedy`, `${p.id}, 16 greedy tokens drafted 4 at a time`);
+    }
+    // The longest prompt in the fixture, through 21 slots.
+    const longest = fixture.prompts.reduce((a, b) => (b.ids.length > a.ids.length ? b : a));
+    for (const [name, env] of [["rows", {}], ["alone", alone]]) {
+      await runEngine(["logits", "--model", modelDir, "--ids", longest.ids.join(","), "--out", join(dir, `small.${name}.logits`), ...RUN,
+        "--gpu-expert-cache", "256"], "", env);
+    }
+    same("small.rows.logits", "small.alone.logits", `${longest.id} through a cache of 256 MiB`);
+    t.diagnostic(`${prompts.map((p) => p.id).join(" and ")}: every position's logits, and 16 greedy tokens drafted 4 at a time, equal a token at a time's byte for byte; ${longest.id}'s ${longest.ids.length} positions too, through a cache of 256 MiB`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
