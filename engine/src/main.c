@@ -69,7 +69,7 @@ static void print_usage(const char* prog) {
     printf("          long the prompt and the new tokens took, measured on this machine. --speculate k drafts up\n");
     printf("          to k tokens where the text's last two or three tokens occur earlier in it, and checks them\n");
     printf("          together: the same tokens and logits as without it. On a GPU they run in one pass (k at\n");
-    printf("          most 7); on the CPU a step at a time, which is no faster\n");
+    printf("          most 7, or 63 for a mixture of experts); on the CPU a step at a time, which is no faster\n");
     printf("logits    writes the logits at every position of the prompt, positions x vocab, float32 LE\n");
     printf("          --router-out, --experts-out and --experts-in, with logits or generate, are for tests of a\n");
     printf("          mixture of experts: for each position run, positions x layers x n, little-endian, they write\n");
@@ -355,6 +355,15 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
         fprintf(stderr, "--device cuda: %s\n", err);
         vitna_llama_free(m);
         return false;
+    }
+    /* For tests only: VITNA_TEST_NO_ROWS=1 makes a mixture of experts on the
+     * GPU run every token alone, where it would run several together as rows
+     * (a prompt's tokens, drafted tokens, requests at once), so that a test
+     * can compare the two byte for byte. */
+    const char* no_rows = getenv("VITNA_TEST_NO_ROWS");
+    if (no_rows && strcmp(no_rows, "1") == 0) {
+        vitna_llama_no_rows(m);
+        fprintf(stderr, "VITNA_TEST_NO_ROWS is set, for a test: a mixture of experts on the GPU runs every token alone.\n");
     }
     return true;
 }

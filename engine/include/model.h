@@ -128,6 +128,18 @@ typedef struct {
      * with its own key-value cache there, and k_cache and v_cache go unused. */
     struct vitna_cuda_model* cuda;
 
+    /* A mixture of experts on the GPU runs several rows at once a layer at a
+     * time (vitna_cuda_moe_rows_*), routed here: rows_max rows a pass, and
+     * each row's router logits and guess (rows_max x n_experts), the experts
+     * it goes through and their weights, and its guess at the next layer
+     * (rows_max x n_experts_used). no_rows, for a test, runs every token alone. */
+    size_t rows_max;
+    float *rows_logits, *rows_next, *rows_weights;
+    int32_t *rows_order, *rows_pred;
+    void* rows_chunk;         /* rows_max vitna_cuda_row_t: a prompt's chunk */
+    float** rows_outs;        /* rows_max: where each row's logits go */
+    bool no_rows;
+
     /* Set when a step on the GPU fails with an error CUDA calls sticky (an
      * illegal address, a kernel that faulted, and others), after which the
      * device can run nothing more in this process: every later step fails
@@ -193,7 +205,9 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
  * On the CPU this is those steps one at a time. On a GPU the tokens run
  * together, as matrix-matrix products that read each weight once for many
  * tokens, and causal attention among them; the results are the same up to
- * float32 rounding.
+ * float32 rounding. A mixture of experts on a GPU runs them as rows instead,
+ * up to rows_max at a time a layer at a time, whose values are the steps',
+ * bit for bit.
  */
 size_t vitna_llama_steps(vitna_llama_t* m, size_t seq, const int32_t* tokens, size_t count, float* logits, size_t rows);
 
@@ -241,9 +255,10 @@ size_t vitna_llama_exact_max(const vitna_llama_t* m);
  * The fewest tokens each piece of a prompt must have for vitna_llama_steps
  * to run the pieces, one call after another, exactly as it runs them in one
  * call: the same keys, values and logits, bit for bit, however the prompt is
- * split. 1 on the CPU, where a prompt runs a step at a time. On a GPU a
- * piece of fewer tokens runs through other kernels, whose sums round
- * differently.
+ * split. 1 on the CPU, where a prompt runs a step at a time, and for a
+ * mixture of experts on a GPU, whose rows give the steps' values. On a GPU
+ * a dense model's piece of fewer tokens runs through other kernels, whose
+ * sums round differently.
  */
 size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
 
@@ -336,6 +351,14 @@ bool vitna_llama_cuda_probe(char* err, size_t err_len);
  * the CPU; a caller that asked for the GPU should stop, not run it there.
  */
 bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len);
+
+/**
+ * For tests: run a mixture of experts on the GPU a token at a time, as
+ * vitna_llama_step runs one, where it would run rows of several together
+ * (a prompt's tokens, drafted tokens, requests at once). Those rows give the
+ * same values, bit for bit; this is what a test compares them with.
+ */
+void vitna_llama_no_rows(vitna_llama_t* m);
 
 /**
  * What the GPU's expert cache has done so far, in a sentence, for --timing:
