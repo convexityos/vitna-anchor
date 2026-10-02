@@ -62,6 +62,18 @@ test("a device the engine does not know is refused by name", { skip }, () => {
   assert.equal(r.wrote, false);
 });
 
+test("--gpu-expert-cache is refused without --device cuda, before anything is loaded", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
+  try {
+    const r = run(["logits", "--model", join(dir, "no-model"), "--ids", "1", "--out", join(dir, "logits.f32"), "--gpu-expert-cache", "1024"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--gpu-expert-cache needs --device cuda/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("--device cpu is accepted, and the engine goes on to load the model", { skip }, () => {
   const r = logitsOn("cpu");
   assert.notEqual(r.status, 0, "there is no model to load");

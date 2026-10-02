@@ -1,7 +1,7 @@
 /**
- * model.h - A Llama-architecture model in float32: dense, on the CPU or, in
- * an engine built with the CUDA path, on an NVIDIA GPU; or OLMoE's mixture
- * of experts, on the CPU.
+ * model.h - A Llama-architecture model in float32, dense or OLMoE's mixture
+ * of experts, on the CPU or, in an engine built with the CUDA path, on an
+ * NVIDIA GPU.
  *
  * Reads config.json and model.safetensors, or the shards an index names
  * (model.safetensors.index.json), from a model directory, and runs one
@@ -26,9 +26,9 @@
  * MLP biases, another activation, clipped activations, renormalized expert
  * weights) is refused on load.
  *
- * A model loads on the CPU. vitna_llama_use_cuda moves a dense model's
- * forward pass to the GPU, where model_cuda.cu runs the same computation;
- * nothing falls back from one device to the other.
+ * A model loads on the CPU. vitna_llama_use_cuda moves its forward pass to
+ * the GPU, where model_cuda.cu runs the same computation; nothing falls back
+ * from one device to the other.
  */
 
 #ifndef VITNA_MODEL_H
@@ -261,7 +261,7 @@ size_t vitna_llama_prompt_piece_min(const vitna_llama_t* m);
 void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos, bool lose_device);
 
 /**
- * For tests of a mixture of experts, on the CPU. At every position p below
+ * For tests of a mixture of experts, on either device. At every position p below
  * positions, each step writes each layer's router logits to
  * logits[(p * n_layers + layer) * n_experts ...] and the experts the router
  * chose there, the highest scoring first, to
@@ -284,10 +284,11 @@ void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen,
  * experts it would choose start being read: a guess, which costs a read
  * when it is wrong and decides nothing, since every layer still routes for
  * itself. The arithmetic is the mapped checkpoint's, so the logits are too,
- * bit for bit. Call it once, straight after vitna_llama_load. Returns false,
- * with the reason in err, for a dense model, a cache too small to hold
- * twice the experts a token goes through, or files that cannot be opened
- * for direct I/O.
+ * bit for bit. Call it once, straight after vitna_llama_load, and before
+ * vitna_llama_use_cuda, which copies the experts to the GPU from the cache
+ * this makes. Returns false, with the reason in err, for a dense model, a
+ * cache too small to hold twice the experts a token goes through, files
+ * that cannot be opened for direct I/O, or a model the GPU has taken.
  */
 bool vitna_llama_stream_experts(vitna_llama_t* m, size_t cache_bytes, char* err, size_t err_len);
 
@@ -320,13 +321,28 @@ bool vitna_llama_cuda_probe(char* err, size_t err_len);
 /**
  * Move a loaded model's forward pass to the first CUDA device: upload every
  * weight once, in its stored dtype, and hold the key-value cache on the
- * device. Call it once, straight after vitna_llama_load, before any step.
- * Returns false, with the reason in err, if the model is a mixture of
- * experts, this engine was built without CUDA, or the device cannot take
- * the model. The model is then as it was, on
+ * device. Call it once, straight after vitna_llama_load (and
+ * vitna_llama_stream_experts, if the experts are streamed), before any step.
+ *
+ * A mixture of experts' experts are not uploaded: the device keeps a cache
+ * of them, expert_cache_bytes, or for 0 what it has free once the rest is in
+ * place, less 512 MiB, and copies each in when a layer wants it, from the
+ * expert stream's cache or else the mapped checkpoint (model_cuda.h). It
+ * runs a token a layer at a time, routed here between the halves of each,
+ * as on the CPU. expert_cache_bytes means nothing for a dense model.
+ *
+ * Returns false, with the reason in err, if this engine was built without
+ * CUDA or the device cannot take the model. The model is then as it was, on
  * the CPU; a caller that asked for the GPU should stop, not run it there.
  */
-bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len);
+bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len);
+
+/**
+ * What the GPU's expert cache has done so far, in a sentence, for --timing:
+ * hits, copies and bytes, and how often the lookahead guessed right. Writes
+ * an empty string for a dense model or one on the CPU. Returns buf.
+ */
+const char* vitna_llama_gpu_report(vitna_llama_t* m, char* buf, size_t len);
 
 /**
  * Where the forward pass runs, as the server's start-up line says it:

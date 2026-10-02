@@ -862,6 +862,34 @@ static void test_expert_stream(void) {
         CHECK(st.prefetched == 1 && st.prefetch_used == 1 && st.misses == 0 && st.hits + st.in_flight == 1, "the prefetch served the acquisition");
         vitna_expert_stream_close(s);
     }
+    /* hold_ready, which the GPU's guess copies from: it holds only a place
+     * already read, starts no read and counts no acquisition, and what it
+     * holds keeps its slot. Two slots, so p0 held leaves one for the rest. */
+    s = vitna_expert_stream_open(paths, 2, places, 5, 2, 1, err, sizeof(err));
+    if (s) {
+        vitna_expert_data_t d[1];
+        const uint32_t p0 = 0, others[2] = { 1, 3 };
+        CHECK(!vitna_expert_stream_hold_ready(s, p0, d), "a place not read is not held");
+        vitna_expert_stream_stats_t st = vitna_expert_stream_stats(s);
+        CHECK(st.reads == 0 && st.acquired == 0 && st.misses == 0, "and nothing is read for it");
+        bool ok = vitna_expert_stream_acquire(s, &p0, 1, d);
+        vitna_expert_stream_release(s, &p0, 1);
+        CHECK(ok && vitna_expert_stream_hold_ready(s, p0, d) && part_is(d[0].part[0], 0, 100, 5000), "a place read is held, with its bytes");
+        for (size_t i = 0; i < 2; i++) {
+            ok = vitna_expert_stream_acquire(s, &others[i], 1, d) && ok;
+            vitna_expert_stream_release(s, &others[i], 1);
+        }
+        CHECK(ok && vitna_expert_stream_hold_ready(s, p0, d) && part_is(d[0].part[0], 0, 100, 5000),
+              "held, it keeps its slot while two other places pass through the other");
+        st = vitna_expert_stream_stats(s);
+        CHECK(st.acquired == 3 && st.misses == 3, "only the acquisitions count: %llu acquired", (unsigned long long)st.acquired);
+        vitna_expert_stream_release(s, &p0, 1);
+        vitna_expert_stream_release(s, &p0, 1);
+        size_t bytes = 0;
+        const void* mem = vitna_expert_stream_memory(s, &bytes);
+        CHECK(mem != NULL && bytes == 2 * 8192 && vitna_expert_stream_slots(s) == 2, "the slots are one block of 2 x 8192 bytes");
+        vitna_expert_stream_close(s);
+    }
     /* Two slots. The least used is given up first: p0, used twice, outlasts
      * p1, used once and more recently, which the least recently used would
      * have kept instead. */
@@ -884,17 +912,6 @@ static void test_expert_stream(void) {
           "a file that cannot be opened is refused with the reason: %s", err);
     remove(paths[0]);
     remove(paths[1]);
-}
-
-/* The CUDA path does not run a mixture of experts: a model with experts is
- * refused before anything is moved to a device, in any build. */
-static void test_moe_stays_on_cpu(void) {
-    vitna_llama_t m;
-    memset(&m, 0, sizeof(m));
-    m.cfg.n_experts = 64;
-    char err[256] = "";
-    CHECK(!vitna_llama_use_cuda(&m, err, sizeof(err)) && strstr(err, "mixture of experts") != NULL && m.cuda == NULL,
-          "a mixture of experts is refused the GPU, saying so: \"%s\"", err);
 }
 
 static void test_api_helpers(void) {
@@ -1112,7 +1129,6 @@ static void test_jsonpfx(void) {
 
 int main(void) {
     test_expert_stream();
-    test_moe_stays_on_cpu();
     test_api_helpers();
     test_jsonpfx();
     test_json();

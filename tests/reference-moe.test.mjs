@@ -7,12 +7,16 @@
 // comparison in reference/compare.mjs accepts the fixture's own logits and
 // routing and rejects wrong ones at this vocabulary too.
 //
-// The rest are step 2: the engine runs the model on the CPU and is compared
-// with the fixture. Its tokenizer needs only the model's tokenizer.json (node
-// scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json, as CI fetches
-// it); the others need the 13.8 GB of weights. Without them these are
-// skipped, with the reason, unless VITNA_REQUIRE_MOE=1, or for the tokenizer
-// VITNA_REQUIRE_MOE_TOKENIZER=1 (as in CI), where they fail.
+// The rest are steps 2 and 3: the engine runs the model, its experts mapped
+// or read from the drive, and is compared with the fixture. Its tokenizer
+// needs only the model's tokenizer.json (node scripts/fetch-model.mjs
+// olmoe-1b-7b --only tokenizer.json, as CI fetches it); the others need the
+// 13.8 GB of weights. Without them these are skipped, with the reason,
+// unless VITNA_REQUIRE_MOE=1, or for the tokenizer
+// VITNA_REQUIRE_MOE_TOKENIZER=1 (as in CI), where they fail. They run on the
+// CPU, or with VITNA_DEVICE=cuda on the GPU (--device cuda), for an engine
+// built with the CUDA path, as gate A4's do; two more run only there. On a
+// GPU they need VITNA_REQUIRE_MOE=1 and this file run alone (below).
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -354,6 +358,10 @@ const modelDir = process.env.ANCHOR_MOE_MODEL_DIR || here("../models/olmoe-1b-7b
 const LAYERS = fixture.model.layers;
 const K = fixture.model.experts_per_token;
 const required = (v) => process.env[v] === "1";
+const DEVICE = process.env.VITNA_DEVICE ?? "";
+assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
+const onDevice = DEVICE ? ["--device", DEVICE] : [];
+const GPU = DEVICE === "cuda";
 
 function missing(files, fetch) {
   if (!engine) return "no built engine found";
@@ -364,8 +372,14 @@ const TOKENIZER = {
   skip: required("VITNA_REQUIRE_MOE") || required("VITNA_REQUIRE_MOE_TOKENIZER") ? false
     : missing(["tokenizer.json"], "node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json"),
 };
+// On a GPU each engine takes what the device has free for its experts, so
+// beside the other files' servers, which VITNA_DEVICE=cuda also puts there,
+// one of them would find no memory. There these run only when asked for,
+// with VITNA_REQUIRE_MOE=1, and with this file alone.
 const MODEL = {
-  skip: required("VITNA_REQUIRE_MOE") ? false : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs olmoe-1b-7b"),
+  skip: required("VITNA_REQUIRE_MOE") ? false
+    : GPU ? "on a GPU these run only with VITNA_REQUIRE_MOE=1, and this file alone: each engine takes what the GPU has free"
+    : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs olmoe-1b-7b"),
 };
 
 /** Run the engine. Resolves with its stdout; rejects with its stderr if it exits other than 0. */
@@ -410,13 +424,20 @@ function firstDeparture(entries, chosen) {
   return null;
 }
 
-// The CPU path runs a step at a time on one thread, so the six prompts run
-// side by side, each in an engine of its own over the same mapped files.
-const CTX = ["--ctx", "512"];
+// Every run of the model: --ctx 512, on the device VITNA_DEVICE names. The
+// CPU path runs a step at a time on one thread, so there the six prompts run
+// side by side, each in an engine of its own over the same mapped files. On
+// a GPU they run one after another, since each engine's expert cache takes
+// what the device has free.
+const RUN = ["--ctx", "512", ...onDevice];
 async function eachPrompt(prefix, run) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
+  const at = (p) => (s) => join(dir, `${p.id}.${s}`);
   try {
-    return await Promise.all(fixture.prompts.map((p) => run(p, (s) => join(dir, `${p.id}.${s}`))));
+    if (!GPU) return await Promise.all(fixture.prompts.map((p) => run(p, at(p))));
+    const results = [];
+    for (const p of fixture.prompts) results.push(await run(p, at(p)));
+    return results;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -441,7 +462,7 @@ test("the engine's tokenizer gives the ids of the model's own tokenizer.json", T
 test("with its routing pinned, the engine's logits match the reference within the tolerance, and its router chooses as the rule allows", MODEL, async (t) => {
   const results = await eachPrompt("vitna-moe-logits-", async (p, f) => {
     writePins(f("pin"), p.routing);
-    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", f("logits"), ...CTX,
+    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", f("logits"), ...RUN,
       "--experts-in", f("pin"), "--router-out", f("router"), "--experts-out", f("experts")]);
     const chosen = readI32(f("experts"));
     return {
@@ -458,7 +479,7 @@ test("with its routing pinned, the engine's logits match the reference within th
   const worst = (k, w) => Math.max(...results.map((r) => r[k].worst[w]));
   const decisions = fixture.prompts.reduce((a, p) => a + p.ids.length * LAYERS, 0);
   const departed = results.filter((r) => r.departure).map((r) => `${r.p.id} position ${r.departure[0]} layer ${r.departure[1]}`);
-  t.diagnostic(`largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
+  t.diagnostic(`on ${DEVICE || "cpu"}, largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
   t.diagnostic(departed.length ? `the router first chose other experts than the reference at ${departed.join("; ")}` : `the router chose the reference's experts in all ${decisions} decisions`);
 });
 
@@ -467,7 +488,7 @@ test("with its routing pinned, the engine's greedy decoding matches the referenc
     const entries = [...p.routing, ...p.greedy_routing];
     writePins(f("pin"), entries);
     const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", String(p.greedy_ids.length), "--greedy",
-      ...CTX, "--logits-out", f("logits"), "--experts-in", f("pin"), "--router-out", f("router"), "--experts-out", f("experts")]);
+      ...RUN, "--logits-out", f("logits"), "--experts-in", f("pin"), "--router-out", f("router"), "--experts-out", f("experts")]);
     const { ids } = JSON.parse(out);
     return {
       p,
@@ -481,7 +502,7 @@ test("with its routing pinned, the engine's greedy decoding matches the referenc
     assert.deepEqual(r.routing.failures.slice(0, 10), [], r.p.id);
   }
   const tokens = results.reduce((a, r) => a + r.tokens, 0);
-  t.diagnostic(`${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${Math.max(...results.map((r) => r.greedy.worst.logit)).toExponential(2)}, router logits ${Math.max(...results.map((r) => r.routing.worst.logit)).toExponential(2)}`);
+  t.diagnostic(`on ${DEVICE || "cpu"}, ${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${Math.max(...results.map((r) => r.greedy.worst.logit)).toExponential(2)}, router logits ${Math.max(...results.map((r) => r.routing.worst.logit)).toExponential(2)}`);
 });
 
 // The tests above pin the experts the router chooses anyway, so they would
@@ -500,14 +521,14 @@ test("pinned experts are the ones a token goes through", MODEL, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "vitna-moe-swap-"));
   try {
     writePins(join(dir, "pin"), swapped);
-    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, "logits"), ...CTX, "--experts-in", join(dir, "pin")]);
+    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, "logits"), ...RUN, "--experts-in", join(dir, "pin")]);
     const rows = readF32(join(dir, "logits"));
     const V = fixture.model.vocab_size;
     const moved = p.positions.map((pos, i) =>
       Math.max(...[...pos.top, ...fixture.probe_ids.map((id, k) => [id, pos.probe[k]])].map(([id, v]) => Math.abs(rows[i * V + id] - v))));
     assert.ok(moved.slice(0, at).every((d) => d <= LOGIT_ATOL), `positions before ${at} moved: ${moved}`);
     assert.ok(Math.max(...moved.slice(at)) > LOGIT_ATOL, `the pinned swap at position ${at} moved nothing past the tolerance: ${moved}`);
-    t.diagnostic(`${p.id} position ${at} layer ${layer}, the runner-up pinned in place of the 8th expert: the logits after it moved by up to ${Math.max(...moved).toExponential(2)}`);
+    t.diagnostic(`on ${DEVICE || "cpu"}, ${p.id} position ${at} layer ${layer}, the runner-up pinned in place of the 8th expert: the logits after it moved by up to ${Math.max(...moved).toExponential(2)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -520,7 +541,7 @@ test("pinned experts are the ones a token goes through", MODEL, async (t) => {
 test("unpinned, the engine decodes the reference's tokens until its routing departs at a near-tie, if it ever does", MODEL, async (t) => {
   const results = await eachPrompt("vitna-moe-free-", async (p, f) => {
     const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", String(p.greedy_ids.length), "--greedy",
-      ...CTX, "--logits-out", f("logits"), "--router-out", f("router"), "--experts-out", f("experts")]);
+      ...RUN, "--logits-out", f("logits"), "--router-out", f("router"), "--experts-out", f("experts")]);
     return { p, ids: JSON.parse(out).ids, logits: readF32(f("logits")), router: readF32(f("router")), chosen: readI32(f("experts")) };
   });
   const E = fixture.model.experts;
@@ -546,54 +567,84 @@ test("unpinned, the engine decodes the reference's tokens until its routing depa
     assert.deepEqual(result.failures.slice(0, 10), [], p.id);
     if (steps === p.greedy.length) assert.deepEqual(ids, p.greedy_ids, p.id);
   }
-  t.diagnostic(notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`);
+  t.diagnostic(`on ${DEVICE || "cpu"}, ` + (notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`));
 });
+
+// Run capital and code under each of configs, [name, extra arguments]: 16
+// greedy tokens with their logits, and every position's logits. Every run
+// must give the first's tokens, and its logits byte for byte. On the CPU the
+// runs of a prompt go side by side; on a GPU one after another.
+async function sameEverywhere(configs) {
+  const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
+  const dir = mkdtempSync(join(tmpdir(), "vitna-moe-same-"));
+  try {
+    for (const p of prompts) {
+      const run = async ([name, extra]) => {
+        const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
+          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
+        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra]);
+        return JSON.parse(out).ids;
+      };
+      const ids = [];
+      if (GPU) for (const c of configs) ids.push(await run(c));
+      else ids.push(...(await Promise.all(configs.map(run))));
+      const [first] = configs;
+      for (const [i, [name]] of configs.entries()) {
+        assert.deepEqual(ids[i], ids[0], `${p.id}: ${name} chose other tokens than ${first[0]}`);
+        for (const kind of ["logits", "greedy"]) {
+          const a = readFileSync(join(dir, `${p.id}.${first[0]}.${kind}`));
+          const b = readFileSync(join(dir, `${p.id}.${name}.${kind}`));
+          assert.ok(a.length > 0 && a.equals(b), `${p.id} ${kind}: the ${name} run's ${b.length} bytes are not the ${first[0]} run's ${a.length}`);
+        }
+      }
+    }
+    return prompts.map((p) => p.id).join(" and ");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 // Gate A5, step 3: the experts read from the drive (--expert-cache), with
 // direct I/O, into a cache in memory far smaller than they are, so that
 // nearly every one is read when a layer wants it or a prefetch guessed it.
 // What is computed must not change at all: the same bytes, run through the
-// same arithmetic, give the mapped run's logits bit for bit.
+// same arithmetic, give the mapped run's logits bit for bit. On a GPU the
+// experts are copied to the device from that cache instead of from the
+// mapped checkpoint, which must not change them either.
 test("read from the drive into a small cache, the experts give the mapped run's logits and tokens, bit for bit", MODEL, async (t) => {
-  const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
-  const dir = mkdtempSync(join(tmpdir(), "vitna-moe-stream-"));
-  try {
-    for (const p of prompts) {
-      const run = async (extra, name) => {
-        const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...CTX,
-          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
-        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...CTX, ...extra]);
-        return JSON.parse(out).ids;
-      };
-      const [mapped, streamed] = await Promise.all([run([], "mapped"), run(["--expert-cache", "256"], "streamed")]);
-      assert.deepEqual(streamed, mapped, p.id);
-      for (const kind of ["logits", "greedy"]) {
-        const a = readFileSync(join(dir, `${p.id}.mapped.${kind}`));
-        const b = readFileSync(join(dir, `${p.id}.streamed.${kind}`));
-        assert.ok(a.length > 0 && a.equals(b), `${p.id} ${kind}: the streamed run's ${b.length} bytes are not the mapped run's ${a.length}`);
-      }
-    }
-    t.diagnostic(`${prompts.map((p) => p.id).join(" and ")}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte, read through a cache of 256 MiB`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  const which = await sameEverywhere([["mapped", []], ["streamed", ["--expert-cache", "256"]]]);
+  t.diagnostic(`on ${DEVICE || "cpu"}, ${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte, read through a cache of 256 MiB`);
+});
+
+// On a GPU the experts live in a cache on the device, filled as layers want
+// them and as the next layer's router guesses. An expert's arithmetic does
+// not depend on which slot holds it, when it was copied there or from where,
+// so a cache of 21 slots, refilled at nearly every layer, must give the
+// logits of one holding nearly half of them, bit for bit, and so must one
+// fed from a cache in memory of 21 slots too.
+test("on the GPU, an expert cache of any size, fed from either place, gives the same logits and tokens, bit for bit", {
+  skip: MODEL.skip || (!GPU && "VITNA_DEVICE is not cuda"),
+}, async (t) => {
+  const which = await sameEverywhere([
+    ["default", []],
+    ["small", ["--gpu-expert-cache", "256"]],
+    ["both-small", ["--gpu-expert-cache", "256", "--expert-cache", "256"]],
+  ]);
+  t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte with the GPU's expert cache as large as the device allows, at 256 MiB, and at 256 MiB fed from a cache of 256 MiB in memory`);
 });
 
 test("an expert cache too small for twice the experts a token goes through is refused, saying how large it must be", MODEL, async () => {
   await assert.rejects(
-    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), ...CTX, "--expert-cache", "64"]),
+    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), ...RUN, "--expert-cache", "64"]),
     /expert cache must hold twice the experts a token goes through: \d+ MiB or more/,
   );
 });
 
-// The CUDA path does not run a mixture of experts yet. An engine without it
-// refuses --device cuda before loading anything, so this needs one built
-// with it, on a GPU: VITNA_DEVICE=cuda, as for gate A4.
-test("an engine with the CUDA path refuses to run a mixture of experts on the GPU, saying so", {
-  skip: MODEL.skip || (process.env.VITNA_DEVICE !== "cuda" && "VITNA_DEVICE is not cuda"),
+test("on the GPU, an expert cache there too small for twice the experts a token goes through is refused, saying how large it must be", {
+  skip: MODEL.skip || (!GPU && "VITNA_DEVICE is not cuda"),
 }, async () => {
   await assert.rejects(
-    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), "--device", "cuda", ...CTX]),
-    /mixture of experts/,
+    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), ...RUN, "--gpu-expert-cache", "100"]),
+    /--device cuda: the GPU's expert cache must hold twice the experts a token goes through: 192 MiB or more/,
   );
 });

@@ -42,7 +42,7 @@ $(CUDA_OBJ)/%.o: src/%.c | $(CUDA_OBJ)
 $(CUDA_OBJ)/unit_tests.o: tests/unit_tests.c | $(CUDA_OBJ)
 	$(CC) $(CFLAGS) -DVITNA_CUDA=1 -c $< -o $@
 
-$(CUDA_OBJ)/model_cuda.o: src/model_cuda.cu include/model_cuda.h include/model.h | $(CUDA_OBJ)
+$(CUDA_OBJ)/model_cuda.o: src/model_cuda.cu include/model_cuda.h include/model.h include/expert_stream.h | $(CUDA_OBJ)
 	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -Iinclude -c $< -o $@
 
 $(TARGET): $(OBJS)

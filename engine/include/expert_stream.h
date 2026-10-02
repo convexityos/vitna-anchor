@@ -115,6 +115,24 @@ bool vitna_expert_stream_wait(vitna_expert_stream_t* s, const uint32_t* ids, siz
 void vitna_expert_stream_release(vitna_expert_stream_t* s, const uint32_t* ids, size_t k);
 
 /**
+ * Hold place id only if the cache has it read already, setting out to where
+ * its parts are, and return true; otherwise return false, starting no read
+ * and waiting for nothing. A place held so is released as one acquired is,
+ * but it is not counted as acquired: it is for copying an expert onward (to
+ * a GPU) before anyone asks for it.
+ */
+bool vitna_expert_stream_hold_ready(vitna_expert_stream_t* s, uint32_t id, vitna_expert_data_t* out);
+
+/** The cache's slots. */
+size_t vitna_expert_stream_slots(const vitna_expert_stream_t* s);
+
+/**
+ * The memory the slots are in, one block of *bytes, for registering it with
+ * a device that copies from it.
+ */
+void* vitna_expert_stream_memory(const vitna_expert_stream_t* s, size_t* bytes);
+
+/**
  * Start reading those of the k places the cache lacks, into slots nobody
  * holds, and return without waiting. Stops early, dropping the rest, when no
  * slot can be given up.
