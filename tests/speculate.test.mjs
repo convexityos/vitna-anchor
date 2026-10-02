@@ -45,14 +45,19 @@ const DEVICE = process.env.VITNA_DEVICE ?? "";
 assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
 const onDevice = DEVICE ? ["--device", DEVICE] : [];
 
+// A run takes a few seconds. One that has not finished in this many minutes
+// never will: it is killed, and fails the test instead of hanging the suite.
+const RUN_MINUTES = 5;
+
 function generate(ids, args) {
   assert.ok(engine, "no built engine found");
   const dir = mkdtempSync(join(tmpdir(), "vitna-speculate-"));
   const out = join(dir, "logits.f32");
   try {
     const r = spawnSync(engine, ["generate", "--model", modelDir, "--ids", ids.join(","), "--max-new", "24", "--logits-out", out, "--timing", ...onDevice, ...args],
-      { encoding: "utf8", maxBuffer: 1 << 26 });
-    assert.equal(r.status, 0, `${engine} exited ${r.status}: ${r.stderr}`);
+      { encoding: "utf8", maxBuffer: 1 << 26, timeout: RUN_MINUTES * 60_000 });
+    const ended = r.error?.code === "ETIMEDOUT" ? `timed out after ${RUN_MINUTES} minutes and was killed` : `exited ${r.status}`;
+    assert.equal(r.status, 0, `${engine} ${ended}: ${r.stderr}`);
     const taken = r.stderr.match(/speculation: (\d+) passes, (\d+) tokens drafted, (\d+) of them taken/);
     return { ids: JSON.parse(r.stdout).ids, logits: readFileSync(out), taken: taken ? Number(taken[3]) : null };
   } finally {
