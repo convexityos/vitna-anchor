@@ -15,7 +15,9 @@
  * does not know are ignored and named in an x-vitna-ignored header. A step the
  * model fails to run ends the request with an error, never with the reply so
  * far: a 500 of type server_error or, once a stream's 200 has gone out, an
- * event carrying that error, with no final chunk or [DONE] after it.
+ * event carrying that error, with no final chunk or [DONE] after it. A step
+ * that loses the GPU (vitna_api_lost) ends every request running that way,
+ * and every other is refused with a 503.
  *
  * Requests that generate run together, as many at once as the model's cache
  * has sequences (vitna_llama_load's seqs), each in a sequence of its own; the
@@ -59,6 +61,17 @@ void vitna_api_free(vitna_api_t* api);
 
 /** The requests it runs at once: the model's sequences. */
 size_t vitna_api_parallel(const vitna_api_t* api);
+
+/**
+ * Whether the GPU can run nothing more in this process: a step failed with an
+ * error CUDA calls sticky (vitna_llama_t.device_lost), after which only a new
+ * process can use the device. From then on every request that was running
+ * ends with the error a failed step gives, and every request waiting for a
+ * sequence, or sent later, is refused with a 503 that says so. The server
+ * stops taking connections when this turns true, so that something can start
+ * a new one.
+ */
+bool vitna_api_lost(vitna_api_t* api);
 
 /**
  * Whether a request may reuse the key-value cache an earlier one left in
