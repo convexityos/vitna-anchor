@@ -333,6 +333,35 @@ static bool wants_cuda(const args_t* a) {
     return a->device && strcmp(a->device, "cuda") == 0;
 }
 
+/* For tests only: VITNA_TEST_FAIL_STEP=<position> makes the step at that
+ * position fail once, so the tests can check what a command does when a step
+ * fails, with no GPU error to cause one: tests/step-failure.test.mjs what a
+ * client of serve sees, and tests/step-failure-cli.test.mjs what run,
+ * generate and logits say. With VITNA_TEST_LOSE_DEVICE=1 too, the device is
+ * lost with that step, as with a GPU error CUDA calls sticky. Arms the hook in
+ * the model and says so on stderr; false, having said why, for a value that is
+ * not a position, or VITNA_TEST_LOSE_DEVICE without one. */
+static bool arm_test_failure(vitna_llama_t* m) {
+    const char* fail = getenv("VITNA_TEST_FAIL_STEP");
+    const char* lose = getenv("VITNA_TEST_LOSE_DEVICE");
+    const bool losing = lose && *lose;
+    if (losing && !(fail && *fail)) {
+        fprintf(stderr, "VITNA_TEST_LOSE_DEVICE needs VITNA_TEST_FAIL_STEP, the position of the step that loses the device\n");
+        return false;
+    }
+    if (!(fail && *fail)) return true;
+    char* end;
+    unsigned long long pos = strtoull(fail, &end, 10);
+    if (fail[0] < '0' || fail[0] > '9' || *end) {
+        fprintf(stderr, "VITNA_TEST_FAIL_STEP must be a position, a whole number, not %s\n", fail);
+        return false;
+    }
+    vitna_llama_fail_step_once(m, (size_t)pos, losing);
+    fprintf(stderr, "VITNA_TEST_FAIL_STEP is set, for a test: the step at position %llu will fail once.\n", pos);
+    if (losing) fprintf(stderr, "VITNA_TEST_LOSE_DEVICE is set, for a test: the device is lost with that step.\n");
+    return true;
+}
+
 static bool load_model(const args_t* a, vitna_llama_t* m) {
     char err[512];
     if (!vitna_llama_load(m, a->model, a->ctx, a->parallel ? a->parallel : 1, err, sizeof(err))) {
@@ -364,6 +393,10 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
     if (no_rows && strcmp(no_rows, "1") == 0) {
         vitna_llama_no_rows(m);
         fprintf(stderr, "VITNA_TEST_NO_ROWS is set, for a test: a mixture of experts on the GPU runs every token alone.\n");
+    }
+    if (!arm_test_failure(m)) {
+        vitna_llama_free(m);
+        return false;
     }
     return true;
 }
@@ -459,6 +492,27 @@ static bool routing_end(const args_t* a, vitna_llama_t* m, routing_io_t* r, size
     return ok;
 }
 
+/* Say why the step for token at position pos did not run, naming only what
+ * the engine knows: the token is outside the vocabulary, as --ids allows; the
+ * position is past the key-value cache; or else the forward pass failed
+ * there, for the reason the model printed first (a GPU error, an expert the
+ * drive did not give, VITNA_TEST_FAIL_STEP). After a GPU error CUDA calls
+ * sticky, the device can run nothing more in this process (device_lost), and
+ * the line says that too. */
+static void step_failed(const vitna_llama_t* m, int32_t token, size_t pos) {
+    if (token < 0 || (size_t)token >= m->cfg.vocab) {
+        fprintf(stderr, "token %d at position %zu is outside the model's vocabulary, ids 0 to %zu\n", token, pos, m->cfg.vocab - 1);
+    } else if (pos >= m->ctx) {
+        fprintf(stderr, "the key-value cache is full at %zu positions; --ctx sets how many it holds, up to the model's maximum of %zu\n",
+                m->ctx, m->cfg.max_positions);
+    } else if (m->device_lost) {
+        fprintf(stderr, "the forward pass failed at position %zu, and the GPU can run nothing more in this process after this error: %s\n",
+                pos, m->device_error);
+    } else {
+        fprintf(stderr, "the forward pass failed at position %zu\n", pos);
+    }
+}
+
 static int cmd_logits(const args_t* a) {
     if (!a->model || !a->out) { fprintf(stderr, "--model <dir> and --out <file> are required\n"); return 1; }
     vitna_tokenizer_t* tok = a->ids ? NULL : load_tokenizer(a->model);
@@ -480,7 +534,7 @@ static int cmd_logits(const args_t* a) {
                 const size_t n = ids.count - t < chunk ? ids.count - t : chunk;
                 const size_t ran = vitna_llama_steps(&m, 0, ids.ids + t, n, rows, n);
                 if (ran < n) {
-                    fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", ids.ids[t + ran], t + ran);
+                    step_failed(&m, ids.ids[t + ran], t + ran);
                     rc = 1;
                 } else if (fwrite(rows, sizeof(float), n * V, f) != n * V) {
                     fprintf(stderr, "cannot write %s\n", a->out);
@@ -550,7 +604,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
     const double t_prompt = vitna_time_ms();
     const size_t ran = vitna_llama_steps(m, 0, prompt->ids, prompt->count, row, 1);
     if (ran < prompt->count) {
-        fprintf(stderr, "token %d at position %zu: out of range or past --ctx\n", prompt->ids[ran], ran);
+        step_failed(m, prompt->ids[ran], ran);
         rc = 1;
     }
     const double t_first = vitna_time_ms();
@@ -578,7 +632,7 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         }
         if (d == 0) {
             if (!vitna_llama_step(m, 0, t, row)) {
-                fprintf(stderr, "the key-value cache is full at %zu positions; raise --ctx\n", m->ctx);
+                step_failed(m, t, m->past[0]);
                 rc = 1;
                 break;
             }
@@ -592,7 +646,8 @@ static int generate(const args_t* a, vitna_llama_t* m, const vitna_tokenizer_t* 
         drafted += d;
         const size_t start = m->past[0];
         if (vitna_llama_steps_exact(m, 0, pass, d + 1, rows) < d + 1) {
-            fprintf(stderr, "the forward pass failed at position %zu\n", m->past[0]);
+            /* The rows before m->past[0] ran; the one there did not. */
+            step_failed(m, pass[m->past[0] - start], m->past[0]);
             rc = 1;
             break;
         }
@@ -851,34 +906,6 @@ static int cmd_serve(const args_t* a) {
     if (!load_model(a, &m)) {
         vitna_tokenizer_free(tok);
         return 1;
-    }
-    /* For tests only: VITNA_TEST_FAIL_STEP=<position> makes the step at that
-     * position fail once, so tests/step-failure.test.mjs can check what a
-     * client sees when a step fails, with no GPU error to cause one. With
-     * VITNA_TEST_LOSE_DEVICE=1 too, the device is lost with that step, as
-     * with a GPU error CUDA calls sticky, so the same file can check that
-     * the server answers what is open and exits. */
-    const char* fail = getenv("VITNA_TEST_FAIL_STEP");
-    const char* lose = getenv("VITNA_TEST_LOSE_DEVICE");
-    const bool losing = lose && *lose;
-    if (losing && !(fail && *fail)) {
-        fprintf(stderr, "VITNA_TEST_LOSE_DEVICE needs VITNA_TEST_FAIL_STEP, the position of the step that loses the device\n");
-        vitna_llama_free(&m);
-        vitna_tokenizer_free(tok);
-        return 1;
-    }
-    if (fail && *fail) {
-        char* end;
-        unsigned long long pos = strtoull(fail, &end, 10);
-        if (fail[0] < '0' || fail[0] > '9' || *end) {
-            fprintf(stderr, "VITNA_TEST_FAIL_STEP must be a position, a whole number, not %s\n", fail);
-            vitna_llama_free(&m);
-            vitna_tokenizer_free(tok);
-            return 1;
-        }
-        vitna_llama_fail_step_once(&m, (size_t)pos, losing);
-        fprintf(stderr, "VITNA_TEST_FAIL_STEP is set, for a test: the step at position %llu will fail once.\n", pos);
-        if (losing) fprintf(stderr, "VITNA_TEST_LOSE_DEVICE is set, for a test: the device is lost with that step.\n");
     }
     char id[128];
     if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
