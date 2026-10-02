@@ -4,6 +4,7 @@
  */
 
 #include "model.h"
+#include "expert_stream.h"
 #include "json.h"
 #include "kernels.h"
 #include "ops.h"
@@ -127,20 +128,34 @@ static const vitna_tensor_desc_t* find_tensor(const vitna_llama_t* m, const char
     return NULL;
 }
 
+/* Open the checkpoint file at path as shard i, keeping its path. */
+static bool open_shard(vitna_llama_t* m, size_t i, const char* path, char* err, size_t err_len) {
+    char st_err[256];
+    m->shard_paths[i] = (char*)malloc(strlen(path) + 1);
+    if (!m->shard_paths[i]) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    strcpy(m->shard_paths[i], path);
+    if (!vitna_safetensors_open_ex(path, &m->shards[i], st_err, sizeof(st_err))) {
+        free(m->shard_paths[i]);
+        m->shard_paths[i] = NULL;
+        return fail(err, err_len, "%s%s", st_err, NULL);
+    }
+    m->n_shards = i + 1;
+    return true;
+}
+
 /* Open dir's model.safetensors or, where there is none, every file its
  * model.safetensors.index.json names, and check that each tensor the index
  * lists is found in the file it names. */
 static bool open_checkpoint(vitna_llama_t* m, const char* dir, char* err, size_t err_len) {
-    char path[1024], st_err[256];
+    char path[1024];
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     FILE* single = fopen(path, "rb");
     if (single) {
         fclose(single);
         m->shards = (vitna_safetensors_t*)calloc(1, sizeof(vitna_safetensors_t));
-        if (!m->shards) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
-        if (!vitna_safetensors_open_ex(path, &m->shards[0], st_err, sizeof(st_err))) return fail(err, err_len, "%s%s", st_err, NULL);
-        m->n_shards = 1;
-        return true;
+        m->shard_paths = (char**)calloc(1, sizeof(char*));
+        if (!m->shards || !m->shard_paths) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+        return open_shard(m, 0, path, err, err_len);
     }
 
     snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
@@ -175,15 +190,12 @@ static bool open_checkpoint(vitna_llama_t* m, const char* dir, char* err, size_t
     }
     if (ok) {
         m->shards = (vitna_safetensors_t*)calloc(n_files, sizeof(vitna_safetensors_t));
-        if (!m->shards) ok = fail(err, err_len, "out of memory%s%s", NULL, NULL);
+        m->shard_paths = (char**)calloc(n_files, sizeof(char*));
+        if (!m->shards || !m->shard_paths) ok = fail(err, err_len, "out of memory%s%s", NULL, NULL);
     }
     for (size_t f = 0; ok && f < n_files; f++) {
         snprintf(path, sizeof(path), "%s/%s", dir, names[f]);
-        if (!vitna_safetensors_open_ex(path, &m->shards[f], st_err, sizeof(st_err))) {
-            ok = fail(err, err_len, "%s%s", st_err, NULL);
-        } else {
-            m->n_shards = f + 1;
-        }
+        ok = open_shard(m, f, path, err, err_len);
     }
     /* Every tensor listed is in its file, and a lookup by name finds that one. */
     for (size_t i = 0; ok && i < n; i++) {
@@ -367,8 +379,15 @@ void vitna_llama_free(vitna_llama_t* m) {
 #if defined(VITNA_CUDA)
     vitna_cuda_free(m->cuda);
 #endif
-    for (size_t i = 0; i < m->n_shards; i++) vitna_safetensors_close(&m->shards[i]);
+    vitna_expert_stream_close(m->stream);
+    free(m->pred_xn);
+    free(m->pred_logits);
+    for (size_t i = 0; i < m->n_shards; i++) {
+        vitna_safetensors_close(&m->shards[i]);
+        free(m->shard_paths[i]);
+    }
     free(m->shards);
+    free(m->shard_paths);
     memset(m, 0, sizeof(*m));
 }
 
@@ -422,14 +441,156 @@ void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen,
     m->pin_positions = pin ? pin_positions : 0;
 }
 
+/* Where a matrix of the checkpoint is: the shard whose mapping holds it,
+ * and its offset and length in that file. */
+static bool locate(const vitna_llama_t* m, const vitna_matrix_t* w, vitna_extent_t* out) {
+    const char* p = (const char*)w->data;
+    for (size_t i = 0; i < m->n_shards; i++) {
+        const char* base = (const char*)m->shards[i].mmap.data;
+        if (p >= base && p < base + m->shards[i].mmap.size) {
+            out->file = (uint32_t)i;
+            out->offset = (uint64_t)(p - base);
+            out->length = (uint64_t)w->rows * w->cols * vitna_dtype_size(w->dtype);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Reads in flight at once: enough to keep an NVMe drive's queue busy with
+ * the experts one layer lacks. */
+#define STREAM_THREADS 4
+
+bool vitna_llama_stream_experts(vitna_llama_t* m, size_t cache_bytes, char* err, size_t err_len) {
+    const vitna_llama_config_t* c = &m->cfg;
+    if (!c->n_experts) return fail(err, err_len, "this model has no experts to read from the drive%s%s", NULL, NULL);
+    if (m->stream) return true;
+    const size_t E = c->n_experts, K = c->n_experts_used, n = c->n_layers * E;
+    vitna_expert_place_t* places = (vitna_expert_place_t*)calloc(n, sizeof(*places));
+    if (!places) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    bool ok = true;
+    for (size_t l = 0; ok && l < c->n_layers; l++) {
+        for (size_t e = 0; ok && e < E; e++) {
+            const vitna_expert_t* x = &m->layers[l].experts[e];
+            vitna_expert_place_t* p = &places[l * E + e];
+            p->n_parts = 3; /* gate, up, down: mixture_of_experts reads them in this order */
+            ok = locate(m, &x->gate, &p->part[0]) && locate(m, &x->up, &p->part[1]) && locate(m, &x->down, &p->part[2]);
+        }
+    }
+    const size_t slot = ok ? vitna_expert_stream_slot_bytes_for(places, n, m->n_shards) : 0;
+    size_t slots = slot ? cache_bytes / slot : 0;
+    if (slots > n) slots = n; /* a slot for every expert holds them all */
+    if (!ok || slot == 0) {
+        ok = fail(err, err_len, "an expert is not where the checkpoint's files can be read%s%s", NULL, NULL);
+    } else if (slots < 2 * K) {
+        char need[32];
+        snprintf(need, sizeof(need), "%zu", (2 * K * slot + ((size_t)1 << 20) - 1) >> 20);
+        ok = fail(err, err_len, "the expert cache must hold twice the experts a token goes through: %s MiB or more%s", need, NULL);
+    }
+    if (ok) {
+        m->pred_xn = (float*)malloc(c->hidden * sizeof(float));
+        m->pred_logits = (float*)malloc(E * sizeof(float));
+        ok = (m->pred_xn && m->pred_logits) || fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    }
+    if (ok) {
+        m->predicted_layer = -1;
+        m->stream = vitna_expert_stream_open((const char* const*)m->shard_paths, m->n_shards, places, n, slots, STREAM_THREADS, err, err_len);
+        ok = m->stream != NULL;
+    }
+    free(places);
+    return ok;
+}
+
+bool vitna_llama_read_experts(vitna_llama_t* m, double* mib, double* ms) {
+    if (!m->stream) return false;
+    const size_t n = m->cfg.n_layers * m->cfg.n_experts, K = m->cfg.n_experts_used;
+    uint32_t* order = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!order) return false;
+    /* A fixed shuffle, so that no two reads in a row are neighbours in the files. */
+    uint64_t r = 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < n; i++) order[i] = (uint32_t)i;
+    for (size_t i = n - 1; i > 0; i--) {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        const size_t j = (size_t)(r % (i + 1));
+        const uint32_t t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+    }
+    const uint64_t before = vitna_expert_stream_stats(m->stream).bytes_read;
+    vitna_expert_data_t data[VITNA_EXPERTS_USED_MAX];
+    bool ok = true;
+    const double t0 = vitna_time_ms();
+    for (size_t i = 0; i < n && ok; i += K) {
+        const size_t k = n - i < K ? n - i : K;
+        vitna_expert_stream_hold(m->stream, order + i, k);
+        if (i + k < n) vitna_expert_stream_prefetch(m->stream, order + i + k, n - i - k < K ? n - i - k : K);
+        ok = vitna_expert_stream_wait(m->stream, order + i, k, data);
+        if (ok) vitna_expert_stream_release(m->stream, order + i, k);
+    }
+    *ms = vitna_time_ms() - t0;
+    *mib = (double)(vitna_expert_stream_stats(m->stream).bytes_read - before) / 1048576.0;
+    free(order);
+    return ok;
+}
+
+const char* vitna_llama_stream_report(vitna_llama_t* m, char* buf, size_t len) {
+    if (len == 0) return buf;
+    buf[0] = '\0';
+    if (!m->stream) return buf;
+    const vitna_expert_stream_stats_t s = vitna_expert_stream_stats(m->stream);
+    snprintf(buf, len,
+             "experts: %llu acquired: %llu already read, %llu still being read for a prefetch, %llu read when asked for. "
+             "%llu prefetched, %llu of those used. %.1f MiB read in %llu reads, %.0f ms of reading summed over %d threads, "
+             "%.0f ms waited for. The lookahead named %.1f%% of the experts the layers routed to",
+             (unsigned long long)s.acquired, (unsigned long long)s.hits, (unsigned long long)s.in_flight,
+             (unsigned long long)s.misses, (unsigned long long)s.prefetched, (unsigned long long)s.prefetch_used,
+             (double)s.bytes_read / 1048576.0, (unsigned long long)s.reads, s.read_ms, STREAM_THREADS, s.wait_ms,
+             m->predicted_total ? 100.0 * (double)m->predicted_right / (double)m->predicted_total : 0.0);
+    return buf;
+}
+
+/* The k largest of n logits, largest first, the lower index first between equals. */
+static void top_k(const float* logits, size_t n, size_t k, int32_t* out) {
+    for (size_t i = 0; i < k; i++) {
+        int32_t best = -1;
+        for (size_t e = 0; e < n; e++) {
+            bool taken = false;
+            for (size_t j = 0; j < i && !taken; j++) taken = out[j] == (int32_t)e;
+            if (!taken && (best < 0 || logits[e] > logits[best])) best = (int32_t)e;
+        }
+        out[i] = best;
+    }
+}
+
+/* A guess at the experts layer will route to, and reads started for those
+ * the cache lacks: the residual stream as it stands, normalized with that
+ * layer's own norm and scored by its router. The layer still routes for
+ * itself when it comes; the guess only decides what is read early. */
+static void prefetch_layer(vitna_llama_t* m, size_t layer) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const vitna_llama_layer_t* L = &m->layers[layer];
+    const size_t K = c->n_experts_used;
+    vitna_rmsnorm(m->x, L->mlp_norm, m->pred_xn, c->hidden, c->rms_eps);
+    vitna_matvec(L->router.data, L->router.dtype, m->pred_xn, m->pred_logits, L->router.rows, L->router.cols);
+    top_k(m->pred_logits, c->n_experts, K, m->predicted);
+    m->predicted_layer = (int64_t)layer;
+    uint32_t places[VITNA_EXPERTS_USED_MAX];
+    for (size_t k = 0; k < K; k++) places[k] = (uint32_t)(layer * c->n_experts + (size_t)m->predicted[k]);
+    vitna_expert_stream_prefetch(m->stream, places, K);
+}
+
 /* Layer l's mixture of experts for the token at pos: m->xn in, m->proj out.
  * This is transformers' OlmoeSparseMoeBlock with its eager experts: the
  * router's logits over every expert; their softmax, in float32; the experts
  * with the n_experts_used largest weights, each weighted by its own share
  * of the softmax, not renormalized over those used; and their outputs, each
  * scaled by its weight, added to zeros one expert at a time in order of
- * expert, as the loop over experts and index_add_ add them. */
-static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, size_t l, size_t pos) {
+ * expert, as the loop over experts and index_add_ add them. With the
+ * experts streamed, the same arithmetic runs on the bytes read from the
+ * drive; false if a read fails. */
+static bool mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, size_t l, size_t pos) {
     const vitna_llama_config_t* c = &m->cfg;
     const size_t E = c->n_experts, K = c->n_experts_used, H = c->hidden;
     float* logits = m->router_logits;
@@ -438,15 +599,7 @@ static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
     /* The router's choice: the K largest logits, which are the K largest
      * weights, largest first, and the lower expert first between equals. */
     int32_t chosen[VITNA_EXPERTS_USED_MAX];
-    for (size_t k = 0; k < K; k++) {
-        int32_t best = -1;
-        for (size_t e = 0; e < E; e++) {
-            bool taken = false;
-            for (size_t j = 0; j < k && !taken; j++) taken = chosen[j] == (int32_t)e;
-            if (!taken && (best < 0 || logits[e] > logits[best])) best = (int32_t)e;
-        }
-        chosen[k] = best;
-    }
+    top_k(logits, E, K, chosen);
     const size_t at = pos * c->n_layers + l;
     if (pos < m->trace_positions) {
         if (m->trace_logits) memcpy(m->trace_logits + at * E, logits, E * sizeof(float));
@@ -461,6 +614,24 @@ static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
         order[j] = e;
     }
 
+    /* Streamed: hold this layer's experts, reading those the cache lacks,
+     * then start reading what the next layer is guessed to want while
+     * these are read and run. Held experts cannot be given up for the guess. */
+    uint32_t places[VITNA_EXPERTS_USED_MAX];
+    vitna_expert_data_t data[VITNA_EXPERTS_USED_MAX];
+    if (m->stream) {
+        for (size_t k = 0; k < K; k++) places[k] = (uint32_t)(l * E + (size_t)order[k]);
+        vitna_expert_stream_hold(m->stream, places, K);
+        if (m->predicted_layer == (int64_t)l) {
+            for (size_t k = 0; k < K; k++) {
+                for (size_t j = 0; j < K; j++) m->predicted_right += m->predicted[j] == chosen[k];
+            }
+            m->predicted_total += K;
+        }
+        if (l + 1 < c->n_layers) prefetch_layer(m, l + 1);
+        if (!vitna_expert_stream_wait(m->stream, places, K, data)) return false;
+    }
+
     float max = logits[0];
     for (size_t e = 1; e < E; e++) if (logits[e] > max) max = logits[e];
     float sum = 0.0f;
@@ -469,16 +640,22 @@ static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, s
     memset(m->proj, 0, H * sizeof(float));
     for (size_t k = 0; k < K; k++) {
         const vitna_expert_t* x = &L->experts[order[k]];
+        /* The streamed parts are gate, up and down, as vitna_llama_stream_experts placed them. */
+        const void* gate = m->stream ? data[k].part[0] : x->gate.data;
+        const void* up = m->stream ? data[k].part[1] : x->up.data;
+        const void* down = m->stream ? data[k].part[2] : x->down.data;
         const float w = expf(logits[order[k]] - max) / sum;
-        vitna_matvec(x->gate.data, x->gate.dtype, m->xn, m->gate, x->gate.rows, x->gate.cols);
-        vitna_matvec(x->up.data, x->up.dtype, m->xn, m->up, x->up.rows, x->up.cols);
+        vitna_matvec(gate, x->gate.dtype, m->xn, m->gate, x->gate.rows, x->gate.cols);
+        vitna_matvec(up, x->up.dtype, m->xn, m->up, x->up.rows, x->up.cols);
         vitna_silu_mul(m->gate, m->up, m->gate, c->intermediate);
-        vitna_matvec(x->down.data, x->down.dtype, m->gate, m->expert_out, x->down.rows, x->down.cols);
+        vitna_matvec(down, x->down.dtype, m->gate, m->expert_out, x->down.rows, x->down.cols);
         for (size_t i = 0; i < H; i++) {
             const float scaled = m->expert_out[i] * w;
             m->proj[i] += scaled;
         }
     }
+    if (m->stream) vitna_expert_stream_release(m->stream, places, K);
+    return true;
 }
 
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
@@ -510,6 +687,8 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
     /* The token's embedding row, widened to float32. */
     const size_t esize = vitna_dtype_size(m->embed.dtype);
     vitna_to_f32((const char*)m->embed.data + (size_t)token * H * esize, m->embed.dtype, m->x, H);
+    /* Streamed experts: the first layer's guess, read while its attention runs. */
+    if (m->stream) prefetch_layer(m, 0);
 
     /* Rotary angles for this position: position * inv_freq, in float32. */
     for (size_t j = 0; j < half; j++) {
@@ -570,7 +749,7 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
         /* MLP */
         vitna_rmsnorm(m->x, L->mlp_norm, m->xn, H, c->rms_eps);
         if (c->n_experts) {
-            mixture_of_experts(m, L, l, pos);
+            if (!mixture_of_experts(m, L, l, pos)) return false;
         } else {
             vitna_matvec(L->gate.data, L->gate.dtype, m->xn, m->gate, L->gate.rows, L->gate.cols);
             vitna_matvec(L->up.data, L->up.dtype, m->xn, m->up, L->up.rows, L->up.cols);

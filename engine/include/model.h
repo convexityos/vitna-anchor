@@ -91,6 +91,7 @@ struct vitna_cuda_model;
 typedef struct {
     vitna_llama_config_t cfg;
     vitna_safetensors_t* shards;   /* the checkpoint's files: one, or those its index names */
+    char** shard_paths;
     size_t n_shards;
     vitna_matrix_t embed;
     vitna_matrix_t lm_head;
@@ -107,6 +108,14 @@ typedef struct {
     /* scratch */
     float *x, *xn, *q, *k, *v, *att, *proj, *gate, *up, *scores, *cos_t, *sin_t;
     float *router_logits, *expert_out;   /* a mixture of experts: n_experts, and hidden */
+
+    /* Set by vitna_llama_stream_experts: the experts are read from the
+     * drive into this cache rather than from the mapped checkpoint. */
+    struct vitna_expert_stream* stream;
+    float *pred_xn, *pred_logits;        /* the lookahead's scratch: hidden, n_experts */
+    int32_t predicted[VITNA_EXPERTS_USED_MAX];
+    int64_t predicted_layer;             /* the layer predicted is for, or -1 */
+    uint64_t predicted_right, predicted_total;
 
     /* For tests, set by vitna_llama_trace_routing. */
     float* trace_logits;
@@ -266,6 +275,37 @@ void vitna_llama_fail_step_once(vitna_llama_t* m, size_t pos, bool lose_device);
  */
 void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen, size_t positions, const int32_t* pin,
                                size_t pin_positions);
+
+/**
+ * From here on, read a mixture of experts' experts from the drive, with
+ * direct I/O, into a cache in memory of cache_bytes, instead of from the
+ * mapped checkpoint (expert_stream.h). Before a layer's experts run, the
+ * next layer's router scores the residual stream as it stands, and the
+ * experts it would choose start being read: a guess, which costs a read
+ * when it is wrong and decides nothing, since every layer still routes for
+ * itself. The arithmetic is the mapped checkpoint's, so the logits are too,
+ * bit for bit. Call it once, straight after vitna_llama_load. Returns false,
+ * with the reason in err, for a dense model, a cache too small to hold
+ * twice the experts a token goes through, or files that cannot be opened
+ * for direct I/O.
+ */
+bool vitna_llama_stream_experts(vitna_llama_t* m, size_t cache_bytes, char* err, size_t err_len);
+
+/**
+ * Read every expert once through the expert cache, in a shuffled order,
+ * n_experts_used at a time with the next as many prefetched, as decoding
+ * reads them: how fast this drive feeds the cache, with nothing to compute.
+ * Sets *mib to what was read and *ms to how long it took. False if the
+ * experts are not streamed or a read fails.
+ */
+bool vitna_llama_read_experts(vitna_llama_t* m, double* mib, double* ms);
+
+/**
+ * What the expert cache has done so far, in a sentence, for --timing: hits,
+ * reads, bytes and time, and how often the lookahead guessed right. Writes
+ * an empty string when the experts are not streamed. Returns buf.
+ */
+const char* vitna_llama_stream_report(vitna_llama_t* m, char* buf, size_t len);
 
 /** True when this engine was built with the CUDA path (VITNA_CUDA). */
 bool vitna_llama_cuda_built(void);
