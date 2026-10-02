@@ -27,10 +27,36 @@
 // differently, moves logits by far less than 1e-2. A real defect, such as the
 // wrong rotary convention, a missing norm, or a position off by one, moves
 // them by 0.1 or more, and usually changes the argmax too.
+//
+// A mixture of experts adds one more, set in gate A5 before the engine could
+// route a single token:
+//
+//   Routing                at every layer of every position: the router
+//                          logits of the 9 experts the fixture keeps within
+//                          ROUTE_ATOL of the reference's, and the 8 experts
+//                          the token goes through the reference's 8, except
+//                          that one whose router logit the reference puts
+//                          within 2 * ROUTE_ATOL of the runner-up's may give
+//                          way to the runner-up
+//
+// Why a band: a token goes through the 8 experts its router scores highest,
+// so two scores that nearly tie can trade places when the same sums are
+// added in another order, and everything after then moves by far more than
+// rounding: by 0.011 to 0.21 when each prompt's closest call was forced the
+// other way with every other decision held, and by up to 0.39 when the
+// others were left to the router. Why 1e-3: run in two other float32
+// orders, OLMoE's reference moved its router logits by at most 1.05e-5 and
+// changed no routing decision, so the band is about a hundred times that,
+// and a tenth of LOGIT_ATOL for logits that are small (those the fixture
+// keeps have a median magnitude of 0.42, and none exceeds 5.7). A band of
+// 2e-2 would leave 1,416 of the fixture's 6,848 routing decisions free to go
+// either way; 2e-3 leaves 159. The measurements come from
+// reference/routing_sensitivity.py.
 
 import { readFileSync } from "node:fs";
 
 export const LOGIT_ATOL = 1e-2;
+export const ROUTE_ATOL = 1e-3;
 
 /**
  * Read the fixture and decode each prompt's last row of logits. Logits are
@@ -52,6 +78,10 @@ export function loadFixture(path) {
     for (const g of p.greedy) {
       g.top = f32pairs(g.top);
       g.margin = Math.fround(g.margin);
+    }
+    // A mixture of experts' fixture keeps router logits too.
+    for (const r of [...(p.routing ?? []), ...(p.greedy_routing ?? [])]) {
+      r.logits = r.logits.map((row) => row.map(Math.fround));
     }
   }
   return fixture;
@@ -153,5 +183,50 @@ export function compareGreedy(fixture, prompt, ids, steps, vocab = fixture.model
       if (!(d <= LOGIT_ATOL)) failures.push(`${prompt.id} step ${s} id ${id}: ${row[id]} vs ${v}`);
     }
   }
+  return { worst, failures };
+}
+
+/**
+ * Compare routing with a mixture-of-experts fixture's, for a run of positions:
+ * a prompt's `routing`, or its `greedy_routing`. Each entry keeps, per layer,
+ * the 8 experts the reference chose and then its runner-up, with their router
+ * logits. `routerLogits` holds the engine's router logits for every expert
+ * (positions x layers x experts float32) and `chosen` the experts it sent
+ * each position through (positions x layers x 8). `label` names the run in
+ * failures. Returns { worst, failures }.
+ */
+export function compareRouting(fixture, entries, routerLogits, chosen, label) {
+  const { layers, experts, experts_per_token: k } = fixture.model;
+  const failures = [];
+  const worst = { logit: 0 };
+  if (routerLogits.length !== entries.length * layers * experts || chosen.length !== entries.length * layers * k) {
+    const want = `${entries.length} x ${layers} x ${experts} router logits and ${entries.length} x ${layers} x ${k} experts`;
+    return { worst, failures: [`${label}: expected ${want}, got ${routerLogits.length} and ${chosen.length}`] };
+  }
+  entries.forEach((entry, t) => {
+    for (let l = 0; l < layers; l++) {
+      const at = `${label} ${t} layer ${l}`;
+      const row = routerLogits.subarray((t * layers + l) * experts, (t * layers + l + 1) * experts);
+      const ids = entry.experts[l];
+      const ref = entry.logits[l];
+      ids.forEach((e, i) => {
+        const d = Math.abs(row[e] - ref[i]);
+        worst.logit = Math.max(worst.logit, d);
+        if (!(d <= ROUTE_ATOL)) failures.push(`${at} expert ${e}: router logit ${row[e]} vs ${ref[i]}`);
+      });
+      const mine = [...chosen.slice((t * layers + l) * k, (t * layers + l + 1) * k)];
+      const theirs = ids.slice(0, k);
+      const left = theirs.filter((e) => !mine.includes(e));
+      const added = mine.filter((e) => !theirs.includes(e));
+      if (new Set(mine).size !== k) {
+        failures.push(`${at}: chose ${JSON.stringify(mine)}, not ${k} different experts`);
+      } else if (left.length > 0) {
+        // The only stand-in allowed is the runner-up, for one expert the
+        // reference scored within 2 * ROUTE_ATOL of it.
+        const close = left.length === 1 && added[0] === ids[k] && ref[theirs.indexOf(left[0])] - ref[k] < 2 * ROUTE_ATOL;
+        if (!close) failures.push(`${at}: experts ${JSON.stringify(mine)}, reference ${JSON.stringify(theirs)}, runner-up ${ids[k]}`);
+      }
+    }
+  });
   return { worst, failures };
 }

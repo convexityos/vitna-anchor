@@ -1,0 +1,18 @@
+{
+  "name": "olmoe-1b-7b",
+  "repo": "allenai/OLMoE-1B-7B-0924",
+  "revision": "6d84c48581ece794365f2b8e9cfb043c68ade9c5",
+  "license": "apache-2.0",
+  "why": "A small mixture-of-experts model under Apache-2.0, for gate A5: 6.9B parameters, 16 layers of 64 experts with 8 active a token, 93% of the weights in the experts. Attention as in Llama with no grouping (16 key-value heads for 16 query heads) and RMSNorm over the queries and keys, a softmax router whose top 8 weights are not renormalized, and an output layer of its own. 13.8 GB in bfloat16, more than the 8 GB GPU that passed A4 holds, so its experts have to stream from a drive.",
+  "files": [
+    { "path": "config.json", "size": 759, "sha256": "3643aa880d2f1c9b418156269ae791c73e5612d6b6b6fde0724d927cf89b6335" },
+    { "path": "generation_config.json", "size": 120, "sha256": "d77272ffaa7e62a904e8e130bb25ab11585bd4a5026e388d6d682e4b82892ce2" },
+    { "path": "special_tokens_map.json", "size": 65, "sha256": "b77491e270c6fcc5b2ecf22370f7318a6a18d3cabea09ba7bab92e9bf12656c2" },
+    { "path": "tokenizer.json", "size": 2115417, "sha256": "a094266ac6c4982efba277bc251349a5a6d6ad37efb39a2a90f53d8be2a40a40" },
+    { "path": "tokenizer_config.json", "size": 5372, "sha256": "78a839c7851f14f9fb30e664c2b46166dc0628f2900679e5ec160656f702edff" },
+    { "path": "model.safetensors.index.json", "size": 287214, "sha256": "0e2e1e0d8d357ac7af817cff28410c3dbad398f060c517a433e4076b2aae5579" },
+    { "path": "model-00001-of-00003.safetensors", "size": 4997744872, "sha256": "5e3cff7e367794685c241169072c940d200918617d5e2813f1c387dff52d845e" },
+    { "path": "model-00002-of-00003.safetensors", "size": 4997235176, "sha256": "15ef5c730ee3cfed7199498788cd2faf337203fc74b529625e7502cdd759f4a7" },
+    { "path": "model-00003-of-00003.safetensors", "size": 3843741912, "sha256": "a9abac4ac1b55c9adabac721a02fa39971f103eea9a65c310972b1246de76e04" }
+  ]
+}
