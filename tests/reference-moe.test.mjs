@@ -1,17 +1,25 @@
-// Gate A5, step 1: the reference for a mixture of experts.
+// Gate A5: a mixture of experts, against its reference.
 //
 // OLMoE-1B-7B's fixture, recorded by reference/record_moe.py as gate A1's is
-// recorded by record.py, with each layer's routing added. These tests need
-// nothing but the repository: the fixture is the one its pin, its inputs and
-// its recorders describe, its routing is complete and consistent, and the
+// recorded by record.py, with each layer's routing added. The first tests
+// need nothing but the repository: the fixture is the one its pin, its inputs
+// and its recorders describe, its routing is complete and consistent, and the
 // comparison in reference/compare.mjs accepts the fixture's own logits and
-// rejects wrong ones at this vocabulary too. The engine cannot run this model
-// yet, so the comparisons with it are todo until step 2.
+// routing and rejects wrong ones at this vocabulary too.
+//
+// The rest are step 2: the engine runs the model on the CPU and is compared
+// with the fixture. Its tokenizer needs only the model's tokenizer.json (node
+// scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json, as CI fetches
+// it); the others need the 13.8 GB of weights. Without them these are
+// skipped, with the reason, unless VITNA_REQUIRE_MOE=1, or for the tokenizer
+// VITNA_REQUIRE_MOE_TOKENIZER=1 (as in CI), where they fail.
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -332,9 +340,223 @@ test("the routing comparison accepts the reference's routing, and a runner-up on
   }
 });
 
-// Gate A5 step 2: the engine runs this model on the CPU and matches the
-// fixture under reference/compare.mjs, routing included.
-test.todo("the engine's tokenizer gives the ids of the model's own tokenizer.json");
-test.todo("the engine routes each token to the reference's experts");
-test.todo("the engine's logits match the reference within the stated tolerance");
-test.todo("the engine's greedy decoding matches the reference token for token");
+// ---------------------------------------------------------------------------
+// The engine against the fixture: gate A5, step 2, on the CPU.
+
+const EXE = process.platform === "win32" ? ".exe" : "";
+const engine = [
+  process.env.VITNA_ENGINE,
+  here(`../engine/vitna-anchor${EXE}`),
+  here(`../engine/build/Release/vitna-anchor${EXE}`),
+  here(`../engine/build/vitna-anchor${EXE}`),
+].filter(Boolean).find((p) => existsSync(p));
+const modelDir = process.env.ANCHOR_MOE_MODEL_DIR || here("../models/olmoe-1b-7b/");
+const LAYERS = fixture.model.layers;
+const K = fixture.model.experts_per_token;
+const required = (v) => process.env[v] === "1";
+
+function missing(files, fetch) {
+  if (!engine) return "no built engine found";
+  const absent = files.find((f) => !existsSync(join(modelDir, f)));
+  return absent ? `no ${absent} in ${modelDir}; run ${fetch}` : false;
+}
+const TOKENIZER = {
+  skip: required("VITNA_REQUIRE_MOE") || required("VITNA_REQUIRE_MOE_TOKENIZER") ? false
+    : missing(["tokenizer.json"], "node scripts/fetch-model.mjs olmoe-1b-7b --only tokenizer.json"),
+};
+const MODEL = {
+  skip: required("VITNA_REQUIRE_MOE") ? false : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs olmoe-1b-7b"),
+};
+
+/** Run the engine. Resolves with its stdout; rejects with its stderr if it exits other than 0. */
+function runEngine(args, input = "") {
+  assert.ok(engine, "no built engine found");
+  return new Promise((resolve, reject) => {
+    const child = spawn(engine, args);
+    let out = "";
+    let err = "";
+    child.stdout.setEncoding("utf8").on("data", (d) => (out += d));
+    child.stderr.setEncoding("utf8").on("data", (d) => (err += d));
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`${engine} ${args.join(" ")} exited ${code}: ${err}`))));
+    child.stdin.end(input);
+  });
+}
+
+const readF32 = (path) => {
+  const b = readFileSync(path);
+  return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4).slice();
+};
+const readI32 = (path) => {
+  const b = readFileSync(path);
+  return new Int32Array(b.buffer, b.byteOffset, b.byteLength / 4).slice();
+};
+
+/** The fixture's experts for a run of positions, as --experts-in reads them: positions x layers x 8, int32 LE. */
+function writePins(path, entries) {
+  const buf = Buffer.alloc(entries.length * LAYERS * K * 4);
+  entries.forEach((r, t) => r.experts.forEach((ids, l) => ids.slice(0, K).forEach((e, i) => buf.writeInt32LE(e, ((t * LAYERS + l) * K + i) * 4))));
+  writeFileSync(path, buf);
+}
+
+/** The first decision, as [position, layer], where the experts chosen are not the reference's 8, or null. */
+function firstDeparture(entries, chosen) {
+  for (let t = 0; t < entries.length; t++) {
+    for (let l = 0; l < LAYERS; l++) {
+      const mine = [...chosen.slice((t * LAYERS + l) * K, (t * LAYERS + l + 1) * K)].sort((a, b) => a - b).join();
+      if (mine !== entries[t].experts[l].slice(0, K).sort((a, b) => a - b).join()) return [t, l];
+    }
+  }
+  return null;
+}
+
+// The CPU path runs a step at a time on one thread, so the six prompts run
+// side by side, each in an engine of its own over the same mapped files.
+const CTX = ["--ctx", "512"];
+async function eachPrompt(prefix, run) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return await Promise.all(fixture.prompts.map((p) => run(p, (s) => join(dir, `${p.id}.${s}`))));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("the engine's tokenizer gives the ids of the model's own tokenizer.json", TOKENIZER, async (t) => {
+  const cases = [...fixture.corpus, ...fixture.prompts];
+  const out = await runEngine(["tokenize", "--model", modelDir], cases.map((c) => JSON.stringify(c.text)).join("\n") + "\n");
+  const lines = out.trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, cases.length);
+  const byText = new Map(cases.map((c, i) => [c.text, lines[i]]));
+  assert.deepEqual(compareTokenization(fixture, (text) => byText.get(text)), []);
+  t.diagnostic(`${cases.length} of ${cases.length} strings tokenized exactly, NFC and the added tokens included`);
+});
+
+// With its routing pinned to the reference's (--experts-in), the engine's
+// logits are compared as gate A2 compares SmolLM2's, so that a near-tie it
+// decides the other way cannot fail the comparison of everything after it.
+// Its own router still runs, and what it chose is compared under the
+// routing rule. Where it chose the reference's experts, the pinned run is
+// the run it would make unpinned, bit for bit.
+test("with its routing pinned, the engine's logits match the reference within the tolerance, and its router chooses as the rule allows", MODEL, async (t) => {
+  const results = await eachPrompt("vitna-moe-logits-", async (p, f) => {
+    writePins(f("pin"), p.routing);
+    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", f("logits"), ...CTX,
+      "--experts-in", f("pin"), "--router-out", f("router"), "--experts-out", f("experts")]);
+    const chosen = readI32(f("experts"));
+    return {
+      p,
+      prefill: comparePrefill(fixture, p, readF32(f("logits"))),
+      routing: compareRouting(fixture, p.routing, readF32(f("router")), chosen, `${p.id} position`),
+      departure: firstDeparture(p.routing, chosen),
+    };
+  });
+  for (const r of results) {
+    assert.deepEqual(r.prefill.failures.slice(0, 10), [], r.p.id);
+    assert.deepEqual(r.routing.failures.slice(0, 10), [], r.p.id);
+  }
+  const worst = (k, w) => Math.max(...results.map((r) => r[k].worst[w]));
+  const decisions = fixture.prompts.reduce((a, p) => a + p.ids.length * LAYERS, 0);
+  const departed = results.filter((r) => r.departure).map((r) => `${r.p.id} position ${r.departure[0]} layer ${r.departure[1]}`);
+  t.diagnostic(`largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
+  t.diagnostic(departed.length ? `the router first chose other experts than the reference at ${departed.join("; ")}` : `the router chose the reference's experts in all ${decisions} decisions`);
+});
+
+test("with its routing pinned, the engine's greedy decoding matches the reference token for token", MODEL, async (t) => {
+  const results = await eachPrompt("vitna-moe-greedy-", async (p, f) => {
+    const entries = [...p.routing, ...p.greedy_routing];
+    writePins(f("pin"), entries);
+    const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", String(p.greedy_ids.length), "--greedy",
+      ...CTX, "--logits-out", f("logits"), "--experts-in", f("pin"), "--router-out", f("router"), "--experts-out", f("experts")]);
+    const { ids } = JSON.parse(out);
+    return {
+      p,
+      greedy: compareGreedy(fixture, p, ids, readF32(f("logits"))),
+      routing: compareRouting(fixture, entries, readF32(f("router")), readI32(f("experts")), `${p.id} position`),
+      tokens: ids.length,
+    };
+  });
+  for (const r of results) {
+    assert.deepEqual(r.greedy.failures.slice(0, 10), [], r.p.id);
+    assert.deepEqual(r.routing.failures.slice(0, 10), [], r.p.id);
+  }
+  const tokens = results.reduce((a, r) => a + r.tokens, 0);
+  t.diagnostic(`${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${Math.max(...results.map((r) => r.greedy.worst.logit)).toExponential(2)}, router logits ${Math.max(...results.map((r) => r.routing.worst.logit)).toExponential(2)}`);
+});
+
+// The tests above pin the experts the router chooses anyway, so they would
+// pass with the pins ignored. Here one decision is pinned the other way, as
+// reference/routing_sensitivity.py forces it: the prompt's closest call at a
+// prompt position, its 8th expert replaced by the runner-up. The positions
+// before it must not move, and the logits from it on must, past the
+// tolerance.
+test("pinned experts are the ones a token goes through", MODEL, async (t) => {
+  const p = fixture.prompts.find((x) => x.id === "capital");
+  const [, at, layer] = p.routing.flatMap((r, pos) => r.logits.map((lg, l) => [Math.min(...lg.slice(0, K)) - lg[K], pos, l])).sort((a, b) => a[0] - b[0])[0];
+  const swapped = p.routing.map((r, pos) => (pos !== at ? r : {
+    ...r,
+    experts: r.experts.map((ids, l) => (l !== layer ? ids : [...ids.slice(0, K - 1), ids[K], ids[K - 1]])),
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "vitna-moe-swap-"));
+  try {
+    writePins(join(dir, "pin"), swapped);
+    await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, "logits"), ...CTX, "--experts-in", join(dir, "pin")]);
+    const rows = readF32(join(dir, "logits"));
+    const V = fixture.model.vocab_size;
+    const moved = p.positions.map((pos, i) =>
+      Math.max(...[...pos.top, ...fixture.probe_ids.map((id, k) => [id, pos.probe[k]])].map(([id, v]) => Math.abs(rows[i * V + id] - v))));
+    assert.ok(moved.slice(0, at).every((d) => d <= LOGIT_ATOL), `positions before ${at} moved: ${moved}`);
+    assert.ok(Math.max(...moved.slice(at)) > LOGIT_ATOL, `the pinned swap at position ${at} moved nothing past the tolerance: ${moved}`);
+    t.diagnostic(`${p.id} position ${at} layer ${layer}, the runner-up pinned in place of the 8th expert: the logits after it moved by up to ${Math.max(...moved).toExponential(2)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Unpinned, the engine routes on its own. Everything is compared as above up
+// to the first decision where it chose other experts than the reference,
+// which must be one the rule allows, a near-tie; after it the engine is on a
+// path the fixture does not describe, and nothing more is compared.
+test("unpinned, the engine decodes the reference's tokens until its routing departs at a near-tie, if it ever does", MODEL, async (t) => {
+  const results = await eachPrompt("vitna-moe-free-", async (p, f) => {
+    const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", String(p.greedy_ids.length), "--greedy",
+      ...CTX, "--logits-out", f("logits"), "--router-out", f("router"), "--experts-out", f("experts")]);
+    return { p, ids: JSON.parse(out).ids, logits: readF32(f("logits")), router: readF32(f("router")), chosen: readI32(f("experts")) };
+  });
+  const E = fixture.model.experts;
+  const notes = [];
+  for (const { p, ids, logits, router, chosen } of results) {
+    const entries = [...p.routing, ...p.greedy_routing];
+    const at = firstDeparture(entries, chosen) ?? [entries.length, 0];
+    const [d, dl] = at;
+    // Whole positions before the departure, then its own position's layers up to it.
+    const before = compareRouting(fixture, entries.slice(0, d), router.subarray(0, d * LAYERS * E), chosen.subarray(0, d * LAYERS * K), `${p.id} position`);
+    assert.deepEqual(before.failures.slice(0, 10), [], p.id);
+    if (d < entries.length) {
+      const sub = { model: { ...fixture.model, layers: dl + 1 } };
+      const entry = { experts: entries[d].experts.slice(0, dl + 1), logits: entries[d].logits.slice(0, dl + 1), lse: entries[d].lse.slice(0, dl + 1) };
+      const own = compareRouting(sub, [entry], router.subarray(d * LAYERS * E, (d * LAYERS + dl + 1) * E), chosen.subarray(d * LAYERS * K, (d * LAYERS + dl + 1) * K), `${p.id} position ${d}`);
+      assert.deepEqual(own.failures, [], `${p.id}: the routing departed where the rule does not allow it`);
+      notes.push(`${p.id} departed at position ${d} layer ${dl}`);
+    }
+    // Step s takes its logits from position ids.length - 1 + s, so the steps before the departure.
+    const steps = Math.max(0, Math.min(p.greedy.length, d - p.ids.length + 1));
+    const V = fixture.model.vocab_size;
+    const result = compareGreedy(fixture, { ...p, greedy: p.greedy.slice(0, steps), greedy_ids: p.greedy_ids.slice(0, steps) }, ids.slice(0, steps), logits.subarray(0, steps * V));
+    assert.deepEqual(result.failures.slice(0, 10), [], p.id);
+    if (steps === p.greedy.length) assert.deepEqual(ids, p.greedy_ids, p.id);
+  }
+  t.diagnostic(notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`);
+});
+
+// The CUDA path does not run a mixture of experts yet. An engine without it
+// refuses --device cuda before loading anything, so this needs one built
+// with it, on a GPU: VITNA_DEVICE=cuda, as for gate A4.
+test("an engine with the CUDA path refuses to run a mixture of experts on the GPU, saying so", {
+  skip: MODEL.skip || (process.env.VITNA_DEVICE !== "cuda" && "VITNA_DEVICE is not cuda"),
+}, async () => {
+  await assert.rejects(
+    runEngine(["logits", "--model", modelDir, "--ids", "510", "--out", join(tmpdir(), "vitna-moe-unused.f32"), "--device", "cuda", ...CTX]),
+    /mixture of experts/,
+  );
+});

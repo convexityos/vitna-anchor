@@ -1,4 +1,4 @@
-"""Generate engine/src/unicode_data.h: code point ranges for the tokenizer.
+"""Generate engine/src/unicode_data.h: the Unicode data the tokenizer needs.
 
     python engine/tools/gen_unicode.py > engine/src/unicode_data.h
 
@@ -7,6 +7,18 @@ classes: \\p{L} (letters: Lu, Ll, Lt, Lm, Lo), \\p{N} (numbers: Nd, Nl, No) and
 \\s. The first two come from this Python's unicodedata, whose Unicode version
 is written into the header. \\s is the White_Space property, a short fixed
 list kept in unicode.c.
+
+A tokenizer whose normalizer is NFC also needs canonical normalization's
+data, from the same unicodedata:
+
+- the canonical combining class of every character that has one (not 0);
+- each canonical decomposition, one level deep as UnicodeData.txt gives it
+  (Hangul syllables, which decompose by formula, are left to unicode.c);
+- each primary composite: a pair that composes, the character it composes
+  to, and nothing that NFC leaves decomposed. A character whose canonical
+  decomposition is a pair is a primary composite exactly when NFC keeps it,
+  which excludes the composition exclusions, the singletons and the
+  decompositions that start with a non-starter.
 """
 
 import sys
@@ -32,19 +44,82 @@ def category_in(prefixes):
     return lambda cp: unicodedata.category(chr(cp)) in prefixes
 
 
-def emit(name, rs):
-    print(f"static const uint32_t {name}[][2] = {{")
+def emit_rows(name, ctype, rows, width, define):
+    print(f"static const {ctype} {name}[][{width}] = {{")
     line = "   "
-    for a, b in rs:
-        item = f" {{0x{a:X}, 0x{b:X}}},"
+    for row in rows:
+        item = " {" + ", ".join(f"0x{v:X}" for v in row) + "},"
         if len(line) + len(item) > 100:
             print(line)
             line = "   "
         line += item
     print(line)
     print("};")
-    print(f"#define {name}_COUNT {len(rs)}")
+    print(f"#define {define} {len(rows)}")
     print()
+
+
+def emit(name, rs):
+    emit_rows(name, "uint32_t", rs, 2, f"{name}_COUNT")
+
+
+def is_hangul_syllable(cp):
+    return 0xAC00 <= cp <= 0xD7A3
+
+
+def canonical_decomposition(cp):
+    """The one-level canonical decomposition of cp, or None."""
+    d = unicodedata.decomposition(chr(cp))
+    if not d or d.startswith("<"):
+        return None
+    return [int(x, 16) for x in d.split()]
+
+
+def combining_classes():
+    """Runs of consecutive code points with the same non-zero class: (first, last, class)."""
+    out = []
+    for cp in range(0x110000):
+        k = unicodedata.combining(chr(cp))
+        if k == 0:
+            continue
+        if out and out[-1][1] == cp - 1 and out[-1][2] == k:
+            out[-1] = (out[-1][0], cp, k)
+        else:
+            out.append((cp, cp, k))
+    return out
+
+
+def decompositions():
+    """(code point, first, second or 0) for every canonical decomposition but the Hangul syllables'."""
+    out = []
+    for cp in range(0x110000):
+        if is_hangul_syllable(cp):
+            continue
+        d = canonical_decomposition(cp)
+        if d is None:
+            continue
+        if len(d) > 2:
+            sys.exit(f"U+{cp:04X} decomposes into {len(d)} characters; this table holds two")
+        out.append((cp, d[0], d[1] if len(d) == 2 else 0))
+    return out
+
+
+def compositions():
+    """(first, second, composite) for every primary composite, sorted by the pair."""
+    out = []
+    for cp in range(0x110000):
+        if is_hangul_syllable(cp):
+            continue
+        d = canonical_decomposition(cp)
+        if d is None or len(d) != 2:
+            continue
+        if unicodedata.normalize("NFC", chr(cp)) == chr(cp):
+            out.append((d[0], d[1], cp))
+    out.sort()
+    for a, b in zip(out, out[1:]):
+        if a[:2] == b[:2]:
+            sys.exit(f"two composites for U+{a[0]:04X} U+{a[1]:04X}")
+    return out
 
 
 def main():
@@ -62,6 +137,12 @@ def main():
     print()
     emit("VITNA_UNI_LETTER", letters)
     emit("VITNA_UNI_NUMBER", numbers)
+    print("/* Canonical combining classes other than 0: {first, last, class}. */")
+    emit_rows("VITNA_UNI_CCC", "uint32_t", combining_classes(), 3, "VITNA_UNI_CCC_COUNT")
+    print("/* Canonical decompositions, one level: {code point, first, second or 0}, by code point. */")
+    emit_rows("VITNA_UNI_DECOMP", "uint32_t", decompositions(), 3, "VITNA_UNI_DECOMP_COUNT")
+    print("/* Primary composites: {first, second, composite}, by first then second. */")
+    emit_rows("VITNA_UNI_COMPOSE", "uint32_t", compositions(), 3, "VITNA_UNI_COMPOSE_COUNT")
     print("#endif /* VITNA_UNICODE_DATA_H */")
 
 

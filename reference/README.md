@@ -64,7 +64,7 @@ Why 1e-2: the reference and the engine's float path both compute in float32. Sum
 
 ## A mixture of experts (gate A5)
 
-Gate A5 streams a mixture-of-experts checkpoint from a drive. The engine has to compute such a model correctly before it is worth making it fast, so A5 starts as A1 did: one model pinned, and a recording to hold the engine to. The engine does not run this model yet.
+Gate A5 streams a mixture-of-experts checkpoint from a drive. The engine has to compute such a model correctly before it is worth making it fast, so A5 starts as A1 did: one model pinned, and a recording to hold the engine to. Step 2 runs it in the engine, on the CPU, and holds it to this recording ([below](#the-engine-against-it)).
 
 ### The model
 
@@ -107,7 +107,7 @@ On the machine that recorded it, `--check` reproduces it bit for bit, routing in
 
 A token goes through the 8 experts its router scores highest, so two scores that nearly tie can trade places when the engine adds the same sums in another order. The fixture holds 6,848 routing decisions. In 85 of them the 8th and 9th router logits are within 1e-3 of each other, in 9 within 1e-4, and in 2 within 1e-5: 5.45e-6 (prompt `unicode`, greedy token 26, layer 2) and 6.62e-6 (`code`, greedy token 10, layer 5).
 
-Such a decision going the other way is no rounding error downstream. Each prompt's closest call at a prompt position (margins from 8.8e-5 to 6.9e-4) was forced the other way. With every other decision held to the reference's, the logits after it moved by 0.011 to 0.21. With the others left to the router, which in four of the six prompts then decided some of them differently as well, they moved by 0.019 to 0.39. Either way, past the 1e-2 tolerance every time. So the engine's routing is compared on its own, against a band of its own (below), and the plan for step 2 is to compare the engine's logits with its routing pinned to the fixture's, so that a near-tie it decides the other way cannot fail the comparison of everything after it.
+Such a decision going the other way is no rounding error downstream. Each prompt's closest call at a prompt position (margins from 8.8e-5 to 6.9e-4) was forced the other way. With every other decision held to the reference's, the logits after it moved by 0.011 to 0.21. With the others left to the router, which in four of the six prompts then decided some of them differently as well, they moved by 0.019 to 0.39. Either way, past the 1e-2 tolerance every time. So the engine's routing is compared on its own, against a band of its own (below), and step 2 compares the engine's logits with its routing pinned to the fixture's (`--experts-in`), so that a near-tie it decides the other way cannot fail the comparison of everything after it.
 
 ### The tolerance
 
@@ -125,4 +125,16 @@ Both measurements, the forced calls both ways and the two orders, come from one 
 python reference/routing_sensitivity.py
 ```
 
-`tests/reference-moe.test.mjs` checks that this fixture matches its pin, inputs and both recorders, that its routing is complete and consistent, that the comparisons accept the reference's own logits and routing and reject wrong ones, and that the runner-up may stand in at the fixture's closest call, for one expert only, and not at a wide one. The engine comparisons are `todo` until step 2.
+`tests/reference-moe.test.mjs` checks that this fixture matches its pin, inputs and both recorders, that its routing is complete and consistent, that the comparisons accept the reference's own logits and routing and reject wrong ones, and that the runner-up may stand in at the fixture's closest call, for one expert only, and not at a wide one.
+
+### The engine against it
+
+Step 2 runs OLMoE in the engine, on the CPU, and the same file compares it with this fixture:
+
+- Its tokenizer's ids, for all 60 strings, exactly.
+- Its logits, with every position's experts pinned to the fixture's (`--experts-in`), under A1's table; and its own router, which still runs and says what it chose (`--router-out`, `--experts-out`), under the routing rule.
+- Greedy decoding with the experts pinned, prompts and greedy tokens alike, token for token.
+- That a pin is not ignored: pinning the runner-up in place of the 8th expert at the shortest prompt's closest call moves the logits after it past the tolerance, and those before it not at all.
+- Greedy decoding unpinned, token for token, up to the first decision where the engine's router goes another way than the reference's, which must be one the routing rule allows.
+
+How it was checked, and what it found, is in the [top-level README](../README.md#how-gate-a5s-forward-pass-was-checked).

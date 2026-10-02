@@ -59,10 +59,16 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
     const char* model_type = vitna_json_as_string(vitna_json_get(cfg, "model_type"));
     const char* act = vitna_json_as_string(vitna_json_get(cfg, "hidden_act"));
     const vitna_json_value_t* scaling = vitna_json_get(cfg, "rope_scaling");
+    const vitna_json_value_t* clip = vitna_json_get(cfg, "clip_qkv");
+    const bool olmoe = model_type && strcmp(model_type, "olmoe") == 0;
     double d;
     memset(c, 0, sizeof(*c));
-    if (!model_type || strcmp(model_type, "llama") != 0) {
-        fail(err, err_len, "config.json: model_type is %s, and only llama is supported%s", model_type ? model_type : "missing", NULL);
+    if (!model_type || (strcmp(model_type, "llama") != 0 && !olmoe)) {
+        fail(err, err_len, "config.json: model_type is %s, and only llama and olmoe are supported%s", model_type ? model_type : "missing", NULL);
+    } else if (olmoe && clip && !vitna_json_is_null(clip)) {
+        fail(err, err_len, "config.json: clip_qkv is not supported%s%s", NULL, NULL);
+    } else if (olmoe && !cfg_false_or_missing(cfg, "norm_topk_prob")) {
+        fail(err, err_len, "config.json: norm_topk_prob true is not supported%s%s", NULL, NULL);
     } else if (!act || strcmp(act, "silu") != 0) {
         fail(err, err_len, "config.json: hidden_act is %s, and only silu is supported%s", act ? act : "missing", NULL);
     } else if (scaling && !vitna_json_is_null(scaling)) {
@@ -90,13 +96,21 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
             fail(err, err_len, "config.json: pretraining_tp other than 1 is not supported%s%s", NULL, NULL);
         } else if (c->n_heads % c->n_kv_heads != 0 || c->head_dim % 2 != 0) {
             fail(err, err_len, "config.json: heads do not divide into key-value groups, or head_dim is odd%s%s", NULL, NULL);
+        } else if (olmoe && !(cfg_size(cfg, "num_experts", &c->n_experts, true, err, err_len) &&
+                              cfg_size(cfg, "num_experts_per_tok", &c->n_experts_used, true, err, err_len))) {
+            /* err is set */
+        } else if (olmoe && (c->n_experts_used > c->n_experts || c->n_experts_used > VITNA_EXPERTS_USED_MAX)) {
+            fail(err, err_len, "config.json: num_experts_per_tok is more than num_experts, or more than this engine takes%s%s", NULL, NULL);
         } else {
-            c->rms_eps = 1e-6f;
+            /* Where config.json leaves it out, each config class's default:
+             * LlamaConfig's 1e-6, OlmoeConfig's 1e-5. */
+            c->rms_eps = olmoe ? 1e-5f : 1e-6f;
             c->rope_theta = 10000.0f;
             if (vitna_json_as_number(vitna_json_get(cfg, "rms_norm_eps"), &d)) c->rms_eps = (float)d;
             if (vitna_json_as_number(vitna_json_get(cfg, "rope_theta"), &d)) c->rope_theta = (float)d;
             c->tied_embeddings = false;
             vitna_json_as_bool(vitna_json_get(cfg, "tie_word_embeddings"), &c->tied_embeddings);
+            c->qk_norm = olmoe;
             ok = true;
         }
     }
@@ -104,9 +118,90 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
     return ok;
 }
 
+/* A tensor of the checkpoint, from whichever of its files holds it. */
+static const vitna_tensor_desc_t* find_tensor(const vitna_llama_t* m, const char* name) {
+    for (size_t i = 0; i < m->n_shards; i++) {
+        const vitna_tensor_desc_t* t = vitna_safetensors_find(&m->shards[i], name);
+        if (t) return t;
+    }
+    return NULL;
+}
+
+/* Open dir's model.safetensors or, where there is none, every file its
+ * model.safetensors.index.json names, and check that each tensor the index
+ * lists is found in the file it names. */
+static bool open_checkpoint(vitna_llama_t* m, const char* dir, char* err, size_t err_len) {
+    char path[1024], st_err[256];
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
+    FILE* single = fopen(path, "rb");
+    if (single) {
+        fclose(single);
+        m->shards = (vitna_safetensors_t*)calloc(1, sizeof(vitna_safetensors_t));
+        if (!m->shards) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+        if (!vitna_safetensors_open_ex(path, &m->shards[0], st_err, sizeof(st_err))) return fail(err, err_len, "%s%s", st_err, NULL);
+        m->n_shards = 1;
+        return true;
+    }
+
+    snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    size_t len;
+    char* text = vitna_read_file(path, &len);
+    if (!text) return fail(err, err_len, "%s holds neither model.safetensors nor model.safetensors.index.json%s", dir, NULL);
+    char jerr[160];
+    vitna_json_doc_t* doc = vitna_json_parse(text, len, jerr, sizeof(jerr));
+    free(text);
+    if (!doc) return fail(err, err_len, "model.safetensors.index.json: %s%s", jerr, NULL);
+    const vitna_json_value_t* map = vitna_json_get(vitna_json_root(doc), "weight_map");
+    bool ok = map && map->type == VITNA_JSON_OBJECT && map->u.object.count > 0;
+    if (!ok) fail(err, err_len, "model.safetensors.index.json has no weight_map%s%s", NULL, NULL);
+    const size_t n = ok ? map->u.object.count : 0;
+    /* Each entry's file, as an index into shards; the files in order of first mention. */
+    size_t* file_of = ok ? (size_t*)malloc(n * sizeof(size_t)) : NULL;
+    const char** names = ok ? (const char**)malloc(n * sizeof(char*)) : NULL;
+    if (ok && (!file_of || !names)) ok = fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    size_t n_files = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        const char* file = vitna_json_as_string(map->u.object.members[i].value);
+        /* A shard is a file in the model directory: a name with a path in it would reach outside. */
+        if (!file || !*file || strchr(file, '/') || strchr(file, '\\') || strcmp(file, ".") == 0 || strcmp(file, "..") == 0) {
+            ok = fail(err, err_len, "model.safetensors.index.json: the file for %s is not a file name in the model directory%s",
+                      map->u.object.members[i].key, NULL);
+            break;
+        }
+        size_t f = 0;
+        while (f < n_files && strcmp(names[f], file) != 0) f++;
+        if (f == n_files) names[n_files++] = file;
+        file_of[i] = f;
+    }
+    if (ok) {
+        m->shards = (vitna_safetensors_t*)calloc(n_files, sizeof(vitna_safetensors_t));
+        if (!m->shards) ok = fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    }
+    for (size_t f = 0; ok && f < n_files; f++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, names[f]);
+        if (!vitna_safetensors_open_ex(path, &m->shards[f], st_err, sizeof(st_err))) {
+            ok = fail(err, err_len, "%s%s", st_err, NULL);
+        } else {
+            m->n_shards = f + 1;
+        }
+    }
+    /* Every tensor listed is in its file, and a lookup by name finds that one. */
+    for (size_t i = 0; ok && i < n; i++) {
+        const char* name = map->u.object.members[i].key;
+        const vitna_tensor_desc_t* t = vitna_safetensors_find(&m->shards[file_of[i]], name);
+        if (!t || find_tensor(m, name) != t) {
+            ok = fail(err, err_len, "model.safetensors.index.json puts %s in %s, and it is not found there alone", name, names[file_of[i]]);
+        }
+    }
+    free(file_of);
+    free(names);
+    vitna_json_free(doc);
+    return ok;
+}
+
 static bool bind(vitna_llama_t* m, vitna_matrix_t* out, const char* name, size_t rows, size_t cols, char* err, size_t err_len) {
-    const vitna_tensor_desc_t* t = vitna_safetensors_find(&m->st, name);
-    if (!t) return fail(err, err_len, "model.safetensors has no tensor %s%s", name, NULL);
+    const vitna_tensor_desc_t* t = find_tensor(m, name);
+    if (!t) return fail(err, err_len, "the checkpoint has no tensor %s%s", name, NULL);
     bool shape_ok = (cols == 0) ? (t->ndim == 1 && t->shape[0] == rows) : (t->ndim == 2 && t->shape[0] == rows && t->shape[1] == cols);
     if (!shape_ok) return fail(err, err_len, "tensor %s has an unexpected shape%s", name, NULL);
     if (t->dtype != VITNA_DTYPE_F32 && t->dtype != VITNA_DTYPE_BF16 && t->dtype != VITNA_DTYPE_F16) {
@@ -119,12 +214,13 @@ static bool bind(vitna_llama_t* m, vitna_matrix_t* out, const char* name, size_t
     return true;
 }
 
-static float* norm_weights(vitna_llama_t* m, const char* name, char* err, size_t err_len) {
+/* The n weights of a norm, widened to float32. */
+static float* norm_weights(vitna_llama_t* m, const char* name, size_t n, char* err, size_t err_len) {
     vitna_matrix_t w;
-    if (!bind(m, &w, name, m->cfg.hidden, 0, err, err_len)) return NULL;
-    float* f = (float*)malloc(m->cfg.hidden * sizeof(float));
+    if (!bind(m, &w, name, n, 0, err, err_len)) return NULL;
+    float* f = (float*)malloc(n * sizeof(float));
     if (!f) { fail(err, err_len, "out of memory%s%s", NULL, NULL); return NULL; }
-    vitna_to_f32(w.data, w.dtype, f, m->cfg.hidden);
+    vitna_to_f32(w.data, w.dtype, f, n);
     return f;
 }
 
@@ -132,12 +228,9 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
     memset(m, 0, sizeof(*m));
     if (!read_config(&m->cfg, dir, err, err_len)) return false;
     const vitna_llama_config_t* c = &m->cfg;
-
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
-    char st_err[256];
-    if (!vitna_safetensors_open_ex(path, &m->st, st_err, sizeof(st_err))) {
-        return fail(err, err_len, "%s%s (a sharded checkpoint is not supported yet)", st_err, NULL);
+    if (!open_checkpoint(m, dir, err, err_len)) {
+        vitna_llama_free(m);
+        return false;
     }
 
     const size_t q_dim = c->n_heads * c->head_dim;
@@ -145,7 +238,7 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
     char name[256];
     bool ok = bind(m, &m->embed, "model.embed_tokens.weight", c->vocab, c->hidden, err, err_len);
     if (ok) {
-        if (vitna_safetensors_find(&m->st, "lm_head.weight")) {
+        if (find_tensor(m, "lm_head.weight")) {
             ok = bind(m, &m->lm_head, "lm_head.weight", c->vocab, c->hidden, err, err_len);
         } else if (c->tied_embeddings) {
             m->lm_head = m->embed;
@@ -153,7 +246,7 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
             ok = fail(err, err_len, "no lm_head.weight, and the config does not tie embeddings%s%s", NULL, NULL);
         }
     }
-    if (ok) ok = (m->final_norm = norm_weights(m, "model.norm.weight", err, err_len)) != NULL;
+    if (ok) ok = (m->final_norm = norm_weights(m, "model.norm.weight", c->hidden, err, err_len)) != NULL;
     if (ok) {
         m->layers = (vitna_llama_layer_t*)calloc(c->n_layers, sizeof(vitna_llama_layer_t));
         ok = m->layers != NULL || fail(err, err_len, "out of memory%s%s", NULL, NULL);
@@ -165,18 +258,44 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
         ok = LAYER(q, "self_attn.q_proj.weight", q_dim, c->hidden) &&
              LAYER(k, "self_attn.k_proj.weight", kv_dim, c->hidden) &&
              LAYER(v, "self_attn.v_proj.weight", kv_dim, c->hidden) &&
-             LAYER(o, "self_attn.o_proj.weight", c->hidden, q_dim) &&
-             LAYER(gate, "mlp.gate_proj.weight", c->intermediate, c->hidden) &&
-             LAYER(up, "mlp.up_proj.weight", c->intermediate, c->hidden) &&
-             LAYER(down, "mlp.down_proj.weight", c->hidden, c->intermediate);
+             LAYER(o, "self_attn.o_proj.weight", c->hidden, q_dim);
+        if (ok && c->n_experts) {
+            /* OLMoE's names: the router is mlp.gate, each expert mlp.experts.<e>. */
+            ok = LAYER(router, "mlp.gate.weight", c->n_experts, c->hidden);
+            if (ok) {
+                L->experts = (vitna_expert_t*)calloc(c->n_experts, sizeof(vitna_expert_t));
+                ok = L->experts != NULL || fail(err, err_len, "out of memory%s%s", NULL, NULL);
+            }
+            for (size_t e = 0; ok && e < c->n_experts; e++) {
+                vitna_expert_t* x = &L->experts[e];
+#define EXPERT(field, part, rows, cols) \
+                (snprintf(name, sizeof(name), "model.layers.%zu.mlp.experts.%zu.%s", l, e, part), bind(m, &x->field, name, rows, cols, err, err_len))
+                ok = EXPERT(gate, "gate_proj.weight", c->intermediate, c->hidden) &&
+                     EXPERT(up, "up_proj.weight", c->intermediate, c->hidden) &&
+                     EXPERT(down, "down_proj.weight", c->hidden, c->intermediate);
+#undef EXPERT
+            }
+        } else if (ok) {
+            ok = LAYER(gate, "mlp.gate_proj.weight", c->intermediate, c->hidden) &&
+                 LAYER(up, "mlp.up_proj.weight", c->intermediate, c->hidden) &&
+                 LAYER(down, "mlp.down_proj.weight", c->hidden, c->intermediate);
+        }
 #undef LAYER
         if (ok) {
             snprintf(name, sizeof(name), "model.layers.%zu.input_layernorm.weight", l);
-            ok = (L->attn_norm = norm_weights(m, name, err, err_len)) != NULL;
+            ok = (L->attn_norm = norm_weights(m, name, c->hidden, err, err_len)) != NULL;
         }
         if (ok) {
             snprintf(name, sizeof(name), "model.layers.%zu.post_attention_layernorm.weight", l);
-            ok = (L->mlp_norm = norm_weights(m, name, err, err_len)) != NULL;
+            ok = (L->mlp_norm = norm_weights(m, name, c->hidden, err, err_len)) != NULL;
+        }
+        if (ok && c->qk_norm) {
+            snprintf(name, sizeof(name), "model.layers.%zu.self_attn.q_norm.weight", l);
+            ok = (L->q_norm = norm_weights(m, name, q_dim, err, err_len)) != NULL;
+            if (ok) {
+                snprintf(name, sizeof(name), "model.layers.%zu.self_attn.k_norm.weight", l);
+                ok = (L->k_norm = norm_weights(m, name, kv_dim, err, err_len)) != NULL;
+            }
         }
     }
 
@@ -202,8 +321,13 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
         m->scores = (float*)malloc(m->ctx * sizeof(float));
         m->cos_t = (float*)malloc(half * sizeof(float));
         m->sin_t = (float*)malloc(half * sizeof(float));
+        if (c->n_experts) {
+            m->router_logits = (float*)malloc(c->n_experts * sizeof(float));
+            m->expert_out = (float*)malloc(c->hidden * sizeof(float));
+        }
         ok = m->past && m->k_cache && m->v_cache && m->inv_freq && m->x && m->xn && m->q && m->k && m->v && m->att &&
-             m->proj && m->gate && m->up && m->scores && m->cos_t && m->sin_t;
+             m->proj && m->gate && m->up && m->scores && m->cos_t && m->sin_t &&
+             (!c->n_experts || (m->router_logits && m->expert_out));
         if (!ok) {
             fail(err, err_len, "out of memory for the key-value cache and scratch buffers%s%s", NULL, NULL);
         } else {
@@ -225,9 +349,14 @@ void vitna_llama_free(vitna_llama_t* m) {
         for (size_t l = 0; l < m->cfg.n_layers; l++) {
             free(m->layers[l].attn_norm);
             free(m->layers[l].mlp_norm);
+            free(m->layers[l].q_norm);
+            free(m->layers[l].k_norm);
+            free(m->layers[l].experts);
         }
         free(m->layers);
     }
+    free(m->router_logits);
+    free(m->expert_out);
     free(m->final_norm);
     free(m->inv_freq);
     free(m->past);
@@ -238,7 +367,8 @@ void vitna_llama_free(vitna_llama_t* m) {
 #if defined(VITNA_CUDA)
     vitna_cuda_free(m->cuda);
 #endif
-    vitna_safetensors_close(&m->st);
+    for (size_t i = 0; i < m->n_shards; i++) vitna_safetensors_close(&m->shards[i]);
+    free(m->shards);
     memset(m, 0, sizeof(*m));
 }
 
@@ -282,6 +412,74 @@ static void cuda_failed(vitna_llama_t* m, const char* err) {
     m->device_lost = vitna_cuda_lost(m->cuda, m->device_error, sizeof(m->device_error));
 }
 #endif
+
+void vitna_llama_trace_routing(vitna_llama_t* m, float* logits, int32_t* chosen, size_t positions, const int32_t* pin,
+                               size_t pin_positions) {
+    m->trace_logits = logits;
+    m->trace_chosen = chosen;
+    m->trace_positions = (logits || chosen) ? positions : 0;
+    m->pin = pin;
+    m->pin_positions = pin ? pin_positions : 0;
+}
+
+/* Layer l's mixture of experts for the token at pos: m->xn in, m->proj out.
+ * This is transformers' OlmoeSparseMoeBlock with its eager experts: the
+ * router's logits over every expert; their softmax, in float32; the experts
+ * with the n_experts_used largest weights, each weighted by its own share
+ * of the softmax, not renormalized over those used; and their outputs, each
+ * scaled by its weight, added to zeros one expert at a time in order of
+ * expert, as the loop over experts and index_add_ add them. */
+static void mixture_of_experts(vitna_llama_t* m, const vitna_llama_layer_t* L, size_t l, size_t pos) {
+    const vitna_llama_config_t* c = &m->cfg;
+    const size_t E = c->n_experts, K = c->n_experts_used, H = c->hidden;
+    float* logits = m->router_logits;
+    vitna_matvec(L->router.data, L->router.dtype, m->xn, logits, L->router.rows, L->router.cols);
+
+    /* The router's choice: the K largest logits, which are the K largest
+     * weights, largest first, and the lower expert first between equals. */
+    int32_t chosen[VITNA_EXPERTS_USED_MAX];
+    for (size_t k = 0; k < K; k++) {
+        int32_t best = -1;
+        for (size_t e = 0; e < E; e++) {
+            bool taken = false;
+            for (size_t j = 0; j < k && !taken; j++) taken = chosen[j] == (int32_t)e;
+            if (!taken && (best < 0 || logits[e] > logits[best])) best = (int32_t)e;
+        }
+        chosen[k] = best;
+    }
+    const size_t at = pos * c->n_layers + l;
+    if (pos < m->trace_positions) {
+        if (m->trace_logits) memcpy(m->trace_logits + at * E, logits, E * sizeof(float));
+        if (m->trace_chosen) memcpy(m->trace_chosen + at * K, chosen, K * sizeof(int32_t));
+    }
+    int32_t order[VITNA_EXPERTS_USED_MAX];
+    memcpy(order, pos < m->pin_positions ? m->pin + at * K : chosen, K * sizeof(int32_t));
+    for (size_t i = 1; i < K; i++) {
+        const int32_t e = order[i];
+        size_t j = i;
+        for (; j > 0 && order[j - 1] > e; j--) order[j] = order[j - 1];
+        order[j] = e;
+    }
+
+    float max = logits[0];
+    for (size_t e = 1; e < E; e++) if (logits[e] > max) max = logits[e];
+    float sum = 0.0f;
+    for (size_t e = 0; e < E; e++) sum += expf(logits[e] - max);
+
+    memset(m->proj, 0, H * sizeof(float));
+    for (size_t k = 0; k < K; k++) {
+        const vitna_expert_t* x = &L->experts[order[k]];
+        const float w = expf(logits[order[k]] - max) / sum;
+        vitna_matvec(x->gate.data, x->gate.dtype, m->xn, m->gate, x->gate.rows, x->gate.cols);
+        vitna_matvec(x->up.data, x->up.dtype, m->xn, m->up, x->up.rows, x->up.cols);
+        vitna_silu_mul(m->gate, m->up, m->gate, c->intermediate);
+        vitna_matvec(x->down.data, x->down.dtype, m->gate, m->expert_out, x->down.rows, x->down.cols);
+        for (size_t i = 0; i < H; i++) {
+            const float scaled = m->expert_out[i] * w;
+            m->proj[i] += scaled;
+        }
+    }
+}
 
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {
     const vitna_llama_config_t* c = &m->cfg;
@@ -330,6 +528,11 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
         vitna_matvec(L->q.data, L->q.dtype, m->xn, m->q, L->q.rows, L->q.cols);
         vitna_matvec(L->k.data, L->k.dtype, m->xn, m->k, L->k.rows, L->k.cols);
         vitna_matvec(L->v.data, L->v.dtype, m->xn, m->v, L->v.rows, L->v.cols);
+        if (c->qk_norm) {
+            /* OLMoE: q and k each normalized whole, across their heads. */
+            vitna_rmsnorm(m->q, L->q_norm, m->q, L->q.rows, c->rms_eps);
+            vitna_rmsnorm(m->k, L->k_norm, m->k, L->k.rows, c->rms_eps);
+        }
         for (size_t h = 0; h < c->n_heads; h++) vitna_rope_half(m->q + h * hd, hd, m->cos_t, m->sin_t);
         for (size_t h = 0; h < c->n_kv_heads; h++) vitna_rope_half(m->k + h * hd, hd, m->cos_t, m->sin_t);
         memcpy(kc + pos * kv_dim, m->k, kv_dim * sizeof(float));
@@ -366,10 +569,14 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
 
         /* MLP */
         vitna_rmsnorm(m->x, L->mlp_norm, m->xn, H, c->rms_eps);
-        vitna_matvec(L->gate.data, L->gate.dtype, m->xn, m->gate, L->gate.rows, L->gate.cols);
-        vitna_matvec(L->up.data, L->up.dtype, m->xn, m->up, L->up.rows, L->up.cols);
-        vitna_silu_mul(m->gate, m->up, m->gate, c->intermediate);
-        vitna_matvec(L->down.data, L->down.dtype, m->gate, m->proj, L->down.rows, L->down.cols);
+        if (c->n_experts) {
+            mixture_of_experts(m, L, l, pos);
+        } else {
+            vitna_matvec(L->gate.data, L->gate.dtype, m->xn, m->gate, L->gate.rows, L->gate.cols);
+            vitna_matvec(L->up.data, L->up.dtype, m->xn, m->up, L->up.rows, L->up.cols);
+            vitna_silu_mul(m->gate, m->up, m->gate, c->intermediate);
+            vitna_matvec(L->down.data, L->down.dtype, m->gate, m->proj, L->down.rows, L->down.cols);
+        }
         for (size_t i = 0; i < H; i++) m->x[i] += m->proj[i];
     }
 
@@ -604,6 +811,9 @@ static bool rope_tables(const vitna_llama_t* m, float** cos_out, float** sin_out
 #endif
 
 bool vitna_llama_use_cuda(vitna_llama_t* m, char* err, size_t err_len) {
+    if (m->cfg.n_experts) {
+        return fail(err, err_len, "the CUDA path does not run a mixture of experts yet; it runs on the CPU%s%s", NULL, NULL);
+    }
 #if defined(VITNA_CUDA)
     if (m->cuda) return true;
     float *ct = NULL, *st = NULL;

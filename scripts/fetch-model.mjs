@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // Fetch a pinned model's files from the Hugging Face Hub and check each one.
 //
-//   node scripts/fetch-model.mjs [name] [--dir <dir>] [--check]
+//   node scripts/fetch-model.mjs [name] [--dir <dir>] [--only <file>]... [--check]
 //
 // name defaults to smollm2-135m, whose pin is reference/smollm2-135m/model.json.
 // Files land in models/<name>/ unless --dir or ANCHOR_MODEL_DIR says otherwise.
 // Every file is downloaded at the pinned revision, never "main", and is kept
 // only if its size and SHA-256 match the pin. A file already present with the
 // right digest is not downloaded again. --check downloads nothing and exits 1
-// if any file is missing or differs.
+// if any file is missing or differs. --only narrows either to the pinned files
+// named, as CI fetches OLMoE's tokenizer.json without its 13.8 GB of weights.
 //
 // Weights are downloaded, never committed: models/ is in .gitignore.
 //
@@ -84,8 +85,15 @@ async function download(url, dest, expected) {
   renameSync(partial, dest);
 }
 
-export async function fetchModel(name = "smollm2-135m", { dir = modelDir(name), log = console.log } = {}) {
-  const pin = readPin(name);
+/** The pin with only the files named in only, or the whole pin when only is empty. Throws on a name the pin lacks. */
+export function narrowPin(pin, only = []) {
+  const unknown = only.filter((f) => !pin.files.some((x) => x.path === f));
+  if (unknown.length > 0) throw new Error(`not in the pin: ${unknown.join(", ")}`);
+  return only.length > 0 ? { ...pin, files: pin.files.filter((f) => only.includes(f.path)) } : pin;
+}
+
+export async function fetchModel(name = "smollm2-135m", { dir = modelDir(name), log = console.log, only = [] } = {}) {
+  const pin = narrowPin(readPin(name), only);
   mkdirSync(dir, { recursive: true });
   for (const file of pin.files) {
     const dest = join(dir, file.path);
@@ -111,19 +119,22 @@ function isEntryPoint() {
 
 if (isEntryPoint()) {
   const args = process.argv.slice(2);
-  const name = args.find((a) => !a.startsWith("--")) ?? "smollm2-135m";
+  // An option's value is not the name: --dir and --only take one each.
+  const taking = new Set(["--dir", "--only"]);
+  const name = args.find((a, i) => !a.startsWith("--") && !taking.has(args[i - 1])) ?? "smollm2-135m";
   const dirIdx = args.indexOf("--dir");
   const dir = dirIdx >= 0 ? resolve(args[dirIdx + 1]) : modelDir(name);
-  const pin = readPin(name);
-  console.log(`${pin.repo} at ${pin.revision} -> ${dir}`);
+  const only = args.flatMap((a, i) => (a === "--only" && args[i + 1] ? [args[i + 1]] : []));
   try {
+    const pin = narrowPin(readPin(name), only);
+    console.log(`${pin.repo} at ${pin.revision} -> ${dir}`);
     if (args.includes("--check")) {
       const problems = await checkModelDir(pin, dir);
       for (const p of problems) console.error(`  ${p}`);
       if (problems.length > 0) process.exit(1);
-      console.log(`  all ${pin.files.length} files match the pin`);
+      console.log(pin.files.length === 1 ? "  the file matches the pin" : `  all ${pin.files.length} files match the pin`);
     } else {
-      await fetchModel(name, { dir });
+      await fetchModel(name, { dir, only });
     }
   } catch (err) {
     console.error(err.message);

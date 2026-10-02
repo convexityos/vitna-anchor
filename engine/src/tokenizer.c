@@ -20,10 +20,11 @@ typedef struct {
 } tok_entry_t;
 
 typedef struct {
-    unsigned char* bytes;
+    unsigned char* bytes;        /* what is matched: the content, normalized when the token is */
     size_t len;
     int32_t id;
     bool special;
+    bool normalized;             /* matched in normalized text, not as written */
 } added_token_t;
 
 struct vitna_tokenizer {
@@ -48,6 +49,7 @@ struct vitna_tokenizer {
     int digits;                  /* 0: no Digits step; 1: each digit alone; 2: runs of digits */
     bool add_prefix_space;
     bool ignore_merges;
+    bool nfc;                    /* the normalizer is NFC; without it there is none */
 };
 
 /* --- Token lists --- */
@@ -228,6 +230,24 @@ static bool configure_pretokenizer(vitna_tokenizer_t* t, const vitna_json_value_
     return true;
 }
 
+/* A post-processor that changes nothing in the encoding of one text: none,
+ * ByteLevel (whose offset trimming touches no id), or a TemplateProcessing
+ * whose single-sequence template is the sequence alone, with no special
+ * tokens to add. */
+static bool post_adds_nothing(const vitna_json_value_t* post) {
+    if (!post || vitna_json_is_null(post)) return true;
+    const char* type = type_of(post);
+    if (type && strcmp(type, "ByteLevel") == 0) return true;
+    if (!type || strcmp(type, "TemplateProcessing") != 0) return false;
+    const vitna_json_value_t* single = vitna_json_get(post, "single");
+    if (!single || single->type != VITNA_JSON_ARRAY || single->u.array.count != 1) return false;
+    const vitna_json_value_t* seq = vitna_json_get(single->u.array.items[0], "Sequence");
+    const char* id = vitna_json_as_string(vitna_json_get(seq, "id"));
+    if (!id || strcmp(id, "A") != 0) return false;
+    const vitna_json_value_t* specials = vitna_json_get(post, "special_tokens");
+    return !specials || vitna_json_is_null(specials) || (specials->type == VITNA_JSON_OBJECT && specials->u.object.count == 0);
+}
+
 vitna_tokenizer_t* vitna_tokenizer_load(const char* path, char* err, size_t err_len) {
     size_t text_len = 0;
     char* text = vitna_read_file(path, &text_len);
@@ -250,10 +270,13 @@ vitna_tokenizer_t* vitna_tokenizer_load(const char* path, char* err, size_t err_
 
     const vitna_json_value_t* root = vitna_json_root(doc);
     const vitna_json_value_t* norm = vitna_json_get(root, "normalizer");
-    if (norm && !vitna_json_is_null(norm)) { errf(err, err_len, "normalizers are not supported", type_of(norm)); goto done; }
+    if (norm && !vitna_json_is_null(norm)) {
+        if (!type_of(norm) || strcmp(type_of(norm), "NFC") != 0) { errf(err, err_len, "normalizers other than NFC are not supported", type_of(norm)); goto done; }
+        t->nfc = true;
+    }
     const vitna_json_value_t* post = vitna_json_get(root, "post_processor");
-    if (post && !vitna_json_is_null(post) && !(type_of(post) && strcmp(type_of(post), "ByteLevel") == 0)) {
-        errf(err, err_len, "post_processors other than ByteLevel are not supported", type_of(post));
+    if (!post_adds_nothing(post)) {
+        errf(err, err_len, "a post_processor that adds tokens is not supported", type_of(post));
         goto done;
     }
     const vitna_json_value_t* dec = vitna_json_get(root, "decoder");
@@ -331,13 +354,23 @@ vitna_tokenizer_t* vitna_tokenizer_load(const char* path, char* err, size_t err_
             goto done;
         }
         added_token_t* at = &t->added[t->n_added++];
-        at->len = content->u.string.len;
-        at->bytes = (unsigned char*)malloc(at->len);
-        if (!at->bytes) { errf(err, err_len, "out of memory", NULL); goto done; }
-        memcpy(at->bytes, s, at->len);
         at->id = (int32_t)d;
         vitna_json_as_bool(vitna_json_get(a, "special"), &at->special);
+        /* Unless the file says, a token is normalized when it is not special,
+         * as the tokenizers library's AddedToken has it. */
+        at->normalized = !at->special;
+        vitna_json_as_bool(vitna_json_get(a, "normalized"), &at->normalized);
         if (at->special) t->is_special[at->id] = 1;
+        /* A normalized token is matched in normalized text, so it is matched
+         * as its own content normalized. */
+        if (at->normalized && t->nfc) {
+            at->bytes = vitna_uni_nfc((const unsigned char*)s, content->u.string.len, &at->len);
+        } else {
+            at->len = content->u.string.len;
+            at->bytes = (unsigned char*)malloc(at->len);
+            if (at->bytes) memcpy(at->bytes, s, at->len);
+        }
+        if (!at->bytes) { errf(err, err_len, "out of memory", NULL); goto done; }
         tok_entry_t* e = &t->tokens[at->id];
         if (!e->bytes) {
             e->bytes = (unsigned char*)malloc(at->len);
@@ -696,8 +729,12 @@ static bool encode_segment(const vitna_tokenizer_t* t, const unsigned char* s, s
     return encode_piece(t, s + run, n - run, out);
 }
 
-bool vitna_tokenizer_encode(const vitna_tokenizer_t* t, const char* text, size_t len, vitna_token_list_t* out) {
-    const unsigned char* s = (const unsigned char*)text;
+typedef bool (*segment_fn)(const vitna_tokenizer_t* t, const unsigned char* s, size_t n, vitna_token_list_t* out);
+
+/* Match the added tokens that are normalized, or those that are not, in
+ * s[0..len), leftmost and longest, and hand the text between them to each. */
+static bool split_added(const vitna_tokenizer_t* t, const unsigned char* s, size_t len, bool normalized, segment_fn each,
+                        vitna_token_list_t* out) {
     size_t seg = 0;
     size_t i = 0;
     while (i < len) {
@@ -705,7 +742,8 @@ bool vitna_tokenizer_encode(const vitna_tokenizer_t* t, const char* text, size_t
         const added_token_t* best = NULL;
         for (size_t k = 0; k < t->n_added; k++) {
             const added_token_t* a = &t->added[k];
-            if (a->len <= len - i && a->bytes[0] == s[i] && memcmp(a->bytes, s + i, a->len) == 0 && (!best || a->len > best->len)) {
+            if (a->normalized == normalized && a->len > 0 && a->len <= len - i && a->bytes[0] == s[i] && memcmp(a->bytes, s + i, a->len) == 0 &&
+                (!best || a->len > best->len)) {
                 best = a;
             }
         }
@@ -713,10 +751,37 @@ bool vitna_tokenizer_encode(const vitna_tokenizer_t* t, const char* text, size_t
             i++;
             continue;
         }
-        if (!encode_segment(t, s + seg, i - seg, out)) return false;
+        if (!each(t, s + seg, i - seg, out)) return false;
         if (!vitna_token_list_push(out, best->id)) return false;
         i += best->len;
         seg = i;
     }
-    return encode_segment(t, s + seg, len - seg, out);
+    return each(t, s + seg, len - seg, out);
+}
+
+/* Text between the added tokens matched as written: normalized, then split
+ * on the added tokens matched in normalized text, then encoded. */
+static bool encode_normalized(const vitna_tokenizer_t* t, const unsigned char* s, size_t n, vitna_token_list_t* out) {
+    if (!t->nfc) return split_added(t, s, n, true, encode_segment, out);
+    size_t m = 0;
+    unsigned char* norm = vitna_uni_nfc(s, n, &m);
+    if (!norm) return false;
+    bool ok = split_added(t, norm, m, true, encode_segment, out);
+    free(norm);
+    return ok;
+}
+
+/* As the tokenizers library extracts added tokens (added_vocabulary.rs,
+ * extract_and_normalize): those not normalized from the text as written;
+ * then, in each piece between them, normalized, the normalized ones. */
+bool vitna_tokenizer_encode(const vitna_tokenizer_t* t, const char* text, size_t len, vitna_token_list_t* out) {
+    return split_added(t, (const unsigned char*)text, len, false, encode_normalized, out);
+}
+
+unsigned char* vitna_tokenizer_normalize(const vitna_tokenizer_t* t, const char* text, size_t len, size_t* out_len) {
+    if (t->nfc) return vitna_uni_nfc((const unsigned char*)text, len, out_len);
+    unsigned char* copy = (unsigned char*)malloc(len ? len : 1);
+    if (copy) memcpy(copy, text, len);
+    *out_len = len;
+    return copy;
 }
