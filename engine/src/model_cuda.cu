@@ -169,7 +169,7 @@
 
 /* The most rows a mixture of experts runs a layer at a time: a prompt goes
  * in chunks of this many. A chunk's experts are copied to the device once
- * a layer, so a larger chunk copies less a token, and costs about 50 KB a
+ * a layer, so a larger chunk copies less a token, and costs about 70 KB a
  * row of the device's memory. */
 #define MOE_ROWS 1024
 
