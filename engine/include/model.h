@@ -372,6 +372,16 @@ bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err
 bool vitna_llama_widen_on_gpu(const vitna_matrix_t* w, float* out, char* err, size_t err_len);
 
 /**
+ * For checking: expert e of layer l run on the GPU for the residual x, as a
+ * step runs it (model_cuda.h's vitna_cuda_expert_check): the normalized
+ * input into xs (hidden floats), the activation into act (intermediate) and
+ * the output into y (hidden). False, with the reason in err, in an engine
+ * built without CUDA.
+ */
+bool vitna_llama_expert_on_gpu(const vitna_llama_t* m, size_t l, size_t e, const float* x, float* xs, float* act, float* y, char* err,
+                               size_t err_len);
+
+/**
  * For tests: run a mixture of experts on the GPU a token at a time, as
  * vitna_llama_step runs one, where it would run rows of several together
  * (a prompt's tokens, drafted tokens, requests at once). Those rows give the

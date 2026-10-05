@@ -1230,6 +1230,24 @@ bool vitna_llama_widen_on_gpu(const vitna_matrix_t* w, float* out, char* err, si
 #endif
 }
 
+bool vitna_llama_expert_on_gpu(const vitna_llama_t* m, size_t l, size_t e, const float* x, float* xs, float* act, float* y, char* err,
+                               size_t err_len) {
+    if (!m->cfg.n_experts || l >= m->cfg.n_layers || e >= m->cfg.n_experts) {
+        return fail(err, err_len, "there is no such expert in this model%s%s", NULL, NULL);
+    }
+#if defined(VITNA_CUDA)
+    const vitna_llama_layer_t* L = &m->layers[l];
+    const vitna_expert_t* x0 = &L->experts[e];
+    return vitna_cuda_expert_check(&x0->gate, &x0->up, &x0->down, L->mlp_norm, x, m->cfg.rms_eps, xs, act, y, err, err_len);
+#else
+    (void)x;
+    (void)xs;
+    (void)act;
+    (void)y;
+    return fail(err, err_len, "%s%s", NO_CUDA, NULL);
+#endif
+}
+
 const char* vitna_llama_gpu_report(vitna_llama_t* m, char* buf, size_t len) {
     if (len == 0) return buf;
     buf[0] = '\0';

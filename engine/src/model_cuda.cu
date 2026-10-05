@@ -521,6 +521,41 @@ __device__ __forceinline__ void load8<VITNA_DTYPE_Q6_K>(const void* row, int c, 
     }
 }
 
+/* e^x as exact.c's vitna_exp_exact computes it, operation for operation, so
+ * the experts' activation is the same bits here as on the CPU (gate A8).
+ * CUDA's expf finishes in ex2.approx, the hardware's approximation, which
+ * the CPU cannot reproduce. */
+__device__ __forceinline__ float vitna_exp_dev(float x) {
+    if (x != x) return x;
+    if (x > 88.72283935546875f) return __uint_as_float(0x7f800000u);
+    if (x < -87.3365478515625f) return 0.0f;
+    const float t = __fmul_rn(x, 1.44269502162933349609375f);
+    const float n = rintf(t);
+    float r = __fmaf_rn(n, -0.693359375f, x);
+    r = __fmaf_rn(n, 2.12194440e-4f, r);
+    const float z = __fmul_rn(r, r);
+    float p = 1.9875691500e-4f;
+    p = __fmaf_rn(p, r, 1.3981999507e-3f);
+    p = __fmaf_rn(p, r, 8.3334519073e-3f);
+    p = __fmaf_rn(p, r, 4.1665795894e-2f);
+    p = __fmaf_rn(p, r, 1.6666665459e-1f);
+    p = __fmaf_rn(p, r, 5.0000001201e-1f);
+    p = __fmaf_rn(p, z, r);
+    p = __fadd_rn(p, 1.0f);
+    const int ni = (int)n;
+    const int h = ni / 2;
+    const float a = __fmul_rn(p, __uint_as_float((unsigned int)(h + 127) << 23));
+    return __fmul_rn(a, __uint_as_float((unsigned int)(ni - h + 127) << 23));
+}
+
+/* An expert's activation, silu(g) * u, as exact.c's vitna_silu_mul_exact. */
+__device__ __forceinline__ float expert_act(float g, float u) {
+    const float e = vitna_exp_dev(-g);
+    const float d = __fadd_rn(1.0f, e);
+    const float s = __fdiv_rn(g, d);
+    return __fmul_rn(s, u);
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
@@ -967,7 +1002,7 @@ __global__ void experts_in_kernel(const float* __restrict__ x, const float* __re
         const int k = u / intermediate, r = u % intermediate;
         const float g = row_dot<DT>(e.gate[k], r, hidden, xs, lane);
         const float v = row_dot<DT>(e.up[k], r, hidden, xs, lane);
-        if (lane == 0) act[u] = (g / (1.0f + expf(-g))) * v;
+        if (lane == 0) act[u] = expert_act(g, v);
     }
 }
 
@@ -995,6 +1030,31 @@ __global__ void experts_down_kernel(const float* __restrict__ act, experts_t e, 
         }
         if (lane == 0) x[r] = x[r] + sum;
     }
+}
+
+/* The experts' down projections as experts_down_kernel computes them, each
+ * expert's output kept apart rather than weighted and added: y holds k rows
+ * of hidden, row j expert j's. The sum experts_down_kernel would form from
+ * them, in the same order, is its own, bit for bit (gate A8, where some of
+ * the outputs come from the CPU). */
+template <vitna_dtype_t DT>
+__global__ void experts_parts_kernel(const float* __restrict__ act, experts_t e, float* __restrict__ y, int hidden, int intermediate) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int u = blockIdx.x * WARPS + warp; u < e.k * hidden; u += gridDim.x * WARPS) {
+        const int k = u / hidden, r = u % hidden;
+        const float s = row_dot<DT>(e.down[k], r, intermediate, act + (size_t)k * intermediate, lane);
+        if (lane == 0) y[u] = s;
+    }
+}
+
+/* RMSNorm of x into xs in global memory, by one block, as norm_to_shared
+ * computes it for every kernel that normalizes a token. */
+__global__ void norm_out_kernel(const float* __restrict__ x, const float* __restrict__ w, float eps, float* __restrict__ xs, int n) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[WARPS];
+    float* s = reinterpret_cast<float*>(shared4);
+    norm_to_shared(x, w, s, n, eps, red);
+    for (int i = threadIdx.x; i < n; i += THREADS) xs[i] = s[i];
 }
 
 /* --- Several steps at once, exactly (vitna_cuda_rows) ---
@@ -1432,8 +1492,8 @@ __global__ void __launch_bounds__(THREADS, 3) experts_in_rows_kernel(const float
         rows_dot_multi<DT, true, 4>(rows, hidden, x, hidden, T, lane, gu);
         if (writes) {
             float* a = act + (size_t)t * intermediate;
-            a[split_at(r, intermediate)] = (gu[0] / (1.0f + expf(-gu[0]))) * gu[1];
-            a[split_at(r + 1, intermediate)] = (gu[2] / (1.0f + expf(-gu[2]))) * gu[3];
+            a[split_at(r, intermediate)] = expert_act(gu[0], gu[1]);
+            a[split_at(r + 1, intermediate)] = expert_act(gu[2], gu[3]);
         }
     }
 }
@@ -3599,5 +3659,51 @@ bool vitna_cuda_widen(const vitna_matrix_t* m, float* out, char* err, size_t err
         }
     }
     if (e != cudaSuccess) return fail_cuda(err, err_len, "widening a matrix on the device failed", e);
+    return true;
+}
+
+bool vitna_cuda_expert_check(const vitna_matrix_t* gate, const vitna_matrix_t* up, const vitna_matrix_t* down, const float* norm_w,
+                             const float* x, float eps, float* xs, float* act, float* y, char* err, size_t err_len) {
+    const int H = (int)gate->cols, I = (int)gate->rows;
+    if (!known_dtype(gate->dtype) || up->dtype != gate->dtype || !known_dtype(down->dtype) || up->rows != gate->rows || up->cols != gate->cols ||
+        down->rows != gate->cols || down->cols != gate->rows || H % 8 != 0 || I % 8 != 0) {
+        return fail(err, err_len, "an expert the GPU's kernels do not take");
+    }
+    const size_t gb = matrix_bytes(gate), ub = matrix_bytes(up), db = matrix_bytes(down);
+    const size_t floats = (size_t)H * 4 + (size_t)I;
+    unsigned char* d_w = NULL;
+    float* d_f = NULL;
+    cudaError_t e = cudaMalloc((void**)&d_w, padded(gb) + padded(ub) + padded(db));
+    if (e == cudaSuccess) e = cudaMalloc((void**)&d_f, floats * sizeof(float));
+    float* d_x = d_f;
+    float* d_norm = d_f + H;
+    float* d_xs = d_f + 2 * (size_t)H;
+    float* d_y = d_f + 3 * (size_t)H;
+    float* d_act = d_f + 4 * (size_t)H;
+    experts_t ex;
+    memset(&ex, 0, sizeof(ex));
+    ex.k = 1;
+    ex.gate[0] = d_w;
+    ex.up[0] = d_w + padded(gb);
+    ex.down[0] = d_w + padded(gb) + padded(ub);
+    ex.weight[0] = 1.0f;
+    if (e == cudaSuccess) e = cudaMemcpy((void*)ex.gate[0], gate->data, gb, cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaMemcpy((void*)ex.up[0], up->data, ub, cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaMemcpy((void*)ex.down[0], down->data, db, cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaMemcpy(d_x, x, (size_t)H * sizeof(float), cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaMemcpy(d_norm, norm_w, (size_t)H * sizeof(float), cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) {
+        const size_t shared = (size_t)H * sizeof(float);
+        norm_out_kernel<<<1, THREADS, shared>>>(d_x, d_norm, eps, d_xs, H);
+        LAUNCH(gate->dtype, experts_in_kernel, blocks_for((size_t)I, WARPS), shared, 0, d_x, d_norm, eps, ex, d_act, H, I);
+        LAUNCH(down->dtype, experts_parts_kernel, blocks_for((size_t)H, WARPS), 0, 0, d_act, ex, d_y, H, I);
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess) e = cudaMemcpy(xs, d_xs, (size_t)H * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) e = cudaMemcpy(act, d_act, (size_t)I * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) e = cudaMemcpy(y, d_y, (size_t)H * sizeof(float), cudaMemcpyDeviceToHost);
+    if (d_w) cudaFree(d_w);
+    if (d_f) cudaFree(d_f);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "running an expert on the device failed", e);
     return true;
 }

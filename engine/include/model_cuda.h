@@ -208,6 +208,17 @@ void vitna_cuda_free(struct vitna_cuda_model* g);
  */
 bool vitna_cuda_widen(const vitna_matrix_t* m, float* out, char* err, size_t err_len);
 
+/**
+ * Run one expert on the GPU as a step runs a mixture's experts, for
+ * checking the CPU's copy of that arithmetic (warp.h): x through RMSNorm
+ * with norm_w into xs, then the expert's gate and up projections and
+ * activation into act (gate->rows floats), then its down projection into y
+ * (gate->cols floats), by the kernels a step uses. Copies the expert to the
+ * device and back.
+ */
+bool vitna_cuda_expert_check(const vitna_matrix_t* gate, const vitna_matrix_t* up, const vitna_matrix_t* down, const float* norm_w,
+                             const float* x, float eps, float* xs, float* act, float* y, char* err, size_t err_len);
+
 #ifdef __cplusplus
 }
 #endif

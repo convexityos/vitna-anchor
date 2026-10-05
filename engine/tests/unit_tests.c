@@ -17,6 +17,7 @@
 
 #include "api.h"
 #include "crypto.h"
+#include "exact.h"
 #include "expert_stream.h"
 #include "gguf.h"
 #include "json.h"
@@ -30,6 +31,7 @@
 #include "strbuf.h"
 #include "tokenizer.h"
 #include "unicode.h"
+#include "warp.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -1241,6 +1243,112 @@ static void test_quant(void) {
     CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "and the scalar loop too");
 }
 
+/* --- The vectorized widening, against the scalar one --- */
+
+static void random_block(uint8_t* b, vitna_dtype_t dt) {
+    const size_t n = vitna_dtype_block_bytes(dt);
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)rnd_u32();
+    /* Scales that are float16 numbers of a plausible size, not NaNs or infinities. */
+    const uint16_t scale = (uint16_t)(0x2000 + (rnd_u32() & 0x0FFF));
+    if (dt == VITNA_DTYPE_Q8_0) put_u16(b, scale);
+    if (dt == VITNA_DTYPE_Q4_K) { put_u16(b, scale); put_u16(b + 2, (uint16_t)(scale - 0x400)); }
+    if (dt == VITNA_DTYPE_Q6_K) put_u16(b + 208, scale);
+}
+
+static void test_dequant_paths(void) {
+    const vitna_dtype_t types[] = { VITNA_DTYPE_Q8_0, VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q6_K };
+    for (size_t t = 0; t < 3; t++) {
+        const vitna_dtype_t dt = types[t];
+        const size_t be = vitna_dtype_block_elems(dt), bb = vitna_dtype_block_bytes(dt);
+        uint8_t blocks[8 * 210];
+        float fast[8 * 256], slow[8 * 256];
+        int bad = 0;
+        for (int round = 0; round < 50; round++) {
+            for (int k = 0; k < 8; k++) random_block(blocks + k * bb, dt);
+            vitna_dequant(blocks, dt, fast, 8 * be);
+            for (int k = 0; k < 8; k++) {
+                if (dt == VITNA_DTYPE_Q8_0) vitna_dequant_q8_0(blocks + k * bb, slow + k * be);
+                if (dt == VITNA_DTYPE_Q4_K) vitna_dequant_q4_k(blocks + k * bb, slow + k * be);
+                if (dt == VITNA_DTYPE_Q6_K) vitna_dequant_q6_k(blocks + k * bb, slow + k * be);
+            }
+            bad += memcmp(fast, slow, 8 * be * sizeof(float)) != 0;
+        }
+        CHECK(bad == 0, "%s: vitna_dequant gives the scalar functions' bits (%d of 50 rounds differ)", vitna_dtype_name(dt), bad);
+    }
+}
+
+/* --- exp and SiLU in exact arithmetic (exact.h) --- */
+
+static void test_exact(void) {
+    CHECK(vitna_exp_exact(0.0f) == 1.0f, "e^0 is 1");
+    CHECK(isinf(vitna_exp_exact(100.0f)) && vitna_exp_exact(-100.0f) == 0.0f, "overflow and underflow");
+    CHECK(isnan(vitna_exp_exact(NAN)), "NaN stays NaN");
+    /* Within 3 units in the last place of exp evaluated in double, over its range. */
+    int worst = 0;
+    for (int i = 0; i <= 200000; i++) {
+        const float x = -87.0f + 175.5f * (float)i / 200000.0f;
+        const float got = vitna_exp_exact(x);
+        const float want = (float)exp((double)x);
+        int32_t gi, wi;
+        memcpy(&gi, &got, 4);
+        memcpy(&wi, &want, 4);
+        const int ulps = abs(gi - wi);
+        if (ulps > worst) worst = ulps;
+    }
+    CHECK(worst <= 3, "vitna_exp_exact is within 3 ulp of exp over [-87, 88.5] (worst %d)", worst);
+    float g[4] = { -3.0f, -0.5f, 0.0f, 2.5f }, u[4] = { 1.0f, 2.0f, 3.0f, -1.0f }, out[4];
+    vitna_silu_mul_exact(g, u, out, 4);
+    bool ok = true;
+    for (int i = 0; i < 4; i++) {
+        const float d = 1.0f + vitna_exp_exact(-g[i]);
+        ok = ok && out[i] == (g[i] / d) * u[i] && fabsf(out[i] - (float)(g[i] / (1.0 + exp(-(double)g[i])) * u[i])) < 1e-6f;
+    }
+    CHECK(ok, "silu(g) * u, as written, and close to the true value");
+}
+
+/* --- Products in the GPU's order (warp.h) --- */
+
+static void test_warp(void) {
+    /* The tree's shape, pinned by sums only it gives: lane 0's partial meets
+     * lane 16's first, and lane 1's only at the last level. Each lane's
+     * partial is its chunk's first weight, x being ones. */
+    float row[256], ones[256], y;
+    for (int i = 0; i < 256; i++) ones[i] = 1.0f;
+    memset(row, 0, sizeof(row));
+    row[0] = 1e8f; row[8 * 16] = -1e8f; row[8 * 1] = 1.0f;
+    vitna_warp_matvec(row, VITNA_DTYPE_F32, 1, 256, ones, &y);
+    CHECK(y == 1.0f, "lanes 0 and 16 cancel before lane 1 is added (got %g)", y);
+    memset(row, 0, sizeof(row));
+    row[0] = 1e8f; row[8 * 1] = -1e8f; row[8 * 16] = 1.0f;
+    vitna_warp_matvec(row, VITNA_DTYPE_F32, 1, 256, ones, &y);
+    CHECK(y == 0.0f, "lane 16's 1 is lost in lane 0's 1e8 before lane 1 cancels it (got %g)", y);
+
+    /* The AVX2 path, where the CPU has it, against the scalar loop, bit for
+     * bit, in every dtype the GPU computes with. */
+    const vitna_dtype_t types[] = { VITNA_DTYPE_F32, VITNA_DTYPE_BF16, VITNA_DTYPE_Q8_0, VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q6_K };
+    enum { R = 6, C = 512 };
+    float x[C], fast[R], slow[R];
+    for (int i = 0; i < C; i++) x[i] = rnd_f(-2.0f, 2.0f);
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        const vitna_dtype_t dt = types[t];
+        const size_t rb = (size_t)vitna_row_bytes(dt, C);
+        uint8_t* w = (uint8_t*)malloc(R * rb);
+        if (vitna_dtype_is_block(dt)) {
+            const size_t bb = vitna_dtype_block_bytes(dt);
+            for (size_t k = 0; k < R * rb / bb; k++) random_block(w + k * bb, dt);
+        } else if (dt == VITNA_DTYPE_F32) {
+            for (size_t i = 0; i < (size_t)R * C; i++) ((float*)w)[i] = rnd_f(-1.0f, 1.0f);
+        } else {
+            for (size_t i = 0; i < (size_t)R * C; i++) ((uint16_t*)w)[i] = (uint16_t)(0x3C00 + (rnd_u32() & 0x3FF) - 0x200);
+        }
+        vitna_warp_matvec(w, dt, R, C, x, fast);
+        vitna_warp_matvec_scalar(w, dt, R, C, x, slow);
+        CHECK(memcmp(fast, slow, sizeof(fast)) == 0, "%s: the %s path sums as the scalar loop does, bit for bit", vitna_dtype_name(dt),
+              vitna_warp_path(C));
+        free(w);
+    }
+}
+
 /* --- GGUF (gguf.h) --- */
 
 typedef struct {
@@ -1358,6 +1466,9 @@ static void test_gguf(void) {
 
 int main(void) {
     test_quant();
+    test_dequant_paths();
+    test_exact();
+    test_warp();
     test_gguf();
     test_expert_stream();
     test_api_helpers();
