@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "compat.h"
+#include "crypto.h"
 #include "json.h"
 #include "kernels.h"
 #include "model.h"
@@ -51,9 +52,13 @@ static void print_usage(const char* prog) {
     printf("               [--speculate <k>] [--parallel <n>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n", prog);
-    printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n\n", prog);
+    printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n", prog);
+    printf("  %s weights-sha256 --model <dir> [--weights <file.gguf>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
+    printf("--weights <file.gguf> reads the weights from a GGUF file, which may be quantized (Q8_0, Q4_K, Q6_K), rather\n");
+    printf("than from the model directory's SafeTensors files; --model still gives config.json, which the file must\n");
+    printf("agree with, and the tokenizer. Quantized weights run on the CPU.\n");
     printf("--expert-cache <MiB> reads a mixture of experts' experts from the drive as they are needed, with direct I/O,\n");
     printf("into a cache in memory of that size, rather than mapping them; the logits are the same, bit for bit. With\n");
     printf("--timing, generate also says how the cache did.\n");
@@ -95,6 +100,7 @@ static void print_usage(const char* prog) {
 
 typedef struct {
     const char* model;
+    const char* weights;  /* --weights: a GGUF file the weights come from */
     const char* prompt;
     const char* ids;
     const char* out;
@@ -131,6 +137,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         const char* v = (i + 1 < argc) ? argv[i + 1] : NULL;
 #define TAKE(name) (strcmp(k, name) == 0 && v && (++i, true))
         if (TAKE("--model")) a->model = v;
+        else if (TAKE("--weights")) a->weights = v;
         else if (TAKE("--prompt")) a->prompt = v;
         else if (TAKE("--ids")) a->ids = v;
         else if (TAKE("--out")) a->out = v;
@@ -364,7 +371,7 @@ static bool arm_test_failure(vitna_llama_t* m) {
 
 static bool load_model(const args_t* a, vitna_llama_t* m) {
     char err[512];
-    if (!vitna_llama_load(m, a->model, a->ctx, a->parallel ? a->parallel : 1, err, sizeof(err))) {
+    if (!vitna_llama_load_ex(m, a->model, a->weights, a->ctx, a->parallel ? a->parallel : 1, err, sizeof(err))) {
         fprintf(stderr, "%s\n", err);
         return false;
     }
@@ -815,6 +822,95 @@ static int cmd_info(const char* model_path) {
     return 0;
 }
 
+/* weights-sha256: the SHA-256 of each tensor's values as the engine widens
+ * them to float32, little-endian and row-major, under the Hugging Face name;
+ * a layer's experts one after another under the name of their stack
+ * (model.layers.<l>.mlp.experts.gate_proj.weight). reference/record_gguf.py
+ * writes the same digests for gguf-py's widening, so equal digests mean the
+ * engine computes with the bits the reference was recorded on. */
+static void hash_rows(vitna_sha256_ctx_t* h, const vitna_matrix_t* w, float* row) {
+    const size_t rb = (size_t)vitna_row_bytes(w->dtype, w->cols);
+    for (size_t r = 0; r < w->rows; r++) {
+        vitna_to_f32((const char*)w->data + r * rb, w->dtype, row, w->cols);
+        vitna_sha256_update(h, row, w->cols * sizeof(float));
+    }
+}
+
+static void print_digest(bool* first, const char* name, vitna_sha256_ctx_t* h) {
+    char hex[65];
+    vitna_sha256_final_hex(h, hex);
+    printf("%s\n  \"%s\": \"%s\"", *first ? "{" : ",", name, hex);
+    *first = false;
+}
+
+static void print_matrix(bool* first, const char* name, const vitna_matrix_t* w, float* row) {
+    vitna_sha256_ctx_t h;
+    vitna_sha256_init(&h);
+    hash_rows(&h, w, row);
+    print_digest(first, name, &h);
+}
+
+static void print_floats(bool* first, const char* name, const float* v, size_t n) {
+    vitna_sha256_ctx_t h;
+    vitna_sha256_init(&h);
+    vitna_sha256_update(&h, v, n * sizeof(float));
+    print_digest(first, name, &h);
+}
+
+static int cmd_weights_sha256(const args_t* a) {
+    if (!a->model) { fprintf(stderr, "--model <dir> is required\n"); return 1; }
+    vitna_llama_t m;
+    if (!load_model(a, &m)) return 1;
+    const vitna_llama_config_t* c = &m.cfg;
+    size_t widest = c->hidden;
+    if (c->intermediate > widest) widest = c->intermediate;
+    if (c->n_heads * c->head_dim > widest) widest = c->n_heads * c->head_dim;
+    float* row = (float*)malloc(widest * sizeof(float));
+    if (!row) { vitna_llama_free(&m); fprintf(stderr, "out of memory\n"); return 1; }
+    bool first = true;
+    char name[256];
+    print_matrix(&first, "model.embed_tokens.weight", &m.embed, row);
+    if (m.lm_head.data != m.embed.data) print_matrix(&first, "lm_head.weight", &m.lm_head, row);
+    print_floats(&first, "model.norm.weight", m.final_norm, c->hidden);
+    for (size_t l = 0; l < c->n_layers; l++) {
+        const vitna_llama_layer_t* L = &m.layers[l];
+#define NAMED(suffix) (snprintf(name, sizeof(name), "model.layers.%zu.%s", l, suffix), name)
+        print_floats(&first, NAMED("input_layernorm.weight"), L->attn_norm, c->hidden);
+        print_floats(&first, NAMED("post_attention_layernorm.weight"), L->mlp_norm, c->hidden);
+        print_matrix(&first, NAMED("self_attn.q_proj.weight"), &L->q, row);
+        print_matrix(&first, NAMED("self_attn.k_proj.weight"), &L->k, row);
+        print_matrix(&first, NAMED("self_attn.v_proj.weight"), &L->v, row);
+        print_matrix(&first, NAMED("self_attn.o_proj.weight"), &L->o, row);
+        if (c->qk_norm) {
+            print_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->n_heads * c->head_dim);
+            print_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->n_kv_heads * c->head_dim);
+        }
+        if (c->n_experts) {
+            print_matrix(&first, NAMED("mlp.gate.weight"), &L->router, row);
+            static const char* parts[] = { "gate_proj", "up_proj", "down_proj" };
+            for (int p = 0; p < 3; p++) {
+                vitna_sha256_ctx_t h;
+                vitna_sha256_init(&h);
+                for (size_t e = 0; e < c->n_experts; e++) {
+                    const vitna_expert_t* x = &L->experts[e];
+                    hash_rows(&h, p == 0 ? &x->gate : p == 1 ? &x->up : &x->down, row);
+                }
+                snprintf(name, sizeof(name), "model.layers.%zu.mlp.experts.%s.weight", l, parts[p]);
+                print_digest(&first, name, &h);
+            }
+        } else {
+            print_matrix(&first, NAMED("mlp.gate_proj.weight"), &L->gate, row);
+            print_matrix(&first, NAMED("mlp.up_proj.weight"), &L->up, row);
+            print_matrix(&first, NAMED("mlp.down_proj.weight"), &L->down, row);
+        }
+#undef NAMED
+    }
+    printf("\n}\n");
+    free(row);
+    vitna_llama_free(&m);
+    return 0;
+}
+
 /* read-experts: every expert of a mixture read once through the expert
  * cache, with nothing computed: how fast this drive feeds --expert-cache. */
 static int cmd_read_experts(const args_t* a) {
@@ -988,6 +1084,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
     if (strcmp(cmd, "read-experts") == 0) return cmd_read_experts(&a);
+    if (strcmp(cmd, "weights-sha256") == 0) return cmd_weights_sha256(&a);
     if (strcmp(cmd, "serve") == 0) return cmd_serve(&a);
     print_usage(argv[0]);
     return 1;

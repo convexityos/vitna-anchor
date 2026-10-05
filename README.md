@@ -36,6 +36,8 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | Greedy decoding and seeded temperature, top-k and top-p sampling | `engine/src/sampler.c` | Greedy matches the reference. Sampling is tested for its proportions and its seed |
 | Float32 matrix-vector product over F32, BF16 or F16 weights, with scalar, AVX2 and NEON paths | `engine/src/ops.c` | Tested against double precision |
 | SafeTensors reader in C | `engine/src/safetensors.c`, `engine/src/json.c` | Tested: the `__metadata__` block is skipped, byte ranges are checked, and malformed files are refused. Reads the model in the A2 comparison, and OLMoE's three shards |
+| GGUF reader in C (versions 2 and 3): the file's tensors listed under the names a Hugging Face checkpoint gives them, each expert of a stack as a tensor of its own, and its metadata checked against `config.json` | `engine/src/gguf.c`, `engine/src/model.c` | Tested on files made for the test: names, shapes, slices of a stack, and refusals of a permuted Llama file, an unknown tensor, an unknown type, a misaligned or out-of-range offset, a duplicate, a truncated file and another format. Reads OLMoE's official GGUF files ([below](#quantized-weights-from-a-gguf-file)) |
+| ggml's Q8_0, Q4_K and Q6_K block formats widened to float32, in gguf-py's arithmetic, and matrix-vector products over them on the CPU | `engine/src/quant.c`, `engine/src/ops.c` | Tested on blocks built from the layout by hand; a quantized matrix multiplies as its widened float32 rows do, bit for bit. Every tensor of OLMoE's Q8_0 and Q4_K_M files widens to the bits gguf-py gives, checked by digest. The CUDA path does not compute with them yet, and an engine asked to says so |
 | RMSNorm and SwiGLU | `engine/src/kernels.c` | Tested against double precision. RMSNorm is used by the forward pass |
 | int2/3/4/8 matrix-vector products, with scalar, AVX2 and NEON paths | `engine/src/kernels.c` | Tested against their documented packing formats. No model uses them yet |
 | Interleaved rotary position embedding | `engine/src/kv_cache.c` | Tested against its formula. Unused: Hugging Face Llama checkpoints need the half-split form in `ops.c` |
@@ -122,6 +124,18 @@ With `--device cuda`, in an engine built with the CUDA path, OLMoE runs on the G
 ./engine/vitna-anchor generate --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 32 --greedy --timing --device cuda
 ```
 
+### Quantized weights from a GGUF file
+
+With `--weights <file.gguf>`, the weights come from a GGUF file rather than the model directory's SafeTensors files, and may be quantized: Q8_0, Q4_K and Q6_K, as llama.cpp writes them, beside F32, F16 and BF16. `--model` still gives `config.json`, which the file's metadata must agree with, and the tokenizer. A quantized weight is widened to float32 as it is used, block by block, to the bits gguf-py's `dequantize` gives, and the arithmetic after that is the same as for a float32 checkpoint. On the CPU only, for now: an engine asked to run a quantized file on the GPU says it cannot.
+
+```bash
+node scripts/fetch-model.mjs olmoe-1b-7b-gguf          # OLMoE's own Q8_0 and Q4_K_M files, 11.6 GB
+./engine/vitna-anchor run --model models/olmoe-1b-7b --weights models/olmoe-1b-7b-gguf/olmoe-1b-7b-0924-q4_k_m.gguf --prompt "The capital of France is"
+./engine/vitna-anchor weights-sha256 --model models/olmoe-1b-7b --weights models/olmoe-1b-7b-gguf/olmoe-1b-7b-0924-q4_k_m.gguf
+```
+
+`weights-sha256` prints the SHA-256 of every tensor as the engine widens it, which [`reference/record_gguf.py`](reference/README.md#quantized-weights-gate-a7) records for gguf-py's widening; `tests/reference-gguf.test.mjs` requires them equal.
+
 | Command | What it does |
 |---|---|
 | `run --model <dir> --prompt <text>` | Prints the prompt's continuation as it is generated |
@@ -133,6 +147,7 @@ With `--device cuda`, in an engine built with the CUDA path, OLMoE runs on the G
 | `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501. `--parallel <n>` runs up to n requests at once, 1 by default and at most 64 (see Requests at once below). `--speculate <k>` drafts and checks tokens as `generate --speculate` does (see Speculation below) |
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
 | `read-experts --model <dir> [--expert-cache <MiB>]` | Reads every expert of a mixture once from the drive, as `--expert-cache` reads them, computing nothing, and says how fast |
+| `weights-sha256 --model <dir> [--weights <file.gguf>]` | Prints, as JSON, the SHA-256 of every tensor's values widened to float32, under its Hugging Face name, each layer's experts together under the name of their stack |
 
 `run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, or expert weights renormalized over those a token uses.
 

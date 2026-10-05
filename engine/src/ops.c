@@ -4,6 +4,7 @@
 
 #include "ops.h"
 #include "kernels.h"
+#include "quant.h"
 #include <math.h>
 #include <string.h>
 
@@ -61,6 +62,28 @@ void vitna_to_f32(const void* src, vitna_dtype_t dtype, float* dst, size_t n) {
     } else if (dtype == VITNA_DTYPE_F16) {
         const uint16_t* s = (const uint16_t*)src;
         for (size_t i = 0; i < n; i++) dst[i] = vitna_f16_to_f32(s[i]);
+    } else if (vitna_dtype_is_block(dtype)) {
+        vitna_dequant(src, dtype, dst, n);
+    }
+}
+
+/* The most weights in a block of any format quant.h widens. */
+#define BLOCK_MAX 256
+
+/* y = W x for a block format, the scalar way: each block of a row widened,
+   then its products added one at a time, in order along the row. */
+static void matvec_blocks_scalar(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols) {
+    const size_t be = vitna_dtype_block_elems(dtype), bb = vitna_dtype_block_bytes(dtype);
+    const size_t row_bytes = (size_t)vitna_row_bytes(dtype, cols);
+    float buf[BLOCK_MAX];
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t* row = (const uint8_t*)w + r * row_bytes;
+        float sum = 0.0f;
+        for (size_t c = 0; c < cols; c += be) {
+            vitna_dequant(row + c / be * bb, dtype, buf, be);
+            for (size_t i = 0; i < be; i++) sum += buf[i] * x[c + i];
+        }
+        y[r] = sum;
     }
 }
 
@@ -71,6 +94,10 @@ static float load_w(const void* w, vitna_dtype_t dtype, size_t i) {
 }
 
 void vitna_matvec_scalar(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols) {
+    if (vitna_dtype_is_block(dtype)) {
+        matvec_blocks_scalar(w, dtype, x, y, rows, cols);
+        return;
+    }
     for (size_t r = 0; r < rows; r++) {
         float sum = 0.0f;
         size_t base = r * cols;
@@ -165,6 +192,28 @@ static void matvec_f32_avx2(const float* w, const float* x, float* y, size_t row
         y[r] = sum;
     }
 }
+
+/* A block format: each block of a row widened into buf, then multiplied in
+   the same two accumulators matvec_f32_avx2 keeps, across the whole row.
+   Every block holds a multiple of 16 weights. */
+VITNA_OPS_AVX2
+static void matvec_blocks_avx2(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols) {
+    const size_t be = vitna_dtype_block_elems(dtype), bb = vitna_dtype_block_bytes(dtype);
+    const size_t row_bytes = (size_t)vitna_row_bytes(dtype, cols);
+    float buf[BLOCK_MAX];
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t* row = (const uint8_t*)w + r * row_bytes;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0;
+        for (size_t c = 0; c < cols; c += be) {
+            vitna_dequant(row + c / be * bb, dtype, buf, be);
+            for (size_t i = 0; i < be; i += 16) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(buf + i), _mm256_loadu_ps(x + c + i), a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(buf + i + 8), _mm256_loadu_ps(x + c + i + 8), a1);
+            }
+        }
+        y[r] = hsum256(_mm256_add_ps(a0, a1));
+    }
+}
 #endif
 
 static int simd_path(void) {
@@ -197,6 +246,7 @@ void vitna_matvec(const void* w, vitna_dtype_t dtype, const float* x, float* y, 
     if (path == 1) {
         if (dtype == VITNA_DTYPE_BF16) { matvec_bf16_avx2((const uint16_t*)w, x, y, rows, cols); return; }
         if (dtype == VITNA_DTYPE_F32) { matvec_f32_avx2((const float*)w, x, y, rows, cols); return; }
+        if (vitna_dtype_is_block(dtype)) { matvec_blocks_avx2(w, dtype, x, y, rows, cols); return; }
     }
 #elif defined(VITNA_OPS_NEON)
     if (path == 2) {

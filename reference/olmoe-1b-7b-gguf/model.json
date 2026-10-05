@@ -1,0 +1,11 @@
+{
+  "name": "olmoe-1b-7b-gguf",
+  "repo": "allenai/OLMoE-1B-7B-0924-GGUF",
+  "revision": "70df85ed7132bf21b5acbcb33817f58e7d3cb949",
+  "license": "apache-2.0",
+  "why": "OLMoE-1B-7B as GGUF, from the model's own authors, for gate A7: the same model as gate A5's, quantized by llama.cpp. Q8_0 keeps every matrix at 8 bits; Q4_K_M keeps most at 4 bits (Q4_K) and some at 6 (Q6_K). The tensors are written unpermuted and the experts stacked in the checkpoint's order, so they map one to one onto reference/olmoe-1b-7b's. config.json and the tokenizer still come from that pin.",
+  "files": [
+    { "path": "olmoe-1b-7b-0924-q8_0.gguf", "size": 7359942240, "sha256": "f2049d5ac4a1c226bedb5b704dab0098d938199e7ddc052662e9159fab50e1b7" },
+    { "path": "olmoe-1b-7b-0924-q4_k_m.gguf", "size": 4213511776, "sha256": "f3ae25f6c7e83efb0e3632ef068b321f4d4a644bcfb6c0e01dd8c00e94e53f14" }
+  ]
+}

@@ -104,6 +104,11 @@ jobs:
         env:
           VITNA_REQUIRE_MOE_TOKENIZER: "1"
         run: node --test --test-reporter=spec tests/reference-moe.test.mjs
+      # Gate A7's GGUF files are 4 to 7 GB each, more than CI fetches, so only
+      # the fixtures are checked here: each the one its pins and recorders
+      # describe. The engine is compared with them by hand (README).
+      - name: Gate A7, the quantized fixtures as recorded
+        run: node --test --test-reporter=spec tests/reference-gguf.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"

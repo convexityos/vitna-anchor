@@ -33,13 +33,44 @@ static const struct { const char* name; vitna_dtype_t dtype; size_t size; } DTYP
 };
 #define N_DTYPES (sizeof(DTYPES) / sizeof(DTYPES[0]))
 
+/* The block formats, which only a GGUF file holds, so parse_dtype never
+   sees them: SafeTensors has no name for them. */
+static const struct { const char* name; vitna_dtype_t dtype; size_t elems, bytes; } BLOCKS[] = {
+    { "Q8_0", VITNA_DTYPE_Q8_0, 32, 34 },
+    { "Q4_K", VITNA_DTYPE_Q4_K, 256, 144 },
+    { "Q6_K", VITNA_DTYPE_Q6_K, 256, 210 },
+};
+#define N_BLOCKS (sizeof(BLOCKS) / sizeof(BLOCKS[0]))
+
 size_t vitna_dtype_size(vitna_dtype_t dtype) {
     for (size_t i = 0; i < N_DTYPES; i++) if (DTYPES[i].dtype == dtype) return DTYPES[i].size;
     return 0;
 }
 
+bool vitna_dtype_is_block(vitna_dtype_t dtype) {
+    for (size_t i = 0; i < N_BLOCKS; i++) if (BLOCKS[i].dtype == dtype) return true;
+    return false;
+}
+
+size_t vitna_dtype_block_elems(vitna_dtype_t dtype) {
+    for (size_t i = 0; i < N_BLOCKS; i++) if (BLOCKS[i].dtype == dtype) return BLOCKS[i].elems;
+    return vitna_dtype_size(dtype) ? 1 : 0;
+}
+
+size_t vitna_dtype_block_bytes(vitna_dtype_t dtype) {
+    for (size_t i = 0; i < N_BLOCKS; i++) if (BLOCKS[i].dtype == dtype) return BLOCKS[i].bytes;
+    return vitna_dtype_size(dtype);
+}
+
+uint64_t vitna_row_bytes(vitna_dtype_t dtype, size_t cols) {
+    const size_t elems = vitna_dtype_block_elems(dtype);
+    if (!elems || cols % elems) return 0;
+    return (uint64_t)(cols / elems) * vitna_dtype_block_bytes(dtype);
+}
+
 const char* vitna_dtype_name(vitna_dtype_t dtype) {
     for (size_t i = 0; i < N_DTYPES; i++) if (DTYPES[i].dtype == dtype) return DTYPES[i].name;
+    for (size_t i = 0; i < N_BLOCKS; i++) if (BLOCKS[i].dtype == dtype) return BLOCKS[i].name;
     return "UNKNOWN";
 }
 
