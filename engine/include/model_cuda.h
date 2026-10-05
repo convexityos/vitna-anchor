@@ -197,6 +197,17 @@ bool vitna_cuda_lost(struct vitna_cuda_model* g, char* err, size_t err_len);
 
 void vitna_cuda_free(struct vitna_cuda_model* g);
 
+/**
+ * Widen the matrix m to float32 on the GPU, into out (rows x cols), for
+ * checking what the kernels compute with: three times, through each way a
+ * kernel reads weights (a chunk of eight, as the projections read them; four,
+ * as a prompt's matrix product does; one, as the embedding does), and false,
+ * with the reason in err, unless all three give the same bits. Copies m to
+ * the device and back; device memory is kept between calls, for the largest
+ * matrix seen so far.
+ */
+bool vitna_cuda_widen(const vitna_matrix_t* m, float* out, char* err, size_t err_len);
+
 #ifdef __cplusplus
 }
 #endif

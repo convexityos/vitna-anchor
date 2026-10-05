@@ -268,7 +268,6 @@ static bool bind(vitna_llama_t* m, vitna_matrix_t* out, const char* name, size_t
     if (!plain && !(vitna_dtype_is_block(t->dtype) && vitna_row_bytes(t->dtype, cols))) {
         return fail(err, err_len, "tensor %s is %s; F32, BF16, F16, Q8_0, Q4_K or Q6_K is needed", name, vitna_dtype_name(t->dtype));
     }
-    if (!plain) m->quantized = true;
     out->data = t->data_ptr;
     out->dtype = t->dtype;
     out->rows = rows;
@@ -1179,9 +1178,6 @@ static bool rope_tables(const vitna_llama_t* m, float** cos_out, float** sin_out
 bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len) {
 #if defined(VITNA_CUDA)
     if (m->cuda) return true;
-    if (m->quantized) {
-        return fail(err, err_len, "the GPU does not compute with quantized weights yet; run this checkpoint on the CPU%s%s", NULL, NULL);
-    }
     if (m->cfg.n_experts && !m->pred_logits) {
         /* The lookahead's logits, which the GPU computes with the router's. */
         m->pred_logits = (float*)malloc(m->cfg.n_experts * sizeof(float));
@@ -1220,6 +1216,16 @@ bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err
 #else
     (void)m;
     (void)expert_cache_bytes;
+    return fail(err, err_len, "%s%s", NO_CUDA, NULL);
+#endif
+}
+
+bool vitna_llama_widen_on_gpu(const vitna_matrix_t* w, float* out, char* err, size_t err_len) {
+#if defined(VITNA_CUDA)
+    return vitna_cuda_widen(w, out, err, err_len);
+#else
+    (void)w;
+    (void)out;
     return fail(err, err_len, "%s%s", NO_CUDA, NULL);
 #endif
 }

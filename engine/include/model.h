@@ -140,10 +140,6 @@ typedef struct {
     float** rows_outs;        /* rows_max: where each row's logits go */
     bool no_rows;
 
-    /* Set on load when any matrix is in a block format (quant.h), which the
-     * CUDA path does not compute with yet. */
-    bool quantized;
-
     /* Set when a step on the GPU fails with an error CUDA calls sticky (an
      * illegal address, a kernel that faulted, and others), after which the
      * device can run nothing more in this process: every later step fails
@@ -366,6 +362,14 @@ bool vitna_llama_cuda_probe(char* err, size_t err_len);
  * the CPU; a caller that asked for the GPU should stop, not run it there.
  */
 bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len);
+
+/**
+ * For checking: the matrix w widened to float32 by the GPU's kernels, into
+ * out (rows x cols), as model_cuda.h's vitna_cuda_widen, which reads it
+ * every way the kernels do and requires the same bits from each. False,
+ * with the reason in err, in an engine built without CUDA.
+ */
+bool vitna_llama_widen_on_gpu(const vitna_matrix_t* w, float* out, char* err, size_t err_len);
 
 /**
  * For tests: run a mixture of experts on the GPU a token at a time, as
