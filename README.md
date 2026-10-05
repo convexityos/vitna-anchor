@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. Told to, it reads that model's experts from the drive as the layers want them, with direct I/O, into a cache in memory of a size it is given, and the logits are then the same, bit for bit; how fast that runs was measured on one machine ([below](#speed-with-the-experts-read-from-a-drive)). Built with its CUDA path, it runs that model on an NVIDIA GPU too, which keeps as many of the experts as its memory holds and has the others copied in as the layers want them, from the mapped checkpoint or from that cache in memory. The same comparison passed there, checked by hand, and how fast it runs was measured on one GPU ([below](#speed-on-a-gpu)). Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. Told to, it reads that model's experts from the drive as the layers want them, with direct I/O, into a cache in memory of a size it is given, and the logits are then the same, bit for bit; how fast that runs was measured on one machine ([below](#speed-with-the-experts-read-from-a-drive)). Built with its CUDA path, it runs that model on an NVIDIA GPU too, which keeps as many of the experts as its memory holds and has the others copied in as the layers want them, from the mapped checkpoint or from that cache in memory. The same comparison passed there, checked by hand, and how fast it runs was measured on one GPU ([below](#speed-on-a-gpu)). Given one of the GGUF files OLMoE's authors publish, quantized to 8 or mostly 4 bits, it runs that instead (`--weights`), on the CPU and on the GPU, and matches a reference recorded on the same quantized weights, checked by hand ([below](#quantized-weights-from-a-gguf-file)); with every expert then fitting on that GPU, it decodes 3.5 times as fast as the BF16 model ([below](#speed-with-quantized-weights)). Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -341,6 +341,38 @@ node scripts/bench-prefill.mjs --device cuda --model models/olmoe-1b-7b --engine
 | 2,000 tokens | 53,071 ms | 2,994 ms | 17.7x |
 
 A token at a time, each wanted the experts it was routed to copied to the GPU if it lacked them. As rows, a chunk's tokens share the copies: an expert runs once a layer for every row routed to it. What is left is copying each chunk's experts once a layer, and the rows' own arithmetic, which reads each expert's weights once for every 8 rows routed to it, so that every row's sums stay its step's.
+
+## Speed with quantized weights
+
+Measured on 2026-10-05 on the same machine and GPU, the engine built as for gate A4, with OLMoE's own GGUF files (`node scripts/fetch-model.mjs olmoe-1b-7b-gguf`) on the Crucial P5. The commands, the first with each `--weights` and without it, the second likewise:
+
+```powershell
+node scripts/bench-experts.mjs --device cuda --tokens 64 --runs 5 --gpu-caches default,2048 [--weights models/olmoe-1b-7b-gguf/<file>]
+node scripts/bench-experts.mjs --tokens 64 --runs 3 --caches none [--weights models/olmoe-1b-7b-gguf/<file>]
+```
+
+The same 64 greedy tokens after "The capital of France is", the median of the 63 steps timed, the experts copied to the GPU from the mapped file and the GPU's cache empty at the start of every run. On the GPU:
+
+| Weights | Cache on the GPU | ms a token | Tokens a second | On the GPU when wanted | MiB copied a position |
+|---|---|---|---|---|---|
+| BF16, 13.8 GB | 5,460 MiB, 455 of the 1,024 experts | 16.6 | 60.3 | 88% | 315 |
+| Q8_0, 7.4 GB | 5,884 MiB, 923 experts | 6.0 | 166.9 | 95% | 70 |
+| Q4_K_M, 4.2 GB | 3,984 MiB, all 1,024 | 4.7 | 213.6 | 95% | 40 |
+| BF16 | 2,040 MiB, 170 experts | 38.8 | 25.8 | 68% | 885 |
+| Q8_0 | 2,046 MiB, 321 experts | 14.3 | 70.0 | 81% | 270 |
+| Q4_K_M | 2,046 MiB, 526 experts | 6.2 | 162.5 | 91% | 72 |
+
+A quantized expert is smaller, so the GPU holds more of them and copies fewer bytes when it lacks one: at Q4_K_M every expert fits beside the rest of the model, and what is left is the arithmetic. With a cache of 2 GiB the gap is wider still, since the BF16 model spends most of a token on the bus.
+
+On the CPU, one thread computing and every weight read through the operating system's file cache:
+
+| Weights | ms a token | Tokens a second |
+|---|---|---|
+| BF16 | 187.5 | 5.33 |
+| Q8_0 | 483.3 | 2.07 |
+| Q4_K_M | 1,140.1 | 0.88 |
+
+The CPU path is slower on quantized weights than on BF16: it widens each block to float32 with a scalar loop before the multiply-adds, and that loop, not reading the weights, is what a token costs. Vectorizing it is the next step on the CPU.
 
 ## Measurements
 

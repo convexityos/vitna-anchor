@@ -9,6 +9,7 @@
 //
 // --weights reads the weights from a GGUF file, which may be quantized, as
 // the engine's own --weights does; the drive named is then that file's.
+// --caches none times the mapped run alone.
 //
 // Each run is one `generate --greedy --timing --expert-cache <MiB>`, which
 // times the tokens after the first new one inside the engine. The expert
@@ -42,7 +43,8 @@ function option(name, fallback) {
   const i = process.argv.indexOf(name);
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
 }
-const list = (s) => (s ? s.split(",").filter(Boolean) : []);
+/* "none" for an empty list, which PowerShell 5.1 cannot pass as "". */
+const list = (s) => (s && s !== "none" ? s.split(",").filter(Boolean) : []);
 
 const device = option("--device", "cpu");
 const gpu = device === "cuda";
