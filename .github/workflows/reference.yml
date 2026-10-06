@@ -5,6 +5,10 @@ name: Reference
 # identical, and no logit may move by more than the tolerance gate A2 is held
 # to. The job prints the largest difference, which says how much torch itself
 # varies between CPUs.
+#
+# The embeddings job does the same for gate A14's fixture, measures how far
+# plausible defects move the embeddings against its tolerance, and checks the
+# engine's BERT tokenizer against the tokenizers library over every code point.
 
 on:
   workflow_dispatch:
@@ -12,6 +16,11 @@ on:
     paths:
       - "reference/**"
       - "scripts/fetch-model.mjs"
+      - "engine/src/tokenizer.c"
+      - "engine/src/wordpiece.c"
+      - "engine/src/wordpiece_data.h"
+      - "engine/tools/check_wordpiece.py"
+      - "engine/tools/gen_wordpiece_unicode.py"
       - ".github/workflows/reference.yml"
 
 permissions:
@@ -46,3 +55,44 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python reference/record.py --check
+
+  embeddings:
+    name: Re-record the embedding reference (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Cache the pinned embedding model's files
+        uses: actions/cache@v6
+        with:
+          path: models/bge-small-en-v1.5
+          key: embed-model-${{ hashFiles('reference/bge-small-en-v1.5/model.json') }}
+      - name: Fetch the embedding model at the pinned revision, checking every file's SHA-256
+        run: node scripts/fetch-model.mjs bge-small-en-v1.5
+      - name: Install the pinned reference software
+        run: python -m pip install -r reference/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Record again and compare with the fixture
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python reference/record_embed.py --check
+      - name: Each plausible defect moves an embedding past the tolerance, and rounding stays far inside it
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python reference/embed_sensitivity.py
+      - name: Build the engine (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd engine
+          make vitna-anchor
+      - name: The engine's BERT tokenizer against the tokenizers library, over every code point
+        if: runner.os == 'Linux'
+        run: python engine/tools/check_wordpiece.py engine/vitna-anchor models/bge-small-en-v1.5

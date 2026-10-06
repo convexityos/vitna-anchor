@@ -23,6 +23,16 @@
  * has sequences (vitna_llama_load's seqs), each in a sequence of its own; the
  * rest wait their turn. Every one is answered exactly as it would be alone,
  * a token at a time: its tokens' logits are those steps', bit for bit.
+ *
+ * An API made for an embedding model (vitna_api_create_encoder) serves POST
+ * /v1/embeddings in place of generation, with OpenAI's request and response:
+ * input a string or a list of up to 2,048, each embedded as the model's
+ * sentence-transformers files say, float or base64, and usage counted from
+ * the tokens the model read. A text longer than the model reads is refused
+ * with a 400, never cut short. Its requests run one at a time, each on every
+ * thread the encoder has. Generation on an embedding model, and embeddings
+ * from a model that generates, are refused with a 404 that says which the
+ * model does.
  */
 
 #ifndef VITNA_API_H
@@ -31,6 +41,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "encoder.h"
 #include "model.h"
 #include "tokenizer.h"
 
@@ -57,10 +68,16 @@ typedef struct {
 /** Serve model under model_id. The API keeps the pointers; it frees neither the model nor the tokenizer. */
 vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok, const char* model_id);
 
+/** Serve an embedding model under model_id, at /v1/embeddings. The API keeps the pointers and frees neither. */
+vitna_api_t* vitna_api_create_encoder(vitna_encoder_t* encoder, const vitna_tokenizer_t* tok, const char* model_id);
+
 void vitna_api_free(vitna_api_t* api);
 
-/** The requests it runs at once: the model's sequences. */
+/** The requests it runs at once: the model's sequences, or 1 for an embedding model. */
 size_t vitna_api_parallel(const vitna_api_t* api);
+
+/** Whether it serves an embedding model, at /v1/embeddings, rather than generation. */
+bool vitna_api_embeds(const vitna_api_t* api);
 
 /**
  * Whether the GPU can run nothing more in this process: a step failed with an

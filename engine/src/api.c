@@ -62,7 +62,9 @@ typedef struct {
 typedef struct job job_t;
 
 struct vitna_api {
-    vitna_llama_t* model;
+    vitna_llama_t* model;           /* a model that generates, or NULL when encoder is set */
+    vitna_encoder_t* encoder;       /* an embedding model, served at /v1/embeddings in place of generation */
+    vitna_mutex_t embed_lock;       /* one embedding request at a time: each runs on every thread the encoder has */
     const vitna_tokenizer_t* tok;
     char* model_id;
     long long created;
@@ -1522,8 +1524,35 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
     return api;
 }
 
+vitna_api_t* vitna_api_create_encoder(vitna_encoder_t* encoder, const vitna_tokenizer_t* tok, const char* model_id) {
+    vitna_api_t* api = (vitna_api_t*)calloc(1, sizeof(vitna_api_t));
+    if (!api) return NULL;
+    api->encoder = encoder;
+    api->tok = tok;
+    api->created = (long long)time(NULL);
+    vitna_mutex_init(&api->lock);
+    vitna_cond_init(&api->work);
+    vitna_mutex_init(&api->pool_lock);
+    vitna_cond_init(&api->pool_work);
+    vitna_cond_init(&api->pool_done);
+    vitna_mutex_init(&api->mask_lock);
+    vitna_mutex_init(&api->embed_lock);
+    size_t n = strlen(model_id) + 1;
+    api->model_id = (char*)malloc(n);
+    if (!api->model_id) {
+        vitna_api_free(api);
+        return NULL;
+    }
+    memcpy(api->model_id, model_id, n);
+    return api;
+}
+
 size_t vitna_api_parallel(const vitna_api_t* api) {
-    return api ? api->model->seqs : 0;
+    return api ? (api->model ? api->model->seqs : 1) : 0;
+}
+
+bool vitna_api_embeds(const vitna_api_t* api) {
+    return api && api->encoder;
 }
 
 bool vitna_api_lost(vitna_api_t* api) {
@@ -1546,6 +1575,7 @@ void vitna_api_set_prefix_cache(vitna_api_t* api, bool on) {
 }
 
 bool vitna_api_set_speculate(vitna_api_t* api, size_t k) {
+    if (!api->model) return false;
     const size_t pass_max = vitna_llama_exact_max(api->model);
     if (k && pass_max > 1 && k > pass_max - 1) k = pass_max - 1;
     vitna_mutex_lock(&api->lock);
@@ -1591,7 +1621,240 @@ void vitna_api_free(vitna_api_t* api) {
     vitna_cond_destroy(&api->pool_done);
     vitna_mutex_destroy(&api->pool_lock);
     vitna_mutex_destroy(&api->mask_lock);
+    if (api->encoder) vitna_mutex_destroy(&api->embed_lock);
     free(api);
+}
+
+/* --- Embeddings --- */
+
+/* The most texts, and tokens across them, one request may ask for: OpenAI's
+ * 2,048 inputs, and enough tokens for 256 texts of 512, which a CPU embeds in
+ * seconds rather than minutes. A larger request is refused, not cut short. */
+#define EMBED_MAX_INPUTS 2048
+#define EMBED_MAX_TOKENS 131072
+
+static void base64_f32(vitna_strbuf_t* b, const float* v, size_t n) {
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    unsigned char bytes[3];
+    size_t have = 0;
+    char quad[4];
+    for (size_t i = 0; i < n * 4; i++) {
+        /* float32 little-endian, as OpenAI's base64 encoding_format sends it */
+        uint32_t bits;
+        memcpy(&bits, &v[i / 4], 4);
+        bytes[have++] = (unsigned char)(bits >> (8 * (i % 4)));
+        if (have == 3) {
+            quad[0] = alphabet[bytes[0] >> 2];
+            quad[1] = alphabet[((bytes[0] & 3) << 4) | (bytes[1] >> 4)];
+            quad[2] = alphabet[((bytes[1] & 15) << 2) | (bytes[2] >> 6)];
+            quad[3] = alphabet[bytes[2] & 63];
+            vitna_sb_append(b, quad, 4);
+            have = 0;
+        }
+    }
+    if (have) {
+        if (have == 1) bytes[1] = 0;
+        quad[0] = alphabet[bytes[0] >> 2];
+        quad[1] = alphabet[((bytes[0] & 3) << 4) | (bytes[1] >> 4)];
+        quad[2] = have == 2 ? alphabet[(bytes[1] & 15) << 2] : '=';
+        quad[3] = '=';
+        vitna_sb_append(b, quad, 4);
+    }
+}
+
+/* Name a field the embeddings route ignores, header-safe, as parse_params does. */
+static void note_ignored(vitna_strbuf_t* ignored, const char* k) {
+    if (ignored->len >= 400) return;
+    if (ignored->len) vitna_sb_puts(ignored, ", ");
+    for (size_t c = 0; k[c] && c < 64; c++) {
+        char ch = k[c];
+        bool safe = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '-';
+        vitna_sb_append(ignored, safe ? &ch : "_", 1);
+    }
+}
+
+/* POST /v1/embeddings: OpenAI's request and response. input is a string or
+ * a list of them; each is tokenized with the model's tokenizer, [CLS] and
+ * [SEP] included, embedded, pooled and normalized as the model's
+ * sentence-transformers files say, and returned in order. usage counts the
+ * tokens the model read. A text longer than the model reads is refused, not
+ * cut short: truncation would embed a text other than the one sent. Token-id
+ * input is refused too, since a list of ids would have to carry the model's
+ * own [CLS] and [SEP], which a client sending OpenAI's ids would not know. */
+static vitna_api_result_t embeddings_route(vitna_api_t* api, const char* body, size_t body_len, vitna_sink_t* sink) {
+    vitna_api_result_t r = { 200, 0, 0, 0 };
+    api_error_t e;
+    char jerr[160];
+    vitna_json_doc_t* doc = vitna_json_parse(body ? body : "", body_len, jerr, sizeof(jerr));
+    const vitna_json_value_t* root = doc ? vitna_json_root(doc) : NULL;
+    vitna_strbuf_t ignored, out, headers;
+    vitna_sb_init(&ignored);
+    vitna_sb_init(&out);
+    vitna_sb_init(&headers);
+    vitna_encoder_t* enc = api->encoder;
+    const size_t H = enc->cfg.hidden;
+    size_t n = 0, tokens = 0;
+    vitna_token_list_t* ids = NULL;
+    const int32_t** rows = NULL;
+    size_t* lens = NULL;
+    float* vecs = NULL;
+    bool base64 = false;
+
+    if (!root || root->type != VITNA_JSON_OBJECT) {
+        set_error(&e, 400, "invalid_request_error", "invalid_json", NULL, "The body must be a JSON object%s%s", doc ? "" : ": ", doc ? "" : jerr);
+        goto fail;
+    }
+    const char* model = vitna_json_as_string(vitna_json_get(root, "model"));
+    if (model && strcmp(model, api->model_id) != 0) {
+        set_error(&e, 404, "invalid_request_error", "model_not_found", "model", "The model `%s` does not exist. This server serves `%s`.", model,
+                  api->model_id);
+        goto fail;
+    }
+    const vitna_json_value_t* input = NULL;
+    for (size_t i = 0; i < root->u.object.count; i++) {
+        const char* k = root->u.object.members[i].key;
+        const vitna_json_value_t* v = root->u.object.members[i].value;
+        double d;
+        if (strcmp(k, "model") == 0 || strcmp(k, "user") == 0) continue;
+        if (strcmp(k, "input") == 0) {
+            input = v;
+        } else if (strcmp(k, "encoding_format") == 0) {
+            const char* f = vitna_json_as_string(v);
+            if (vitna_json_is_null(v) || (f && strcmp(f, "float") == 0)) {
+                base64 = false;
+            } else if (f && strcmp(f, "base64") == 0) {
+                base64 = true;
+            } else {
+                set_error(&e, 400, "invalid_request_error", "invalid_value", k, "`encoding_format` must be float or base64");
+                goto fail;
+            }
+        } else if (strcmp(k, "dimensions") == 0) {
+            if (vitna_json_is_null(v)) continue;
+            if (!vitna_json_as_number(v, &d) || !integral(d) || d < 1) {
+                set_error(&e, 400, "invalid_request_error", "invalid_value", k, "`dimensions` must be a positive integer");
+                goto fail;
+            }
+            if ((size_t)d != H) {
+                set_error(&e, 400, "invalid_request_error", "unsupported_parameter", k,
+                          "`dimensions` is not supported by this model: its embeddings have %zu dimensions, and it was not trained to be cut shorter", H);
+                goto fail;
+            }
+        } else {
+            note_ignored(&ignored, k);
+        }
+    }
+    if (!input || vitna_json_is_null(input)) {
+        set_error(&e, 400, "invalid_request_error", "missing_required_parameter", "input", "`input` is required");
+        goto fail;
+    }
+    const bool one = input->type == VITNA_JSON_STRING;
+    if (!one && input->type != VITNA_JSON_ARRAY) {
+        set_error(&e, 400, "invalid_request_error", "invalid_value", "input", "`input` must be a string or an array of strings");
+        goto fail;
+    }
+    n = one ? 1 : input->u.array.count;
+    if (n == 0 || n > EMBED_MAX_INPUTS) {
+        set_error(&e, 400, "invalid_request_error", "invalid_value", "input", "`input` must hold from 1 to %d texts", EMBED_MAX_INPUTS);
+        goto fail;
+    }
+    for (size_t i = 0; !one && i < n; i++) {
+        const vitna_json_value_t* item = input->u.array.items[i];
+        if (item->type == VITNA_JSON_STRING) continue;
+        if (item->type == VITNA_JSON_NUMBER || item->type == VITNA_JSON_ARRAY) {
+            unsupported(&e, "input", "token ids are not accepted; send text, which the server tokenizes with the model's own tokenizer");
+        } else {
+            set_error(&e, 400, "invalid_request_error", "invalid_value", "input", "`input` must be a string or an array of strings");
+        }
+        goto fail;
+    }
+    ids = (vitna_token_list_t*)calloc(n, sizeof(vitna_token_list_t));
+    rows = (const int32_t**)malloc(n * sizeof(int32_t*));
+    lens = (size_t*)malloc(n * sizeof(size_t));
+    if (!ids || !rows || !lens) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        goto fail;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const vitna_json_value_t* item = one ? input : input->u.array.items[i];
+        if (!vitna_tokenizer_encode(api->tok, item->u.string.ptr, item->u.string.len, &ids[i])) {
+            set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+            goto fail;
+        }
+        if (ids[i].count > enc->cfg.max_tokens) {
+            char which[32] = "input";
+            if (!one) snprintf(which, sizeof(which), "input[%zu]", i);
+            set_error(&e, 400, "invalid_request_error", "context_length_exceeded", "input",
+                      "This model reads at most %zu tokens a text, [CLS] and [SEP] included, and %s is %zu tokens. Send shorter texts; nothing is cut short.",
+                      enc->cfg.max_tokens, which, ids[i].count);
+            goto fail;
+        }
+        rows[i] = ids[i].ids;
+        lens[i] = ids[i].count;
+        tokens += ids[i].count;
+    }
+    if (tokens > EMBED_MAX_TOKENS) {
+        set_error(&e, 400, "invalid_request_error", "invalid_value", "input",
+                  "These texts are %zu tokens together, and one request may hold %d. Send them in smaller requests.", tokens, EMBED_MAX_TOKENS);
+        goto fail;
+    }
+    vecs = (float*)malloc(n * H * sizeof(float));
+    if (!vecs) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        goto fail;
+    }
+    vitna_mutex_lock(&api->embed_lock);
+    const bool ran = vitna_encoder_embed(enc, rows, lens, n, enc->cfg.pooling, enc->cfg.normalize, vecs, NULL);
+    vitna_mutex_unlock(&api->embed_lock);
+    if (!ran) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        goto fail;
+    }
+    for (size_t i = 0; i < n * H; i++) {
+        if (!isfinite(vecs[i])) {
+            set_error(&e, 500, "server_error", NULL, NULL, "the model produced a value that is not a finite number");
+            goto fail;
+        }
+    }
+
+    vitna_sb_puts(&out, "{\"object\":\"list\",\"data\":[");
+    for (size_t i = 0; i < n; i++) {
+        vitna_sb_printf(&out, "%s{\"object\":\"embedding\",\"index\":%zu,\"embedding\":", i ? "," : "", i);
+        if (base64) {
+            vitna_sb_puts(&out, "\"");
+            base64_f32(&out, vecs + i * H, H);
+            vitna_sb_puts(&out, "\"");
+        } else {
+            vitna_sb_puts(&out, "[");
+            for (size_t k = 0; k < H; k++) vitna_sb_printf(&out, k ? ",%.9g" : "%.9g", (double)vecs[i * H + k]);
+            vitna_sb_puts(&out, "]");
+        }
+        vitna_sb_puts(&out, "}");
+    }
+    vitna_sb_puts(&out, "],\"model\":");
+    vitna_sb_json_string(&out, (const unsigned char*)api->model_id, strlen(api->model_id));
+    vitna_sb_printf(&out, ",\"usage\":{\"prompt_tokens\":%zu,\"total_tokens\":%zu}}", tokens, tokens);
+    if (!out.ok) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        goto fail;
+    }
+    if (ignored.len) vitna_sb_printf(&headers, "x-vitna-ignored: %s\r\n", ignored.data);
+    respond(sink, 200, headers.len ? headers.data : NULL, out.data, out.len);
+    r.prompt_tokens = tokens;
+    goto done;
+
+fail:
+    r.status = respond_error(sink, &e);
+done:
+    for (size_t i = 0; ids && i < n; i++) vitna_token_list_free(&ids[i]);
+    free(ids);
+    free(rows);
+    free(lens);
+    free(vecs);
+    vitna_sb_free(&ignored);
+    vitna_sb_free(&out);
+    vitna_sb_free(&headers);
+    vitna_json_free(doc);
+    return r;
 }
 
 static vitna_api_result_t completion_route(vitna_api_t* api, bool chat, const char* body, size_t body_len, vitna_sink_t* sink) {
@@ -1659,11 +1922,18 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
     bool post = strcmp(method, "POST") == 0;
     bool chat = strcmp(route, "/v1/chat/completions") == 0;
     bool completions = strcmp(route, "/v1/completions") == 0;
+    bool embeddings = strcmp(route, "/v1/embeddings") == 0;
 
     if (get && (strcmp(route, "/health") == 0 || strcmp(route, "/v1/health") == 0)) {
         vitna_strbuf_t b;
         vitna_sb_init(&b);
-        if (api) {
+        if (api && api->encoder) {
+            const vitna_encoder_config_t* c = &api->encoder->cfg;
+            vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
+            vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
+            vitna_sb_printf(&b, ",\"generation\":false,\"embeddings\":true,\"dimensions\":%zu,\"max_tokens\":%zu,\"pooling\":\"%s\",\"normalized\":%s,\"threads\":%zu}",
+                            c->hidden, c->max_tokens, c->pooling == VITNA_POOL_CLS ? "cls" : "mean", c->normalize ? "true" : "false", api->encoder->threads);
+        } else if (api) {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
             vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
             vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu}", api->model->ctx, api->model->seqs);
@@ -1688,23 +1958,34 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
         vitna_sb_free(&b);
         return r;
     }
-    if ((chat || completions) && !post) {
+    if ((chat || completions || embeddings) && !post) {
         set_error(&e, 405, "invalid_request_error", "method_not_allowed", NULL, "%s takes POST", route);
         r.status = respond_error(sink, &e);
         return r;
     }
-    if (post && strcmp(route, "/v1/embeddings") == 0) {
-        set_error(&e, 501, "not_implemented", "not_implemented", NULL, "Embeddings are not implemented.");
-        r.status = respond_error(sink, &e);
-        return r;
-    }
-    if (chat || completions) {
+    if (chat || completions || embeddings) {
         if (!api) {
             set_error(&e, 501, "not_implemented", "no_model", NULL, NO_MODEL_MESSAGE);
             r.status = respond_error(sink, &e);
             return r;
         }
-        return completion_route(api, chat, body, body_len, sink);
+        /* A model does one or the other: an embedding model generates no
+         * text, and a model that generates is not served as an embedding
+         * model, whose pooling and training it does not have. */
+        if (embeddings && !api->encoder) {
+            set_error(&e, 404, "invalid_request_error", "model_not_supported", "model",
+                      "The model `%s` generates text and produces no embeddings. Start the server with an embedding model to serve /v1/embeddings.",
+                      api->model_id);
+            r.status = respond_error(sink, &e);
+            return r;
+        }
+        if (!embeddings && api->encoder) {
+            set_error(&e, 404, "invalid_request_error", "model_not_supported", "model",
+                      "The model `%s` produces embeddings and generates no text. Send it to /v1/embeddings.", api->model_id);
+            r.status = respond_error(sink, &e);
+            return r;
+        }
+        return embeddings ? embeddings_route(api, body, body_len, sink) : completion_route(api, chat, body, body_len, sink);
     }
     set_error(&e, 404, "invalid_request_error", "not_found", NULL, "Not found: %s %s", method, route);
     r.status = respond_error(sink, &e);
