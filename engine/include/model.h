@@ -140,6 +140,10 @@ typedef struct {
     float** rows_outs;        /* rows_max: where each row's logits go */
     bool no_rows;
 
+    /* Set on load when any matrix is in a block format (quant.h), which the
+     * CUDA path does not compute with yet. */
+    bool quantized;
+
     /* Set when a step on the GPU fails with an error CUDA calls sticky (an
      * illegal address, a kernel that faulted, and others), after which the
      * device can run nothing more in this process: every later step fails
@@ -163,6 +167,17 @@ typedef struct {
  * asks for something unsupported.
  */
 bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs, char* err, size_t err_len);
+
+/**
+ * vitna_llama_load, with the weights read from the GGUF file at weights
+ * rather than from dir's SafeTensors files. dir still gives config.json,
+ * which the file's metadata must agree with (layers, widths, heads,
+ * experts, the norm's epsilon and the rotary base), and the tokenizer. A
+ * GGUF file's tensors may be quantized (quant.h); weights NULL is
+ * vitna_llama_load.
+ */
+bool vitna_llama_load_ex(vitna_llama_t* m, const char* dir, const char* weights, size_t ctx, size_t seqs, char* err,
+                         size_t err_len);
 
 void vitna_llama_free(vitna_llama_t* m);
 

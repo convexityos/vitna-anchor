@@ -21,12 +21,15 @@ extern "C" {
 float vitna_bf16_to_f32(uint16_t h);
 float vitna_f16_to_f32(uint16_t h);
 
-/** Widen n values of dtype to float32. dtype is F32, BF16 or F16. */
+/** Widen n values of dtype to float32. dtype is F32, BF16 or F16, or a block
+    format (quant.h), for which n is whole blocks starting at a block. */
 void vitna_to_f32(const void* src, vitna_dtype_t dtype, float* dst, size_t n);
 
 /**
  * y = W x, for W of rows x cols in row-major order, stored as dtype. Uses
- * NEON or AVX2 with FMA when the CPU has them, else the scalar loop.
+ * NEON or AVX2 with FMA when the CPU has them, else the scalar loop. A block
+ * format's rows are widened a block at a time, then multiplied as float32
+ * rows are (AVX2), or by the scalar loop (elsewhere).
  */
 void vitna_matvec(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols);
 

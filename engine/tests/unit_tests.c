@@ -18,11 +18,13 @@
 #include "api.h"
 #include "crypto.h"
 #include "expert_stream.h"
+#include "gguf.h"
 #include "json.h"
 #include "jsonpfx.h"
 #include "kernels.h"
 #include "kv_cache.h"
 #include "ops.h"
+#include "quant.h"
 #include "safetensors.h"
 #include "sampler.h"
 #include "strbuf.h"
@@ -1214,7 +1216,236 @@ static void test_jsonpfx(void) {
     CHECK(disagree == 0, "3000 mutated objects: the prefix check and the parser agree (%d did not)", disagree);
 }
 
+/* --- ggml's block formats (quant.h) ---
+ *
+ * Each block is built here from the layout in quant.h's comment, written
+ * out independently of quant.c: chosen scales and integers packed into
+ * bytes, and the weights expected computed from them by the formula. */
+
+static void put_u16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+static void test_quant(void) {
+    /* float16 values exact in float32: 0.5, 0.25, 0.03125, -0.125 */
+    const uint16_t H_HALF = 0x3800, H_QUARTER = 0x3400, H_32TH = 0x2800, H_NEG_8TH = 0xB000;
+
+    /* Q8_0: d, then 32 int8. */
+    uint8_t q8[34];
+    put_u16(q8, H_NEG_8TH);
+    int8_t q8v[32];
+    for (int i = 0; i < 32; i++) { q8v[i] = (int8_t)(i * 9 - 128 + (i == 31 ? 127 - 151 : 0)); q8[2 + i] = (uint8_t)q8v[i]; }
+    float out[256];
+    vitna_dequant_q8_0(q8, out);
+    int bad = 0;
+    for (int i = 0; i < 32; i++) bad += out[i] != (float)q8v[i] * -0.125f;
+    CHECK(bad == 0, "Q8_0: w = q * d (%d of 32 differ)", bad);
+
+    /* Q4_K: d, dmin, 12 bytes of 6-bit scales and mins, 128 bytes of nibbles. */
+    uint8_t q4[144];
+    memset(q4, 0, sizeof(q4));
+    put_u16(q4, H_HALF);
+    put_u16(q4 + 2, H_QUARTER);
+    uint8_t sc[8], mn[8], q4v[256];
+    for (int j = 0; j < 8; j++) { sc[j] = (uint8_t)(7 * j + 5); mn[j] = (uint8_t)(63 - 6 * j); }
+    uint8_t* s = q4 + 4;
+    for (int j = 0; j < 4; j++) {
+        s[j] = (uint8_t)((sc[j] & 63) | ((sc[j + 4] >> 4) << 6));
+        s[j + 4] = (uint8_t)((mn[j] & 63) | ((mn[j + 4] >> 4) << 6));
+        s[j + 8] = (uint8_t)((sc[j + 4] & 0x0F) | ((mn[j + 4] & 0x0F) << 4));
+    }
+    for (int i = 0; i < 256; i++) {
+        q4v[i] = (uint8_t)((i * 7 + 3) & 0x0F);
+        const int g = i / 32, l = i % 32;
+        q4[16 + 32 * (g / 2) + l] |= (uint8_t)(q4v[i] << ((g & 1) ? 4 : 0));
+    }
+    vitna_dequant_q4_k(q4, out);
+    bad = 0;
+    for (int i = 0; i < 256; i++) {
+        const float d1 = 0.5f * (float)sc[i / 32], m1 = 0.25f * (float)mn[i / 32];
+        const float p = d1 * (float)q4v[i];
+        bad += out[i] != p - m1;
+    }
+    CHECK(bad == 0, "Q4_K: w = (d * scale) * q - (dmin * min), group by group (%d of 256 differ)", bad);
+
+    /* Q6_K: 128 bytes of low nibbles, 64 of high pairs, 16 int8 scales, d. */
+    uint8_t q6[210];
+    memset(q6, 0, sizeof(q6));
+    int8_t sc6[16];
+    int q6v[256];
+    for (int k = 0; k < 16; k++) { sc6[k] = (int8_t)(k * 11 - 80); q6[192 + k] = (uint8_t)sc6[k]; }
+    put_u16(q6 + 208, H_32TH);
+    for (int i = 0; i < 256; i++) {
+        const int q = (i * 37 + 11) % 64; /* 0..63 */
+        q6v[i] = q - 32;
+        const int h = i / 128, r = (i % 128) / 32, l = i % 32;
+        q6[64 * h + l + 32 * (r & 1)] |= (uint8_t)((q & 0x0F) << (4 * (r >> 1)));
+        q6[128 + 32 * h + l] |= (uint8_t)(((q >> 4) & 0x03) << (2 * r));
+    }
+    vitna_dequant_q6_k(q6, out);
+    bad = 0;
+    for (int i = 0; i < 256; i++) {
+        const float ds = 0.03125f * (float)sc6[i / 16];
+        bad += out[i] != ds * (float)q6v[i];
+    }
+    CHECK(bad == 0, "Q6_K: w = (d * scale) * (q - 32), sixteen at a time (%d of 256 differ)", bad);
+
+    /* Sizes, and blocks run together. */
+    CHECK(vitna_row_bytes(VITNA_DTYPE_Q8_0, 64) == 68 && vitna_row_bytes(VITNA_DTYPE_Q4_K, 512) == 288 &&
+          vitna_row_bytes(VITNA_DTYPE_Q6_K, 256) == 210 && vitna_row_bytes(VITNA_DTYPE_BF16, 3) == 6,
+          "row sizes are whole blocks");
+    CHECK(vitna_row_bytes(VITNA_DTYPE_Q4_K, 100) == 0 && vitna_row_bytes(VITNA_DTYPE_Q8_0, 33) == 0, "a row of part of a block has no size");
+    CHECK(vitna_dtype_size(VITNA_DTYPE_Q4_K) == 0 && strcmp(vitna_dtype_name(VITNA_DTYPE_Q6_K), "Q6_K") == 0, "a block format has no element size");
+    uint8_t two[288];
+    memcpy(two, q4, 144);
+    memcpy(two + 144, q4, 144);
+    float both[512];
+    vitna_to_f32(two, VITNA_DTYPE_Q4_K, both, 512);
+    vitna_dequant_q4_k(q4, out);
+    CHECK(memcmp(both, out, sizeof(out)) == 0 && memcmp(both + 256, out, sizeof(out)) == 0, "vitna_to_f32 widens block after block");
+
+    /* A matrix in a block format multiplies as its widened float32 rows do,
+     * bit for bit: the same products, added in the same order. */
+    enum { ROWS = 3, COLS = 512 };
+    uint8_t w[ROWS * 288];
+    float wf[ROWS * COLS], x[COLS], y_block[ROWS], y_f32[ROWS];
+    for (int r = 0; r < ROWS; r++) {
+        for (int b = 0; b < 2; b++) {
+            uint8_t* blk = w + r * 288 + b * 144;
+            memcpy(blk, q4, 144);
+            for (int i = 16; i < 144; i++) blk[i] = (uint8_t)rnd_u32();
+        }
+    }
+    vitna_to_f32(w, VITNA_DTYPE_Q4_K, wf, ROWS * COLS);
+    for (int i = 0; i < COLS; i++) x[i] = rnd_f(-1.0f, 1.0f);
+    vitna_matvec(w, VITNA_DTYPE_Q4_K, x, y_block, ROWS, COLS);
+    if (strcmp(vitna_matvec_path(), "neon") == 0) {
+        vitna_matvec_scalar(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+    } else {
+        vitna_matvec(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+    }
+    CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "Q4_K rows multiply as their widened float32 rows, bit for bit");
+    vitna_matvec_scalar(w, VITNA_DTYPE_Q4_K, x, y_block, ROWS, COLS);
+    vitna_matvec_scalar(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+    CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "and the scalar loop too");
+}
+
+/* --- GGUF (gguf.h) --- */
+
+typedef struct {
+    uint8_t* p;
+    size_t n, cap;
+} gbuf_t;
+
+static void g_put(gbuf_t* b, const void* src, size_t n) {
+    if (b->n + n > b->cap) {
+        b->cap = (b->n + n) * 2 + 64;
+        b->p = (uint8_t*)realloc(b->p, b->cap);
+    }
+    memcpy(b->p + b->n, src, n);
+    b->n += n;
+}
+static void g_u32(gbuf_t* b, uint32_t v) { uint8_t t[4]; for (int i = 0; i < 4; i++) t[i] = (uint8_t)(v >> (8 * i)); g_put(b, t, 4); }
+static void g_u64(gbuf_t* b, uint64_t v) { uint8_t t[8]; for (int i = 0; i < 8; i++) t[i] = (uint8_t)(v >> (8 * i)); g_put(b, t, 8); }
+static void g_str(gbuf_t* b, const char* s) { g_u64(b, strlen(s)); g_put(b, s, strlen(s)); }
+static void g_kv_str(gbuf_t* b, const char* k, const char* v) { g_str(b, k); g_u32(b, 8); g_str(b, v); }
+static void g_kv_u32(gbuf_t* b, const char* k, uint32_t v) { g_str(b, k); g_u32(b, 4); g_u32(b, v); }
+static void g_tensor(gbuf_t* b, const char* name, uint32_t n_dims, const uint64_t* ne, uint32_t type, uint64_t offset) {
+    g_str(b, name);
+    g_u32(b, n_dims);
+    for (uint32_t d = 0; d < n_dims; d++) g_u64(b, ne[d]);
+    g_u32(b, type);
+    g_u64(b, offset);
+}
+
+/* A small GGUF file: an embedding of 3 rows of Q8_0, a stack of 2 experts of
+ * 2 rows each, and a norm in F32, each at a multiple of 32 in the data. The
+ * first five arguments break it in one way each. */
+static size_t build_gguf(gbuf_t* b, const char* arch, uint32_t version, const char* extra_name, uint32_t emb_type, uint64_t norm_offset) {
+    b->n = 0;
+    g_u32(b, 0x46554747u);
+    g_u32(b, version);
+    g_u64(b, extra_name ? 4 : 3);
+    g_u64(b, 4);
+    g_kv_str(b, "general.architecture", arch);
+    g_kv_u32(b, "general.alignment", 32);
+    char key[64];
+    snprintf(key, sizeof(key), "%s.block_count", arch);
+    g_kv_u32(b, key, 1);
+    snprintf(key, sizeof(key), "%s.expert_count", arch);
+    g_kv_u32(b, key, 2);
+    const uint64_t emb[2] = { 32, 3 }, exps[3] = { 32, 2, 2 }, norm[1] = { 32 };
+    g_tensor(b, "token_embd.weight", 2, emb, emb_type, 0);
+    g_tensor(b, "blk.0.ffn_gate_exps.weight", 3, exps, 8, 128);
+    g_tensor(b, "blk.0.attn_norm.weight", 1, norm, 0, norm_offset);
+    if (extra_name) g_tensor(b, extra_name, 1, norm, 0, 288);
+    while (b->n % 32) g_put(b, "", 1);
+    const size_t data_start = b->n;
+    uint8_t data[448];
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)(i * 7);
+    g_put(b, data, sizeof(data));
+    return data_start;
+}
+
+static void test_gguf(void) {
+    const char* path = "vitna-unit-test.gguf";
+    gbuf_t b = { NULL, 0, 0 };
+    vitna_safetensors_t st;
+    vitna_gguf_info_t info;
+    char err[512];
+
+    const size_t data_start = build_gguf(&b, "olmoe", 3, NULL, 8, 288);
+    write_file(path, b.p, b.n);
+    bool ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
+    CHECK(ok, "a small GGUF file opens: %s", err);
+    if (ok) {
+        CHECK(strcmp(info.arch, "olmoe") == 0 && info.block_count == 1 && info.expert_count == 2 && info.alignment == 32,
+              "its metadata is read");
+        CHECK(st.tensor_count == 4 && info.file_tensors == 3, "a stack of 2 experts is listed as 2 tensors (%zu listed)", st.tensor_count);
+        const vitna_tensor_desc_t* e = vitna_safetensors_find(&st, "model.embed_tokens.weight");
+        CHECK(e && e->dtype == VITNA_DTYPE_Q8_0 && e->ndim == 2 && e->shape[0] == 3 && e->shape[1] == 32 &&
+              e->data_ptr == (const uint8_t*)st.mmap.data + data_start, "token_embd is the embedding, rows then columns, in place");
+        const vitna_tensor_desc_t* x1 = vitna_safetensors_find(&st, "model.layers.0.mlp.experts.1.gate_proj.weight");
+        CHECK(x1 && x1->shape[0] == 2 && x1->shape[1] == 32 &&
+              x1->data_ptr == (const uint8_t*)st.mmap.data + data_start + 128 + 2 * 34,
+              "expert 1 is its slice of the stack");
+        const vitna_tensor_desc_t* n = vitna_safetensors_find(&st, "model.layers.0.input_layernorm.weight");
+        CHECK(n && n->dtype == VITNA_DTYPE_F32 && n->ndim == 1 && n->shape[0] == 32, "attn_norm is the input norm");
+        vitna_safetensors_close(&st);
+    }
+
+    struct { const char* arch; uint32_t version; const char* extra; uint32_t emb_type; uint64_t norm_offset; const char* why; } bad[] = {
+        { "llama", 3, NULL, 8, 288, "permuted" },
+        { "olmoe", 1, NULL, 8, 288, "version" },
+        { "olmoe", 3, "blk.0.ffn_gate_shexp.weight", 8, 288, "knows where to put" },
+        { "olmoe", 3, NULL, 2, 288, "Q4_0" },
+        { "olmoe", 3, NULL, 8, 300, "alignment" },
+        { "olmoe", 3, NULL, 8, 448, "outside the data section" },
+        { "olmoe", 3, "blk.0.attn_norm.weight", 8, 288, "listed twice" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        build_gguf(&b, bad[i].arch, bad[i].version, bad[i].extra, bad[i].emb_type, bad[i].norm_offset);
+        write_file(path, b.p, b.n);
+        ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
+        CHECK(!ok && strstr(err, bad[i].why) != NULL, "refused (%s): got \"%s\"", bad[i].why, ok ? "opened" : err);
+        if (ok) vitna_safetensors_close(&st);
+    }
+    /* Cut short in the metadata, and not a GGUF file at all. */
+    build_gguf(&b, "olmoe", 3, NULL, 8, 288);
+    write_file(path, b.p, 100); /* inside the second metadata entry */
+    ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, "runs past") != NULL, "a file cut short in its metadata is refused: got \"%s\"", ok ? "opened" : err);
+    if (ok) vitna_safetensors_close(&st);
+    write_file(path, "GGML not this", 13);
+    ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, "not a GGUF") != NULL, "another file is refused: got \"%s\"", ok ? "opened" : err);
+    if (ok) vitna_safetensors_close(&st);
+    CHECK(vitna_gguf_path("a/b.GGUF") && !vitna_gguf_path("b.safetensors") && !vitna_gguf_path("gguf"), "a .gguf path is told apart");
+    free(b.p);
+    remove(path);
+}
+
 int main(void) {
+    test_quant();
+    test_gguf();
     test_expert_stream();
     test_api_helpers();
     test_jsonpfx();

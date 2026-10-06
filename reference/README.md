@@ -1,4 +1,4 @@
-# The reference (gates A1, A5 and A14)
+# The reference (gates A1, A5, A7 and A14)
 
 Gate A2 asks whether the engine computes what the model computes. This directory is the answer key. It pins one model, holds token ids and logits recorded from a pinned reference implementation, and says how close the engine has to come.
 
@@ -140,6 +140,72 @@ Step 2 runs OLMoE in the engine, on the CPU, and the same file compares it with 
 - Greedy decoding unpinned, token for token, up to the first decision where the engine's router goes another way than the reference's, which must be one the routing rule allows.
 
 How it was checked, and what it found, is in the [top-level README](../README.md#how-gate-a5s-forward-pass-was-checked).
+
+## Quantized weights (gate A7)
+
+Gate A7 asks whether the engine computes, from a GGUF file whose weights are quantized, what the model computes with those weights. A quantized file's weights are small integers times scales, so this answer key is gate A5's recording again, with every weight of the model replaced by the file's, widened to float32 by gguf-py, which is llama.cpp's own reference implementation of the block formats.
+
+### The files
+
+[`olmoe-1b-7b-gguf/model.json`](olmoe-1b-7b-gguf/model.json) pins two of the GGUF files OLMoE's authors publish, `allenai/OLMoE-1B-7B-0924-GGUF` at revision `70df85ed7132bf21b5acbcb33817f58e7d3cb949`, by size and SHA-256:
+
+| File | Size | Its matrices |
+|---|---|---|
+| `olmoe-1b-7b-0924-q8_0.gguf` | 7.4 GB | 114 in Q8_0, 8 bits |
+| `olmoe-1b-7b-0924-q4_k_m.gguf` | 4.2 GB | 97 in Q4_K, 4 bits, and 17 in Q6_K, 6 bits |
+
+In both, the router and the norms, 81 tensors, are float32. The tensors are written unpermuted, and each layer's experts are stacked in the checkpoint's order: Q8_0's widened query, key and expert rows lie within its rounding (0.4% of the largest weight) of the BF16 checkpoint's, where a permutation would move them by the whole weight. `config.json` and the tokenizer still come from A5's pin.
+
+```bash
+node scripts/fetch-model.mjs olmoe-1b-7b-gguf    # both files, 11.6 GB, each checked against the pin
+```
+
+### The recording
+
+[`record_gguf.py`](record_gguf.py) runs [`record_moe.py`](record_moe.py) unchanged, whose hash A5's fixture pins, after replacing its weight check with the replacement: every GGUF tensor maps to a place in the model, every parameter is written exactly once, and every value written reads back equal. The inputs are A5's, `olmoe-1b-7b/prompts.json`, and so are the settings and the software, with gguf pinned beside them:
+
+| | Version |
+|---|---|
+| gguf | 0.19.0 |
+
+Each fixture, `olmoe-1b-7b-gguf/fixture-q8_0.json` and `fixture-q4_k_m.json` (3.3 MB each), holds what A5's does except the tokenizer corpus, which is A5's, and adds two things:
+
+- `weights.sha256_f32`: the SHA-256 of every tensor widened to float32, little-endian and row-major in the checkpoint's shape, each layer's experts together under the name of their stack. The engine's `weights-sha256` command prints the same digests for its own widening, and the test requires them equal, all 195. So "the engine widens to the reference's bits" is checked, not argued.
+- `against_bf16`: what quantizing cost, measured against A5's fixture of the BF16 model (below). It is measured, not gated.
+
+```bash
+python reference/record_gguf.py --file olmoe-1b-7b-0924-q8_0.gguf            # write the fixture
+python reference/record_gguf.py --file olmoe-1b-7b-0924-q8_0.gguf --check    # record into memory and compare
+```
+
+Both fixtures were recorded on 2026-10-05 on an AMD Ryzen 7 3700X (Windows 11, x86-64) with Python 3.12.10: in 393 s and 560 s.
+
+### The tolerance
+
+A5's, unchanged: A1's table and the routing rule, applied to the logits and router logits the reference computes from the widened weights. The widening itself is held to more than the tolerance: bit for bit, by digest.
+
+### What quantizing cost
+
+Against A5's fixture of the BF16 model, on the same prompts. The KL divergence is from the BF16 model's distribution to the quantized one's, at each prompt's last position, where both fixtures keep all 50,304 logits. The top token is compared at all 242 prompt positions. Greedy decoding is compared token by token from each prompt, up to the first token that differs.
+
+| File | KL at the last position, mean of 6 | Top token agrees | Greedy tokens equal before the first difference |
+|---|---|---|---|
+| Q8_0 | 6.8e-4 | 240 of 242 | 177 of 192: one prompt departs at step 17, five never |
+| Q4_K_M | 1.9e-2 | 214 of 242 | 78 of 192: one prompt departs at its first token, one never |
+
+`python reference/record_gguf.py --file <file>` prints these figures, and each fixture keeps them under `against_bf16`.
+
+### The engine against it
+
+[`tests/reference-gguf.test.mjs`](../tests/reference-gguf.test.mjs) checks that each fixture matches its pins, its inputs and its recorders, and then runs the engine with `--weights <file.gguf>` on the CPU and compares it with each, as A5's tests compare the BF16 model:
+
+- Every tensor widened to the reference's bits, by digest.
+- Its logits with every position's experts pinned to the fixture's, under A1's table, and its own router under the routing rule.
+- Greedy decoding with the experts pinned, token for token.
+- Greedy decoding unpinned, token for token, up to the first decision where its router goes another way than the reference's, which must be one the rule allows.
+- The experts read from the drive into a cache of 128 MiB, giving the mapped run's logits and tokens byte for byte.
+
+The GPU does not compute with quantized weights yet, so these run on the CPU only.
 
 ## An embedding model (gate A14)
 

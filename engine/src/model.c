@@ -5,6 +5,7 @@
 
 #include "model.h"
 #include "expert_stream.h"
+#include "gguf.h"
 #include "json.h"
 #include "kernels.h"
 #include "ops.h"
@@ -143,10 +144,54 @@ static bool open_shard(vitna_llama_t* m, size_t i, const char* path, char* err, 
     return true;
 }
 
+/* Where a GGUF file's metadata and config.json describe different models,
+ * the first difference, else NULL. A value the file leaves out is not
+ * compared: the tensors' shapes are checked as they are bound anyway. */
+static const char* gguf_disagrees(const vitna_llama_config_t* c, const vitna_gguf_info_t* g) {
+    const size_t ffn = g->expert_feed_forward_length ? (size_t)g->expert_feed_forward_length : (size_t)g->feed_forward_length;
+    if (g->block_count && g->block_count != c->n_layers) return "the number of layers";
+    if (g->embedding_length && g->embedding_length != c->hidden) return "the hidden size";
+    if (ffn && ffn != c->intermediate) return "the MLP's width";
+    if (g->head_count && g->head_count != c->n_heads) return "the number of attention heads";
+    if (g->head_count_kv && g->head_count_kv != c->n_kv_heads) return "the number of key-value heads";
+    if (g->key_length && g->key_length != c->head_dim) return "the head size";
+    if (g->expert_count != c->n_experts) return "the number of experts";
+    if (g->expert_used_count != c->n_experts_used) return "the experts a token goes through";
+    if (g->rms_eps != 0.0 && (float)g->rms_eps != c->rms_eps) return "the RMSNorm epsilon";
+    if (g->rope_freq_base != 0.0 && (float)g->rope_freq_base != c->rope_theta) return "the rotary base";
+    return NULL;
+}
+
+/* Open the GGUF file at path as the checkpoint's one file. */
+static bool open_gguf(vitna_llama_t* m, const char* path, char* err, size_t err_len) {
+    m->shards = (vitna_safetensors_t*)calloc(1, sizeof(vitna_safetensors_t));
+    m->shard_paths = (char**)calloc(1, sizeof(char*));
+    if (!m->shards || !m->shard_paths) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    m->shard_paths[0] = (char*)malloc(strlen(path) + 1);
+    if (!m->shard_paths[0]) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
+    strcpy(m->shard_paths[0], path);
+    vitna_gguf_info_t info;
+    char g_err[512];
+    if (!vitna_gguf_open(path, &m->shards[0], &info, g_err, sizeof(g_err))) {
+        free(m->shard_paths[0]);
+        m->shard_paths[0] = NULL;
+        return fail(err, err_len, "%s%s", g_err, NULL);
+    }
+    m->n_shards = 1;
+    const char* differs = gguf_disagrees(&m->cfg, &info);
+    if (differs) return fail(err, err_len, "%s and config.json disagree on %s", path, differs);
+    return true;
+}
+
 /* Open dir's model.safetensors or, where there is none, every file its
  * model.safetensors.index.json names, and check that each tensor the index
- * lists is found in the file it names. */
-static bool open_checkpoint(vitna_llama_t* m, const char* dir, char* err, size_t err_len) {
+ * lists is found in the file it names. With weights, open that GGUF file
+ * instead. */
+static bool open_checkpoint(vitna_llama_t* m, const char* dir, const char* weights, char* err, size_t err_len) {
+    if (weights) {
+        if (!vitna_gguf_path(weights)) return fail(err, err_len, "--weights takes a .gguf file, and %s is not one%s", weights, NULL);
+        return open_gguf(m, weights, err, err_len);
+    }
     char path[1024];
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     FILE* single = fopen(path, "rb");
@@ -216,9 +261,14 @@ static bool bind(vitna_llama_t* m, vitna_matrix_t* out, const char* name, size_t
     if (!t) return fail(err, err_len, "the checkpoint has no tensor %s%s", name, NULL);
     bool shape_ok = (cols == 0) ? (t->ndim == 1 && t->shape[0] == rows) : (t->ndim == 2 && t->shape[0] == rows && t->shape[1] == cols);
     if (!shape_ok) return fail(err, err_len, "tensor %s has an unexpected shape%s", name, NULL);
-    if (t->dtype != VITNA_DTYPE_F32 && t->dtype != VITNA_DTYPE_BF16 && t->dtype != VITNA_DTYPE_F16) {
-        return fail(err, err_len, "tensor %s is %s; F32, BF16 or F16 is needed", name, vitna_dtype_name(t->dtype));
+    const bool plain = t->dtype == VITNA_DTYPE_F32 || t->dtype == VITNA_DTYPE_BF16 || t->dtype == VITNA_DTYPE_F16;
+    if (cols == 0 && !plain) {
+        return fail(err, err_len, "tensor %s is %s; a norm's weights must be F32, BF16 or F16", name, vitna_dtype_name(t->dtype));
     }
+    if (!plain && !(vitna_dtype_is_block(t->dtype) && vitna_row_bytes(t->dtype, cols))) {
+        return fail(err, err_len, "tensor %s is %s; F32, BF16, F16, Q8_0, Q4_K or Q6_K is needed", name, vitna_dtype_name(t->dtype));
+    }
+    if (!plain) m->quantized = true;
     out->data = t->data_ptr;
     out->dtype = t->dtype;
     out->rows = rows;
@@ -237,10 +287,15 @@ static float* norm_weights(vitna_llama_t* m, const char* name, size_t n, char* e
 }
 
 bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs, char* err, size_t err_len) {
+    return vitna_llama_load_ex(m, dir, NULL, ctx, seqs, err, err_len);
+}
+
+bool vitna_llama_load_ex(vitna_llama_t* m, const char* dir, const char* weights, size_t ctx, size_t seqs, char* err,
+                         size_t err_len) {
     memset(m, 0, sizeof(*m));
     if (!read_config(&m->cfg, dir, err, err_len)) return false;
     const vitna_llama_config_t* c = &m->cfg;
-    if (!open_checkpoint(m, dir, err, err_len)) {
+    if (!open_checkpoint(m, dir, weights, err, err_len)) {
         vitna_llama_free(m);
         return false;
     }
@@ -457,7 +512,7 @@ static bool locate(const vitna_llama_t* m, const vitna_matrix_t* w, vitna_extent
         if (p >= base && p < base + m->shards[i].mmap.size) {
             out->file = (uint32_t)i;
             out->offset = (uint64_t)(p - base);
-            out->length = (uint64_t)w->rows * w->cols * vitna_dtype_size(w->dtype);
+            out->length = (uint64_t)w->rows * vitna_row_bytes(w->dtype, w->cols);
             return true;
         }
     }
@@ -786,8 +841,8 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
     const float scale = 1.0f / sqrtf((float)hd);
 
     /* The token's embedding row, widened to float32. */
-    const size_t esize = vitna_dtype_size(m->embed.dtype);
-    vitna_to_f32((const char*)m->embed.data + (size_t)token * H * esize, m->embed.dtype, m->x, H);
+    const size_t row_bytes = (size_t)vitna_row_bytes(m->embed.dtype, H);
+    vitna_to_f32((const char*)m->embed.data + (size_t)token * row_bytes, m->embed.dtype, m->x, H);
     /* Streamed experts: the first layer's guess, read while its attention runs. */
     if (m->stream) prefetch_layer(m, 0);
 
@@ -1124,6 +1179,9 @@ static bool rope_tables(const vitna_llama_t* m, float** cos_out, float** sin_out
 bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len) {
 #if defined(VITNA_CUDA)
     if (m->cuda) return true;
+    if (m->quantized) {
+        return fail(err, err_len, "the GPU does not compute with quantized weights yet; run this checkpoint on the CPU%s%s", NULL, NULL);
+    }
     if (m->cfg.n_experts && !m->pred_logits) {
         /* The lookahead's logits, which the GPU computes with the router's. */
         m->pred_logits = (float*)malloc(m->cfg.n_experts * sizeof(float));
