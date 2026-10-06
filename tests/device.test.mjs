@@ -110,6 +110,23 @@ test("--gpu-kv-layers is refused without --device cuda, and when it is not a cou
   }
 });
 
+test("--precision is refused without --device cuda for fast, and when it is neither exact nor fast, before anything is loaded", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
+  try {
+    const base = ["logits", "--model", join(dir, "no-model"), "--ids", "1", "--out", join(dir, "logits.f32")];
+    let r = run([...base, "--precision", "fast"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--precision fast needs --device cuda/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+    r = run([...base, "--device", "cuda", "--precision", "half"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--precision is exact or fast, not half/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("--ids-file and --prompt-file naming no file are refused, before anything is loaded", { skip }, () => {
   const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
   try {

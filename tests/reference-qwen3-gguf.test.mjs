@@ -286,6 +286,49 @@ for (const { file, quant, path } of FIXTURES) {
     });
   }
 
+  // --precision fast (the owner's decision of 2026-10-06, docs/PARITY.md): a
+  // prompt's chunk runs through the tensor cores, its inputs rounded to
+  // float16, so it is measured against the reference as quantization was,
+  // not held to it: KL at each prompt's last position, the top token at
+  // every position, greedy tokens until the first that differs. The bounds
+  // asserted are far looser than what it measures and catch a broken path,
+  // not a drift. VITNA_TEST_FAST_ROWS=2 gives the fixture's short prompts
+  // that path; decoding a token at a time stays exact.
+  if (quant === "q4_k_m") {
+    test(`${quant}: on the GPU, --precision fast measured against the reference as quantization was`, ON_GPU, async (t) => {
+      const fast = { VITNA_TEST_FAST_ROWS: "2" };
+      const V = fixture.model.vocab_size;
+      const results = await eachPrompt("vitna-qwen3-gguf-fast-", async (p, f) => {
+        await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", f("logits"), ...RUN, "--precision", "fast"], fast);
+        const out = await runEngine(["generate", ...WEIGHTS, "--ids", p.ids.join(","), "--max-new", String(p.greedy_ids.length), "--greedy", ...RUN,
+          "--precision", "fast"], fast);
+        const L = readF32(f("logits"));
+        let top = 0;
+        for (let i = 0; i < p.ids.length; i++) {
+          let best = 0;
+          for (let v = 1; v < V; v++) if (L[i * V + v] > L[i * V + best]) best = v;
+          if (best === p.positions[i].top[0][0]) top++;
+        }
+        const last = L.subarray((p.ids.length - 1) * V, p.ids.length * V);
+        const lse = (row) => { let m = -Infinity; for (const v of row) m = Math.max(m, v); let s = 0; for (const v of row) s += Math.exp(v - m); return m + Math.log(s); };
+        const lr = lse(p.lastLogits), le = lse(last);
+        let kl = 0;
+        for (let v = 0; v < V; v++) { const a = p.lastLogits[v] - lr; kl += Math.exp(a) * (a - (last[v] - le)); }
+        const ids = JSON.parse(out).ids;
+        let same = 0;
+        while (same < ids.length && ids[same] === p.greedy_ids[same]) same++;
+        return { p, kl, top, same };
+      });
+      const positions = fixture.prompts.reduce((a, p) => a + p.ids.length, 0);
+      const top = results.reduce((a, r) => a + r.top, 0);
+      const kl = results.reduce((a, r) => a + r.kl, 0) / results.length;
+      const same = results.reduce((a, r) => a + r.same, 0);
+      assert.ok(Number.isFinite(kl) && kl < 1e-2, `KL at the last position, mean ${kl}`);
+      assert.ok(top >= 0.95 * positions, `the top token agrees at only ${top} of ${positions} positions`);
+      t.diagnostic(`on ${where}, against the reference: KL at the last position, mean of ${results.length}, ${kl.toExponential(2)}; the top token agrees at ${top} of ${positions} positions; greedy tokens equal before the first difference, ${same} of ${results.length * fixture.prompts[0].greedy_ids.length}`);
+    });
+  }
+
   // Gate A8 on this model: with --cpu-experts, the experts the device lacks
   // are shared between the CPU, in the GPU's arithmetic, and copies to it,
   // and the logits must be the GPU alone's, byte for byte. Through 1 GiB of

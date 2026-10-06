@@ -97,6 +97,22 @@ test("a short prompt's logits are the same, byte for byte, with every layer's ca
   });
 });
 
+test("with --precision fast, a prompt's logits are the same, byte for byte, wherever the cache is", ON_GPU, async (t) => {
+  await withDir("vitna-long-fast-", async (at) => {
+    const ids = (await textIds()).slice(0, 2000);
+    writeFileSync(at("ids"), ids.join(","));
+    const files = [];
+    for (const [name, extra] of [["gpu", []], ["host", ["--gpu-kv-layers", "0"]]]) {
+      const { out } = await runEngine(["generate", ...WEIGHTS, "--ids-file", at("ids"), "--ctx", "2048", "--max-new", "8", "--greedy",
+        "--precision", "fast", "--logits-out", at(name), ...extra]);
+      files.push([name, JSON.parse(out).ids, readFileSync(at(name))]);
+    }
+    assert.deepEqual(files[1][1], files[0][1], "with no layer's cache on the GPU, it chose other tokens");
+    assert.ok(files[0][2].length > 0 && files[1][2].equals(files[0][2]), "with no layer's cache on the GPU, the logits differ");
+    t.diagnostic("2,000 positions in --precision fast: 8 greedy tokens and their logits equal, byte for byte, with no layer's cache on the GPU");
+  });
+});
+
 test("a prompt past 1,024 positions: 8 greedy tokens and their logits are the same, byte for byte, wherever the cache is, and as rows or a token at a time", ON_GPU, async (t) => {
   await withDir("vitna-long-4k-", async (at) => {
     const ids = (await textIds()).slice(0, 2000);
