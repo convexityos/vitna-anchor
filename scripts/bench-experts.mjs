@@ -3,9 +3,13 @@
 // at several sizes of the expert cache, and print the machine, the drive and
 // the command with the results.
 //
-//   node scripts/bench-experts.mjs [--engine <path>] [--model <dir>] [--prompt <text>]
+//   node scripts/bench-experts.mjs [--engine <path>] [--model <dir>] [--weights <file.gguf>] [--prompt <text>]
 //                                  [--tokens <n>] [--runs <n>] [--caches <MiB,MiB,...>] [--no-mapped]
 //                                  [--device cpu|cuda] [--gpu-caches <MiB|default,...>]
+//
+// --weights reads the weights from a GGUF file, which may be quantized, as
+// the engine's own --weights does; the drive named is then that file's.
+// --caches none times the mapped run alone.
 //
 // Each run is one `generate --greedy --timing --expert-cache <MiB>`, which
 // times the tokens after the first new one inside the engine. The expert
@@ -39,11 +43,13 @@ function option(name, fallback) {
   const i = process.argv.indexOf(name);
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
 }
-const list = (s) => (s ? s.split(",").filter(Boolean) : []);
+/* "none" for an empty list, which PowerShell 5.1 cannot pass as "". */
+const list = (s) => (s && s !== "none" ? s.split(",").filter(Boolean) : []);
 
 const device = option("--device", "cpu");
 const gpu = device === "cuda";
 const model = resolve(option("--model", join(ROOT, "models", "olmoe-1b-7b")));
+const weights = option("--weights", "") ? resolve(option("--weights", "")) : "";
 const prompt = option("--prompt", "The capital of France is");
 const tokens = Number(option("--tokens", "64"));
 const runs = Number(option("--runs", "3"));
@@ -66,8 +72,8 @@ if (!Number.isInteger(tokens) || tokens < 2 || !Number.isInteger(runs) || runs <
 if (caches.some((c) => !Number.isInteger(c) || c < 1)) throw new Error("--caches is a list of sizes in MiB");
 if (gpu && gpuCaches.some((c) => !Number.isInteger(c) || c < 0)) throw new Error("--gpu-caches is a list of sizes in MiB, or default");
 
-const base = ["generate", "--model", model, "--prompt", prompt, "--max-new", String(tokens), "--greedy", "--timing", "--ctx", "512",
-  ...(gpu ? ["--device", "cuda"] : [])];
+const base = ["generate", "--model", model, ...(weights ? ["--weights", weights] : []), "--prompt", prompt, "--max-new", String(tokens),
+  "--greedy", "--timing", "--ctx", "512", ...(gpu ? ["--device", "cuda"] : [])];
 
 const num = (s) => Number(s);
 function once(cache, gpuCache) {
@@ -115,20 +121,21 @@ function once(cache, gpuCache) {
 const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 const medianRun = (r) => r.find((x) => x.ms === median(r.map((y) => y.ms)));
 
-/* The drive the model is on, as the operating system names it. */
+/* The drive the weights are on, as the operating system names it. */
 function drive() {
+  const at = weights || model;
   if (process.platform === "win32") {
-    const letter = model[0];
+    const letter = at[0];
     const ps = `$d = Get-Partition -DriveLetter ${letter} | Get-Disk; "$($d.FriendlyName), $($d.BusType)"`;
     const r = spawnSync("powershell.exe", ["-NoProfile", "-Command", ps], { encoding: "utf8" });
     return r.status === 0 && r.stdout.trim() ? `${r.stdout.trim()} (${letter}:)` : "unknown";
   }
-  const src = spawnSync("findmnt", ["-no", "SOURCE", "--target", model], { encoding: "utf8" });
+  const src = spawnSync("findmnt", ["-no", "SOURCE", "--target", at], { encoding: "utf8" });
   if (src.status === 0 && src.stdout.trim()) {
     const m = spawnSync("lsblk", ["-no", "MODEL,TRAN", src.stdout.trim()], { encoding: "utf8" });
     return `${src.stdout.trim()}${m.status === 0 && m.stdout.trim() ? `, ${m.stdout.trim().split("\n")[0]}` : ""}`;
   }
-  const df = spawnSync("df", [model], { encoding: "utf8" });
+  const df = spawnSync("df", [at], { encoding: "utf8" });
   return df.status === 0 ? df.stdout.trim().split("\n").pop().split(/\s+/)[0] : "unknown";
 }
 

@@ -13,8 +13,12 @@
 // They need the engine, the model directory of gate A5 (for config.json and
 // the tokenizer) and the GGUF files (node scripts/fetch-model.mjs
 // olmoe-1b-7b-gguf). Without them they are skipped, with the reason, unless
-// VITNA_REQUIRE_GGUF=1, where they fail. They run on the CPU: the GPU does not
-// compute with quantized weights yet, and an engine asked to says so and stops.
+// VITNA_REQUIRE_GGUF=1, where they fail. They run on the CPU, or with
+// VITNA_DEVICE=cuda on the GPU, for an engine built with the CUDA path, where
+// the digests are of the GPU's widening, read every way its kernels read
+// weights; two more run only there, as A5's do. On a GPU they run only with
+// VITNA_REQUIRE_GGUF=1 and this file alone, since each engine takes what the
+// device has free for its experts.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -97,7 +101,7 @@ for (const { file, quant, path } of FIXTURES) {
   });
 
   // ---------------------------------------------------------------------------
-  // The engine against the fixture, on the CPU.
+  // The engine against the fixture, on the device VITNA_DEVICE names.
 
   const EXE = process.platform === "win32" ? ".exe" : "";
   const engine = [
@@ -108,18 +112,24 @@ for (const { file, quant, path } of FIXTURES) {
   ].filter(Boolean).find((p) => existsSync(p));
   const modelDir = process.env.ANCHOR_MOE_MODEL_DIR || here("../models/olmoe-1b-7b/");
   const ggufPath = join(process.env.ANCHOR_GGUF_DIR || here("../models/olmoe-1b-7b-gguf/"), file);
+  const DEVICE = process.env.VITNA_DEVICE ?? "";
+  assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
+  const GPU = DEVICE === "cuda";
+  const onDevice = DEVICE ? ["--device", DEVICE] : [];
   const needs = process.env.VITNA_REQUIRE_GGUF === "1" ? false
-    : process.env.VITNA_DEVICE === "cuda" ? "the GPU does not compute with quantized weights yet"
+    : GPU ? "on a GPU these run only with VITNA_REQUIRE_GGUF=1, and this file alone: each engine takes what the GPU has free"
     : !engine ? "no built engine found"
     : !existsSync(join(modelDir, "config.json")) ? `no config.json in ${modelDir}; run node scripts/fetch-model.mjs olmoe-1b-7b`
     : !existsSync(ggufPath) ? `no ${ggufPath}; run node scripts/fetch-model.mjs olmoe-1b-7b-gguf`
     : false;
   const ENGINE = { skip: needs };
+  const ON_GPU = { skip: needs || (!GPU && "VITNA_DEVICE is not cuda") };
   const WEIGHTS = ["--model", modelDir, "--weights", ggufPath];
-  const RUN = ["--ctx", "512"];
+  const RUN = ["--ctx", "512", ...onDevice];
+  const where = DEVICE || "cpu";
 
-  const runEngine = (args) => new Promise((resolve, reject) => {
-    const child = spawn(engine, args);
+  const runEngine = (args, env = {}) => new Promise((resolve, reject) => {
+    const child = spawn(engine, args, { env: { ...process.env, ...env } });
     let out = "";
     let err = "";
     child.stdout.setEncoding("utf8").on("data", (d) => (out += d));
@@ -145,23 +155,31 @@ for (const { file, quant, path } of FIXTURES) {
     return null;
   };
   // The CPU path computes on one thread, so the prompts run side by side, each
-  // in an engine of its own over the same mapped file.
+  // in an engine of its own over the same mapped file. On a GPU they run one
+  // after another, since each engine's expert cache takes what the device has free.
   const eachPrompt = async (prefix, run) => {
     const dir = mkdtempSync(join(tmpdir(), prefix));
+    const at = (p) => (s) => join(dir, `${p.id}.${s}`);
     try {
-      return await Promise.all(fixture.prompts.map((p) => run(p, (s) => join(dir, `${p.id}.${s}`))));
+      if (!GPU) return await Promise.all(fixture.prompts.map((p) => run(p, at(p))));
+      const results = [];
+      for (const p of fixture.prompts) results.push(await run(p, at(p)));
+      return results;
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   };
 
+  // On a GPU the digests are of the GPU's widening, which weights-sha256
+  // --device cuda reads three ways, as the projections, a prompt's matrix
+  // product and the embedding read weights, and refuses unless all three agree.
   test(`${quant}: the engine widens every tensor to the bits the reference was recorded on`, ENGINE, async (t) => {
-    const mine = JSON.parse(await runEngine(["weights-sha256", ...WEIGHTS]));
+    const mine = JSON.parse(await runEngine(["weights-sha256", ...WEIGHTS, ...onDevice]));
     const want = fixture.weights.sha256_f32;
     const differ = Object.keys(want).filter((k) => mine[k] !== want[k]);
     assert.deepEqual(Object.keys(mine).sort(), Object.keys(want).sort(), "the engine lists other tensors than the reference");
     assert.deepEqual(differ, [], `${differ.length} tensors widen to other bits`);
-    t.diagnostic(`all ${Object.keys(want).length} tensors, ${Object.entries(fixture.weights.tensor_types).map(([k, v]) => `${v} ${k}`).join(", ")} in the file, widen to gguf-py's bits`);
+    t.diagnostic(`on ${where}, all ${Object.keys(want).length} tensors, ${Object.entries(fixture.weights.tensor_types).map(([k, v]) => `${v} ${k}`).join(", ")} in the file, widen to gguf-py's bits`);
   });
 
   test(`${quant}: with its routing pinned, the engine's logits match the reference within the tolerance, and its router chooses as the rule allows`, ENGINE, async (t) => {
@@ -184,7 +202,7 @@ for (const { file, quant, path } of FIXTURES) {
     const worst = (k, w) => Math.max(...results.map((r) => r[k].worst[w]));
     const decisions = fixture.prompts.reduce((a, p) => a + p.ids.length * LAYERS, 0);
     const departed = results.filter((r) => r.departure).map((r) => `${r.p.id} position ${r.departure[0]} layer ${r.departure[1]}`);
-    t.diagnostic(`largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
+    t.diagnostic(`on ${where}, largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
     t.diagnostic(departed.length ? `the router first chose other experts than the reference at ${departed.join("; ")}` : `the router chose the reference's experts in all ${decisions} decisions`);
   });
 
@@ -207,7 +225,7 @@ for (const { file, quant, path } of FIXTURES) {
       assert.deepEqual(r.routing.failures.slice(0, 10), [], r.p.id);
     }
     const tokens = results.reduce((a, r) => a + r.tokens, 0);
-    t.diagnostic(`${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${Math.max(...results.map((r) => r.greedy.worst.logit)).toExponential(2)}`);
+    t.diagnostic(`on ${where}, ${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${Math.max(...results.map((r) => r.greedy.worst.logit)).toExponential(2)}`);
   });
 
   test(`${quant}: unpinned, the engine decodes the reference's tokens until its routing departs at a near-tie, if it ever does`, ENGINE, async (t) => {
@@ -235,31 +253,99 @@ for (const { file, quant, path } of FIXTURES) {
       assert.deepEqual(result.failures.slice(0, 10), [], p.id);
       if (steps === p.greedy.length) assert.deepEqual(ids, p.greedy_ids, p.id);
     }
-    t.diagnostic(notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`);
+    t.diagnostic(`on ${where}, ` + (notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`));
   });
+
+  // Run capital (and code, given more prompts) under each of configs, [name,
+  // extra arguments]: 16 greedy tokens with their logits, and every
+  // position's logits. Every run must give the first's tokens, and its
+  // logits byte for byte. On the CPU a prompt's runs go side by side; on a
+  // GPU one after another.
+  const sameEverywhere = async (configs, ids = ["capital"]) => {
+    const prompts = fixture.prompts.filter((p) => ids.includes(p.id));
+    const dir = mkdtempSync(join(tmpdir(), "vitna-gguf-same-"));
+    try {
+      for (const p of prompts) {
+        const run = async ([name, extra]) => {
+          const out = await runEngine(["generate", ...WEIGHTS, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
+            "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
+          await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra]);
+          return JSON.parse(out).ids;
+        };
+        const tokens = [];
+        if (GPU) for (const c of configs) tokens.push(await run(c));
+        else tokens.push(...(await Promise.all(configs.map(run))));
+        const [first] = configs;
+        for (const [i, [name]] of configs.entries()) {
+          assert.deepEqual(tokens[i], tokens[0], `${p.id}: ${name} chose other tokens than ${first[0]}`);
+          for (const kind of ["logits", "greedy"]) {
+            const a = readFileSync(join(dir, `${p.id}.${first[0]}.${kind}`));
+            const b = readFileSync(join(dir, `${p.id}.${name}.${kind}`));
+            assert.ok(a.length > 0 && a.equals(b), `${p.id} ${kind}: the ${name} run's ${b.length} bytes are not the ${first[0]} run's ${a.length}`);
+          }
+        }
+      }
+      return prompts.map((p) => p.id).join(" and ");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
 
   // Gate A5's step 3 again, for a quantized file: the experts read from the
   // drive into a cache far smaller than they are must give the mapped run's
   // logits bit for bit. A quantized expert's extent is whole rows of blocks,
   // and need not start on a sector.
   test(`${quant}: read from the drive into a small cache, the experts give the mapped run's logits and tokens, bit for bit`, ENGINE, async (t) => {
-    const p = fixture.prompts.find((x) => x.id === "capital");
-    const dir = mkdtempSync(join(tmpdir(), "vitna-gguf-same-"));
+    const which = await sameEverywhere([["mapped", []], ["streamed", ["--expert-cache", "128"]]]);
+    t.diagnostic(`on ${where}, ${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte, read through a cache of 128 MiB`);
+  });
+
+  // As A5's: on a GPU an expert's arithmetic does not depend on which slot
+  // holds it, when it was copied there or from where. Here a layer's down
+  // projections may be in another format than the next layer's, so a slot
+  // holds experts of different sizes as layers come and go.
+  test(`${quant}: on the GPU, an expert cache of any size, fed from either place, gives the same logits and tokens, bit for bit`, ON_GPU, async (t) => {
+    const which = await sameEverywhere([
+      ["default", []],
+      ["small", ["--gpu-expert-cache", "256"]],
+      ["both-small", ["--gpu-expert-cache", "256", "--expert-cache", "256"]],
+    ], ["capital", "code"]);
+    t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte with the GPU's expert cache as large as the device allows, at 256 MiB, and at 256 MiB fed from a cache of 256 MiB in memory`);
+  });
+
+  // As A5's: tokens run together as rows (a prompt's, and drafted tokens with
+  // --speculate) give a token at a time's logits, byte for byte.
+  test(`${quant}: on the GPU, tokens run together as rows give a token at a time's logits and tokens, byte for byte`, ON_GPU, async (t) => {
+    const alone = { VITNA_TEST_NO_ROWS: "1" };
+    const dir = mkdtempSync(join(tmpdir(), "vitna-gguf-rows-"));
     try {
-      const run = async (name, extra) => {
-        const out = await runEngine(["generate", ...WEIGHTS, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
-          "--logits-out", join(dir, `${name}.greedy`), ...extra]);
-        await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", join(dir, `${name}.logits`), ...RUN, ...extra]);
-        return JSON.parse(out).ids;
+      const same = (a, b, what) => {
+        const x = readFileSync(join(dir, a));
+        const y = readFileSync(join(dir, b));
+        assert.ok(x.length > 0 && x.equals(y), `${what}: rows gave ${x.length} bytes unlike a token at a time's ${y.length}`);
       };
-      const [mapped, streamed] = await Promise.all([run("mapped", []), run("streamed", ["--expert-cache", "128"])]);
-      assert.deepEqual(streamed, mapped);
-      for (const kind of ["logits", "greedy"]) {
-        const a = readFileSync(join(dir, `mapped.${kind}`));
-        const b = readFileSync(join(dir, `streamed.${kind}`));
-        assert.ok(a.length > 0 && a.equals(b), `${kind}: the streamed run's bytes are not the mapped run's`);
+      const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
+      for (const p of prompts) {
+        for (const [name, env] of [["rows", {}], ["alone", alone]]) {
+          await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN], env);
+        }
+        const greedy = (name, extra, env) =>
+          runEngine(["generate", ...WEIGHTS, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
+            "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra], env);
+        const drafted = JSON.parse(await greedy("rows", ["--speculate", "4"], {})).ids;
+        const stepped = JSON.parse(await greedy("alone", [], alone)).ids;
+        assert.deepEqual(drafted, stepped, p.id);
+        same(`${p.id}.rows.logits`, `${p.id}.alone.logits`, `${p.id}, every position's logits`);
+        same(`${p.id}.rows.greedy`, `${p.id}.alone.greedy`, `${p.id}, 16 greedy tokens drafted 4 at a time`);
       }
-      t.diagnostic(`${p.id}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte, read through a cache of 128 MiB`);
+      // The longest prompt, through a cache too small to hold a layer's experts for it at once.
+      const longest = fixture.prompts.reduce((a, b) => (b.ids.length > a.ids.length ? b : a));
+      for (const [name, env] of [["rows", {}], ["alone", alone]]) {
+        await runEngine(["logits", ...WEIGHTS, "--ids", longest.ids.join(","), "--out", join(dir, `small.${name}.logits`), ...RUN,
+          "--gpu-expert-cache", "256"], env);
+      }
+      same("small.rows.logits", "small.alone.logits", `${longest.id} through a cache of 256 MiB`);
+      t.diagnostic(`${prompts.map((p) => p.id).join(" and ")}: every position's logits, and 16 greedy tokens drafted 4 at a time, equal a token at a time's byte for byte; ${longest.id}'s ${longest.ids.length} positions too, through a cache of 256 MiB`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
