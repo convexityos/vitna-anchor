@@ -52,6 +52,8 @@ foreach(target vitna-anchor vitna-anchor-tests)
 
     if(MSVC)
         target_compile_options(${target} PRIVATE /W3 /O2)
+        # A UTF-8 program, for paths with any letters in them: the manifest says how.
+        target_sources(${target} PRIVATE windows/utf8.manifest)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -O3)
     endif()

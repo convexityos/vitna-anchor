@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The engine is a UTF-8 program on Windows 10 version 1903 and later: its
+     process code page is UTF-8, so a path with any letters in it, as a user's
+     name often has, reaches fopen, CreateFileA and the other narrow file
+     functions whole, and what the engine prints of it is UTF-8. Without it a
+     letter outside the ANSI code page arrives as a question mark. The CMake
+     build embeds it with MSVC (CMakeLists.txt). -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

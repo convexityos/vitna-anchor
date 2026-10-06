@@ -3307,6 +3307,25 @@ bool vitna_cuda_probe(char* err, size_t err_len) {
     return true;
 }
 
+int vitna_cuda_devices(vitna_cuda_device_t* out, int max) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) return 0;
+    int n = 0;
+    for (int i = 0; i < count && n < max; i++) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, i) != cudaSuccess) continue;
+        vitna_cuda_device_t* d = &out[n++];
+        snprintf(d->name, sizeof(d->name), "%s", p.name);
+        d->total_bytes = p.totalGlobalMem;
+        d->major = p.major;
+        d->minor = p.minor;
+        /* What is free needs a context on the device, which asking makes. */
+        size_t free_b = 0, total_b = 0;
+        d->free_bytes = cudaSetDevice(i) == cudaSuccess && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? free_b : 0;
+    }
+    return n;
+}
+
 /* The expert cache's part of vitna_cuda_free: the copies finished and their
  * sources released to the expert stream, which the model closes after
  * this, and the memory registered for them unregistered. */
