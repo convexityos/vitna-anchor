@@ -265,6 +265,32 @@ Against the BF16 fixture, on the same prompts, measured as for A7. The KL diverg
 
 [`tests/reference-qwen3.test.mjs`](../tests/reference-qwen3.test.mjs) checks the BF16 fixture against its pin, its inputs and its recorders, that its routing is complete, that each greedy token is the largest logit at its step, and that the comparison accepts the fixture's own logits and rejects wrong ones. Then it runs the engine and compares it with the fixture as A5's tests do: its tokenizer on all 86 strings, its logits and routing with the experts pinned, and greedy decoding pinned and unpinned. [`tests/reference-qwen3-gguf.test.mjs`](../tests/reference-qwen3-gguf.test.mjs) does the same for each GGUF fixture with `--weights`, every tensor's widening by digest first, and on a GPU gate A8 on this model: through 1 GiB of the device, with `--cpu-experts`, the logits are the GPU alone's, byte for byte. The model's comparisons run only with `VITNA_REQUIRE_QWEN3=1` or `VITNA_REQUIRE_QWEN3_GGUF=1`, since they take most of an hour and of the machine's memory; CI fetches the tokenizer alone and requires it to match (`VITNA_REQUIRE_QWEN3_TOKENIZER=1`).
 
+## Conversations and API shapes (gate A11)
+
+Gate A11 serves Anthropic's Messages and OpenAI's Responses beside chat completions. Two things hold it: the text a conversation becomes, and what clients send.
+
+### Qwen3's chat template
+
+The model was trained on its chat template's rendering of a conversation, so the engine, which writes the prompt itself in C (`engine/src/chat.c`), must write the same text. [`record_chat_template.py`](record_chat_template.py) renders each conversation in [`qwen3-30b-a3b/chat-cases.json`](qwen3-30b-a3b/chat-cases.json) through the template in the pinned `tokenizer_config.json`, with transformers' own renderer (`render_jinja_template`, which `apply_chat_template` calls), and writes [`qwen3-30b-a3b/chat-template.json`](qwen3-30b-a3b/chat-template.json): each case's request, in JSON as Python writes it, and the prompt it renders to. It refuses to run with a transformers other than 5.17.0 or a Jinja2 other than 3.1.6, which could render differently, or on a `tokenizer_config.json` other than the pinned one. `tests/chat-template.test.mjs` sends each request to the engine's `chat-prompt` command and requires the same prompt, byte for byte, in CI.
+
+The 13 conversations: a plain one, a user's message alone, thinking switched off, several turns, an assistant's reasoning kept and dropped, tools with a system prompt and without, a call whose arguments are a string and one whose arguments are an object, calls in parallel, several steps of calls and results, numbers as Python writes them, and empty contents with nested arguments. Recorded on 2026-10-06 with Python 3.12.10.
+
+```bash
+python reference/record_chat_template.py           # write the fixture
+python reference/record_chat_template.py --check   # render again and compare with the committed fixture
+```
+
+### What Claude Code and Codex send
+
+[`api-shapes/`](api-shapes/) holds every request Claude Code 2.1.283 and Codex 0.160.0 sent to the server in gate A11's sessions ([README](../README.md#how-gate-a11-was-checked)), a file for each. [`scripts/record-api-requests.mjs`](../scripts/record-api-requests.mjs) recorded them: a proxy that forwards each request and writes it down with its body and only the headers that describe the API, never a key or a token. [`scripts/api-shapes.mjs`](../scripts/api-shapes.mjs) made the files from its log. Every string longer than 32 characters became its length, so the clients' prompts and tool descriptions, which are their vendors' text, and the files they read are not copied here; and Anthropic's `metadata` and Codex's `client_metadata` and `prompt_cache_key`, which identify a machine or a session, were dropped. What stays is the shape: roles, block and item types, tool and property names, schemas, ids, and the parameters and betas each client sent. `tests/api-surface.test.mjs` puts every request through its API's token counter in CI, and with `VITNA_REPLAY_SHAPES=1` answers each through the model.
+
+To record another version of either client:
+
+```bash
+node scripts/record-api-requests.mjs 8772 8765 log.jsonl     # then point the client at port 8772, with a placeholder key
+node scripts/api-shapes.mjs log.jsonl claude-code <version> > reference/api-shapes/claude-code-<version>.json
+```
+
 ## An embedding model (gate A14)
 
 Gate A14 has the engine produce text embeddings, which a search index stores and compares, and serve them at `/v1/embeddings`. It starts as A1 did: one model pinned, and a recording to hold the engine to.

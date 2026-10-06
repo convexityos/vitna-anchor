@@ -24,7 +24,7 @@ Its quality is measured statistically against an FP16 path (KL divergence, top-1
 
 ## Where Anchor stands
 
-As of 2026-10-06 gates A7 to A10 have passed, and the README's table says what each showed. When this was written: two models, SmolLM2-135M and OLMoE-1B-7B, in float32 over their published weights, on a CPU or an NVIDIA GPU, matched to a pinned reference. Results are the same bit for bit however the experts are cached or read, under speculation and with requests running together. OLMoE on the RTX 3070 here decodes 61 tokens a second from memory and 8.7 with its experts read off the drive.
+As of 2026-10-06 gates A7 to A11 have passed, and the README's table says what each showed. When this was written: two models, SmolLM2-135M and OLMoE-1B-7B, in float32 over their published weights, on a CPU or an NVIDIA GPU, matched to a pinned reference. Results are the same bit for bit however the experts are cached or read, under speculation and with requests running together. OLMoE on the RTX 3070 here decodes 61 tokens a second from memory and 8.7 with its experts read off the drive.
 
 ## Decisions, 2026-10-05
 
