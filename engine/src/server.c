@@ -343,7 +343,9 @@ int vitna_server_run(const vitna_server_config_t* config) {
     }
 
     printf("vitna-anchor listening on http://%s:%u\n", bind_ip, port);
-    if (api && vitna_api_parallel(api) > 1) {
+    if (api && vitna_api_embeds(api)) {
+        printf("Serving %s at /v1/embeddings, one request at a time.\n", vitna_api_model_id(api));
+    } else if (api && vitna_api_parallel(api) > 1) {
         printf("Serving %s at /v1/chat/completions and /v1/completions, %zu requests at a time.\n", vitna_api_model_id(api), vitna_api_parallel(api));
     } else if (api) {
         printf("Serving %s at /v1/chat/completions and /v1/completions, one request at a time.\n", vitna_api_model_id(api));

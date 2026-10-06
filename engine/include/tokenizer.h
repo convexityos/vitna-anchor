@@ -20,6 +20,10 @@
  * no tokens (so no BOS is added), a ByteLevel decoder, and a BPE model
  * without dropout, unknown token or byte fallback. Anything else is refused
  * on load, not approximated.
+ *
+ * A tokenizer.json whose model is WordPiece, a BERT model's, is run by
+ * wordpiece.h instead, through these same functions: its encoding includes
+ * the post-processor's tokens ([CLS] and [SEP]).
  */
 
 #ifndef VITNA_TOKENIZER_H
@@ -68,6 +72,9 @@ const unsigned char* vitna_tokenizer_token_bytes(const vitna_tokenizer_t* tok, i
 
 /** Whether id is an added token marked special. */
 bool vitna_tokenizer_is_special(const vitna_tokenizer_t* tok, int32_t id);
+
+/** Whether the tokenizer is WordPiece, a BERT model's (wordpiece.h). */
+bool vitna_tokenizer_is_wordpiece(const vitna_tokenizer_t* tok);
 
 #ifdef __cplusplus
 }
