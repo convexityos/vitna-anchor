@@ -1230,6 +1230,17 @@ bool vitna_llama_widen_on_gpu(const vitna_matrix_t* w, float* out, char* err, si
 #endif
 }
 
+bool vitna_llama_cpu_experts(vitna_llama_t* m, size_t threads, char* err, size_t err_len) {
+#if defined(VITNA_CUDA)
+    if (!m->cuda) return fail(err, err_len, "the experts run on the CPU beside the GPU, and this model is not on the GPU%s%s", NULL, NULL);
+    return vitna_cuda_cpu_experts(m->cuda, threads, err, err_len);
+#else
+    (void)m;
+    (void)threads;
+    return fail(err, err_len, "%s%s", NO_CUDA, NULL);
+#endif
+}
+
 bool vitna_llama_expert_on_gpu(const vitna_llama_t* m, size_t l, size_t e, const float* x, float* xs, float* act, float* y, char* err,
                                size_t err_len) {
     if (!m->cfg.n_experts || l >= m->cfg.n_layers || e >= m->cfg.n_experts) {

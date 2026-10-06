@@ -570,19 +570,21 @@ test("unpinned, the engine decodes the reference's tokens until its routing depa
   t.diagnostic(`on ${DEVICE || "cpu"}, ` + (notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`));
 });
 
-// Run capital and code under each of configs, [name, extra arguments]: 16
-// greedy tokens with their logits, and every position's logits. Every run
-// must give the first's tokens, and its logits byte for byte. On the CPU the
-// runs of a prompt go side by side; on a GPU one after another.
+// Run capital and code under each of configs, [name, extra arguments, and
+// optionally the environment]: 16 greedy tokens with their logits, and every
+// position's logits. Every run must give the first's tokens, and its logits
+// byte for byte. On the CPU the runs of a prompt go side by side; on a GPU
+// one after another.
 async function sameEverywhere(configs) {
   const prompts = fixture.prompts.filter((p) => ["capital", "code"].includes(p.id));
   const dir = mkdtempSync(join(tmpdir(), "vitna-moe-same-"));
   try {
     for (const p of prompts) {
-      const run = async ([name, extra]) => {
+      const run = async ([name, extra, env = {}]) => {
         const out = await runEngine(["generate", "--model", modelDir, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
-          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
-        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra]);
+          "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra], "", env);
+        await runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra],
+          "", env);
         return JSON.parse(out).ids;
       };
       const ids = [];
@@ -631,6 +633,33 @@ test("on the GPU, an expert cache of any size, fed from either place, gives the 
     ["both-small", ["--gpu-expert-cache", "256", "--expert-cache", "256"]],
   ]);
   t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte with the GPU's expert cache as large as the device allows, at 256 MiB, and at 256 MiB fed from a cache of 256 MiB in memory`);
+});
+
+// Gate A8: with --cpu-experts, a step runs the experts the device lacks, or
+// is still copying, on the CPU, in the GPU's arithmetic (engine/src/warp.c),
+// while the device runs those it holds, and one kernel adds all their
+// outputs in the order the device would. Which experts ran where must change
+// nothing: the logits are the GPU alone's, byte for byte. Through 21 slots
+// on the device most of a token's experts run on the CPU; with the cache
+// the device allows, few do; on one thread the rows of the CPU's experts are
+// not shared out at all; and fed from a cache of 256 MiB in memory the CPU
+// reads what the drive gave. Every token runs as a step (VITNA_TEST_NO_ROWS),
+// the prompt's too, since a prompt's rows copy in what they lack as before;
+// one run more lets the prompt run as rows and only the new tokens split.
+test("on the GPU, the experts the device lacks run on the CPU, and the logits and tokens are the GPU alone's, byte for byte", {
+  skip: MODEL.skip || (!GPU && "VITNA_DEVICE is not cuda"),
+}, async (t) => {
+  const alone = { VITNA_TEST_NO_ROWS: "1" };
+  const small = ["--gpu-expert-cache", "256"];
+  const which = await sameEverywhere([
+    ["gpu", small, alone],
+    ["split", [...small, "--cpu-experts", "4"], alone],
+    ["split-one-thread", [...small, "--cpu-experts", "1"], alone],
+    ["split-large", ["--cpu-experts", "4"], alone],
+    ["split-streamed", [...small, "--expert-cache", "256", "--cpu-experts", "4"], alone],
+    ["split-after-rows", [...small, "--cpu-experts", "4"]],
+  ]);
+  t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal the GPU alone's byte for byte, with the experts the device lacked run on the CPU on 4 threads and on 1, through 21 slots on the device and through as many as it allows, fed from the mapped checkpoint and from a cache of 256 MiB in memory`);
 });
 
 test("an expert cache too small for twice the experts a token goes through is refused, saying how large it must be", MODEL, async () => {

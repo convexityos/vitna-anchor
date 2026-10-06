@@ -85,6 +85,20 @@ bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, s
 /** What the device's expert cache has done so far, in a sentence, for --timing; empty for a dense model. Returns buf. */
 const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len);
 
+/**
+ * From now on, a step of a mixture of experts shares the experts the device
+ * lacks between the CPU, on threads threads, and copies to the device, while
+ * the device runs those it holds (gate A8): the CPU takes the share it
+ * finishes as the copies of the rest do, by what each has cost so far, the
+ * least used first. The CPU computes in the GPU's arithmetic (warp.h) and
+ * the outputs are added in the device's order, so every value, the logits
+ * among them, is the bits it would have been, whichever experts ran where.
+ * Rows (vitna_cuda_moe_rows_*) copy in what they lack, as before. False,
+ * with the reason in err, for a dense model or if the memory or the threads
+ * cannot be had.
+ */
+bool vitna_cuda_cpu_experts(struct vitna_cuda_model* g, size_t threads, char* err, size_t err_len);
+
 /*
  * Several rows of a mixture of experts at once, each a token at its position
  * in its sequence (vitna_cuda_row_t), a layer at a time as one token runs

@@ -257,19 +257,19 @@ for (const { file, quant, path } of FIXTURES) {
   });
 
   // Run capital (and code, given more prompts) under each of configs, [name,
-  // extra arguments]: 16 greedy tokens with their logits, and every
-  // position's logits. Every run must give the first's tokens, and its
-  // logits byte for byte. On the CPU a prompt's runs go side by side; on a
-  // GPU one after another.
+  // extra arguments, and optionally the environment]: 16 greedy tokens with
+  // their logits, and every position's logits. Every run must give the
+  // first's tokens, and its logits byte for byte. On the CPU a prompt's runs
+  // go side by side; on a GPU one after another.
   const sameEverywhere = async (configs, ids = ["capital"]) => {
     const prompts = fixture.prompts.filter((p) => ids.includes(p.id));
     const dir = mkdtempSync(join(tmpdir(), "vitna-gguf-same-"));
     try {
       for (const p of prompts) {
-        const run = async ([name, extra]) => {
+        const run = async ([name, extra, env = {}]) => {
           const out = await runEngine(["generate", ...WEIGHTS, "--ids", p.ids.join(","), "--max-new", "16", "--greedy", ...RUN,
-            "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra]);
-          await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra]);
+            "--logits-out", join(dir, `${p.id}.${name}.greedy`), ...extra], env);
+          await runEngine(["logits", ...WEIGHTS, "--ids", p.ids.join(","), "--out", join(dir, `${p.id}.${name}.logits`), ...RUN, ...extra], env);
           return JSON.parse(out).ids;
         };
         const tokens = [];
@@ -311,6 +311,21 @@ for (const { file, quant, path } of FIXTURES) {
       ["both-small", ["--gpu-expert-cache", "256", "--expert-cache", "256"]],
     ], ["capital", "code"]);
     t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal byte for byte with the GPU's expert cache as large as the device allows, at 256 MiB, and at 256 MiB fed from a cache of 256 MiB in memory`);
+  });
+
+  // Gate A8 for a quantized file: the experts the device lacks run on the
+  // CPU, which widens their blocks as the GPU does (quant.c) and sums in the
+  // GPU's order, so the logits are the GPU alone's, byte for byte. As in
+  // A5's, every token runs as a step, the prompt's too.
+  test(`${quant}: on the GPU, the experts the device lacks run on the CPU, and the logits and tokens are the GPU alone's, byte for byte`, ON_GPU, async (t) => {
+    const alone = { VITNA_TEST_NO_ROWS: "1" };
+    const small = ["--gpu-expert-cache", "256"];
+    const which = await sameEverywhere([
+      ["gpu", small, alone],
+      ["split", [...small, "--cpu-experts", "4"], alone],
+      ["split-streamed", [...small, "--expert-cache", "256", "--cpu-experts", "4"], alone],
+    ], ["capital", "code"]);
+    t.diagnostic(`${which}: every position's logits, and 16 greedy tokens with their logits, equal the GPU alone's byte for byte, with the experts the device lacked, through 256 MiB of it, run on the CPU on 4 threads, fed from the mapped file and from a cache of 256 MiB in memory`);
   });
 
   // As A5's: tokens run together as rows (a prompt's, and drafted tokens with

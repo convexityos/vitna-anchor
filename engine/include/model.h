@@ -364,6 +364,17 @@ bool vitna_llama_cuda_probe(char* err, size_t err_len);
 bool vitna_llama_use_cuda(vitna_llama_t* m, size_t expert_cache_bytes, char* err, size_t err_len);
 
 /**
+ * After vitna_llama_use_cuda, for a mixture of experts: each step runs some
+ * of the experts the device lacks on threads CPU threads, while the device
+ * runs those it holds and the rest copied in, rather than copying them all in
+ * and waiting (model_cuda.h's vitna_cuda_cpu_experts, gate A8). Every value
+ * is the bits it would have been. False, with the reason in err, if the
+ * model is not on the GPU, has no experts, or the threads or memory cannot
+ * be had.
+ */
+bool vitna_llama_cpu_experts(vitna_llama_t* m, size_t threads, char* err, size_t err_len);
+
+/**
  * For checking: the matrix w widened to float32 by the GPU's kernels, into
  * out (rows x cols), as model_cuda.h's vitna_cuda_widen, which reads it
  * every way the kernels do and requires the same bits from each. False,

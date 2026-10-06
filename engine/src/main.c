@@ -69,7 +69,10 @@ static void print_usage(const char* prog) {
     printf("--gpu-expert-cache <MiB>, with --device cuda, is how much of the GPU holds a mixture of experts' experts, each\n");
     printf("copied in when a layer wants it, from --expert-cache's cache or else the mapped checkpoint (default: what\n");
     printf("the GPU has free once the rest of the model is there, less 512 MiB); the logits are the same, bit for bit,\n");
-    printf("whatever its size.\n\n");
+    printf("whatever its size.\n");
+    printf("--cpu-experts <threads>, with --device cuda, shares a step's experts that the GPU lacks between that many CPU\n");
+    printf("threads and copies to the GPU, by what each has cost so far, while the GPU runs those it holds. The CPU\n");
+    printf("computes in the GPU's order, so the logits are the same, bit for bit.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
@@ -118,6 +121,7 @@ typedef struct {
     size_t ctx;
     size_t expert_cache_mib; /* read a mixture of experts' experts from the drive into a cache this large */
     size_t gpu_expert_cache_mib; /* --device cuda: the GPU memory that holds a mixture of experts' experts */
+    size_t cpu_experts;  /* --device cuda: CPU threads that run the experts the GPU lacks; 0, they are copied in */
     int iterations;
     size_t count;        /* --count: experts expert-check runs */
     uint16_t port;
@@ -166,6 +170,13 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--gpu-expert-cache")) {
             a->gpu_expert_cache_mib = (size_t)strtoull(v, NULL, 10);
             if (a->gpu_expert_cache_mib == 0) a->gpu_expert_cache_mib = 1; /* refused on load as too small, not taken as the default */
+        }
+        else if (TAKE("--cpu-experts")) {
+            a->cpu_experts = (size_t)strtoull(v, NULL, 10);
+            if (a->cpu_experts == 0) {
+                fprintf(stderr, "--cpu-experts takes the threads to run experts on, 1 or more\n");
+                return false;
+            }
         }
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--count")) a->count = (size_t)strtoull(v, NULL, 10);
@@ -393,6 +404,11 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
      * experts copies its experts there from the cache above, if there is one. */
     if (wants_cuda(a) && !vitna_llama_use_cuda(m, a->gpu_expert_cache_mib << 20, err, sizeof(err))) {
         fprintf(stderr, "--device cuda: %s\n", err);
+        vitna_llama_free(m);
+        return false;
+    }
+    if (a->cpu_experts && !vitna_llama_cpu_experts(m, a->cpu_experts, err, sizeof(err))) {
+        fprintf(stderr, "--cpu-experts: %s\n", err);
         vitna_llama_free(m);
         return false;
     }
@@ -1003,7 +1019,11 @@ static int cmd_expert_check(const args_t* a) {
             break;
         }
         const vitna_expert_t* ex = &m.layers[l].experts[e];
-        vitna_warp_expert(ex->gate.data, ex->up.data, ex->down.data, ex->gate.dtype, ex->down.dtype, H, I, xs, mine, mine + H);
+        if (!vitna_warp_expert(ex->gate.data, ex->up.data, ex->down.data, ex->gate.dtype, ex->down.dtype, H, I, xs, mine, mine + H)) {
+            fprintf(stderr, "out of memory\n");
+            status = 1;
+            break;
+        }
         const bool a_ok = memcmp(mine + H, act, I * sizeof(float)) == 0;
         const bool y_ok = memcmp(mine, y, H * sizeof(float)) == 0;
         act_equal += a_ok;
@@ -1181,6 +1201,10 @@ int main(int argc, char** argv) {
      * and nothing falls back to the CPU in its place. */
     if (a.gpu_expert_cache_mib && !wants_cuda(&a)) {
         fprintf(stderr, "--gpu-expert-cache needs --device cuda\n");
+        return 1;
+    }
+    if (a.cpu_experts && !wants_cuda(&a)) {
+        fprintf(stderr, "--cpu-experts runs experts on the CPU beside the GPU, and needs --device cuda\n");
         return 1;
     }
     if (a.device && strcmp(a.device, "cpu") != 0) {

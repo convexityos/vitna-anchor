@@ -31,6 +31,7 @@
 #include "strbuf.h"
 #include "tokenizer.h"
 #include "unicode.h"
+#include "pool.h"
 #include "warp.h"
 
 static int g_checks = 0;
@@ -1349,6 +1350,101 @@ static void test_warp(void) {
     }
 }
 
+/* A matrix of rows x cols in dt, of random weights: random blocks for a block format, small values for the rest. */
+static uint8_t* random_matrix(vitna_dtype_t dt, size_t rows, size_t cols) {
+    const size_t bytes = rows * (size_t)vitna_row_bytes(dt, cols);
+    uint8_t* w = (uint8_t*)malloc(bytes);
+    if (!w) return NULL;
+    if (vitna_dtype_is_block(dt)) {
+        const size_t bb = vitna_dtype_block_bytes(dt);
+        for (size_t k = 0; k < bytes / bb; k++) random_block(w + k * bb, dt);
+    } else if (dt == VITNA_DTYPE_F32) {
+        for (size_t i = 0; i < rows * cols; i++) ((float*)w)[i] = rnd_f(-0.1f, 0.1f);
+    } else {
+        for (size_t i = 0; i < rows * cols; i++) ((uint16_t*)w)[i] = (uint16_t)(0x2C00 + (rnd_u32() & 0x3FF) - 0x200);
+    }
+    return w;
+}
+
+/* --- A pool of threads (pool.h) --- */
+
+typedef struct {
+    int* ran;     /* times each task ran */
+    size_t* by;   /* the worker that ran it */
+} pool_probe_t;
+
+static void pool_probe_task(void* arg, size_t i, size_t worker) {
+    const pool_probe_t* p = (const pool_probe_t*)arg;
+    p->ran[i]++;
+    p->by[i] = worker;
+}
+
+static void test_pool(void) {
+    enum { N = 1000 };
+    static int ran[N];
+    static size_t by[N];
+    for (size_t threads = 1; threads <= 4; threads++) {
+        vitna_pool_t* pool = vitna_pool_create(threads);
+        CHECK(pool && vitna_pool_threads(pool) == threads, "a pool of %zu threads starts", threads);
+        if (!pool) continue;
+        bool once = true, named = true;
+        for (int job = 0; job < 50; job++) {
+            memset(ran, 0, sizeof(ran));
+            const pool_probe_t p = { ran, by };
+            const size_t n = (size_t)(job * 37 % N) + 1;
+            vitna_pool_run(pool, n, pool_probe_task, (void*)&p);
+            for (size_t i = 0; i < N; i++) once = once && ran[i] == (i < n ? 1 : 0);
+            for (size_t i = 0; i < n; i++) named = named && by[i] < threads;
+        }
+        CHECK(once, "a pool of %zu threads runs every task of 50 jobs once, and none past a job's end", threads);
+        CHECK(named, "a pool of %zu threads: each task ran on a worker the pool has", threads);
+        vitna_pool_free(pool);
+    }
+    CHECK(vitna_pool_create(0) == NULL, "a pool of no threads is refused");
+}
+
+/* Several experts with their rows shared among threads, against each run
+ * alone: the same bits, however the rows fall. intermediate is neither a
+ * multiple of the rows a task takes nor of 256, so the last task of each
+ * expert is short and the down projection takes the scalar loop while gate
+ * and up take the AVX2 path, where the CPU has it. */
+static void test_warp_experts(void) {
+    enum { H = 512, I = 320, N = 3 };
+    const vitna_dtype_t gu = VITNA_DTYPE_Q4_K, dn = VITNA_DTYPE_Q8_0;
+    uint8_t *gate[N], *up[N], *down[N];
+    static float xs[H], want[N][H], got[N][H], act[N * 2 * I], one[2 * I];
+    for (int i = 0; i < H; i++) xs[i] = rnd_f(-2.0f, 2.0f);
+    bool alone = true;
+    for (int k = 0; k < N; k++) {
+        gate[k] = random_matrix(gu, I, H);
+        up[k] = random_matrix(gu, I, H);
+        down[k] = random_matrix(dn, H, I);
+        alone = alone && vitna_warp_expert(gate[k], up[k], down[k], gu, dn, H, I, xs, want[k], one);
+    }
+    CHECK(alone, "vitna_warp_expert runs each expert");
+    for (size_t threads = 1; threads <= 3; threads += 2) {
+        vitna_pool_t* pool = vitna_pool_create(threads);
+        float* scratch = (float*)malloc(threads * vitna_warp_scratch_floats(H, I) * sizeof(float));
+        vitna_warp_expert_t ex[N];
+        for (int k = 0; k < N; k++) {
+            ex[k].gate = gate[k];
+            ex[k].up = up[k];
+            ex[k].down = down[k];
+            ex[k].y = got[k];
+        }
+        memset(got, 0xFF, sizeof(got));
+        if (pool && scratch) vitna_warp_experts(pool, ex, N, gu, dn, H, I, xs, act, scratch);
+        CHECK(pool && scratch && memcmp(got, want, sizeof(got)) == 0, "%d experts on %zu threads equal each run alone, bit for bit", N, threads);
+        free(scratch);
+        vitna_pool_free(pool);
+    }
+    for (int k = 0; k < N; k++) {
+        free(gate[k]);
+        free(up[k]);
+        free(down[k]);
+    }
+}
+
 /* --- GGUF (gguf.h) --- */
 
 typedef struct {
@@ -1469,6 +1565,8 @@ int main(void) {
     test_dequant_paths();
     test_exact();
     test_warp();
+    test_pool();
+    test_warp_experts();
     test_gguf();
     test_expert_stream();
     test_api_helpers();
