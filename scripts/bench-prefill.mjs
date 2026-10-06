@@ -3,13 +3,19 @@
 // turns, and print the machine and the command with the result.
 //
 //   node scripts/bench-prefill.mjs [--device cpu|cuda] [--engine <path> ...] [--model <dir>] [--weights <file.gguf>]
-//                                  [--prompt-tokens <n,n,...>] [--runs <n>]
+//                                  [--prompt-tokens <n,n,...>] [--runs <n>] [--text <file> ...] [--ctx <n>]
+//                                  [--gpu-kv-layers <n>]
 //
 // --weights reads the weights from a GGUF file, as the engine's own --weights
-// does; --model still gives config.json and the tokenizer.
+// does; --model still gives config.json and the tokenizer. --ctx and
+// --gpu-kv-layers go to the engine as they are.
 //
 // Each run is one `generate --greedy --timing --max-new 2` over the first n
-// tokens of README.md, and the engine's own timing line gives the prompt's
+// tokens of the text, README.md unless --text names files, which are read
+// one after another with a blank line between; the ids go to the engine in
+// a file (--ids-file), since 32K of them are more than a Windows command
+// line holds. The commit the files were read at is printed, so the prompt
+// can be had again. The engine's own timing line gives the prompt's
 // time: from its first token to the next token's logits on the host, with
 // loading and the upload to a GPU left out. Every round runs every build once
 // at a length, so builds compared with each other see the same interference
@@ -22,8 +28,8 @@
 // builds, and says nothing about another. Zero external dependencies.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { cpus, release, type } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpus, release, tmpdir, type } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -48,6 +54,8 @@ const model = resolve(option("--model", join(ROOT, "models", "smollm2-135m")));
 const weights = option("--weights", "") ? resolve(option("--weights", "")) : "";
 const lengths = option("--prompt-tokens", "8,100,500,2000").split(",").map(Number);
 const runs = Number(option("--runs", "5"));
+const texts = (options("--text").length ? options("--text") : ["README.md"]).map((p) => resolve(ROOT, p));
+const passed = ["--ctx", "--gpu-kv-layers"].flatMap((name) => (option(name, "") ? [name, option(name, "")] : []));
 const fallback = [
   process.env.VITNA_ENGINE,
   join(ROOT, `engine/vitna-anchor${EXE}`),
@@ -60,20 +68,25 @@ if (!["cpu", "cuda"].includes(device)) throw new Error(`--device must be cpu or 
 for (const e of engines) if (!existsSync(e)) throw new Error(`no built engine at ${e}; pass --engine <path>`);
 if (!Number.isInteger(runs) || runs < 1) throw new Error("--runs must be at least 1");
 
+const text = texts.map((p) => readFileSync(p, "utf8")).join("\n\n");
 const tok = spawnSync(engines[0], ["tokenize", "--model", model], {
-  input: JSON.stringify(readFileSync(join(ROOT, "README.md"), "utf8")) + "\n",
+  input: JSON.stringify(text) + "\n",
   encoding: "utf8",
   maxBuffer: 1 << 26,
 });
 if (tok.status !== 0) throw new Error(tok.stderr);
-const readme = JSON.parse(tok.stdout.trim());
+const ids = JSON.parse(tok.stdout.trim());
 for (const n of lengths) {
-  if (!Number.isInteger(n) || n < 1 || n > readme.length) throw new Error(`--prompt-tokens must each be 1 to ${readme.length}`);
+  if (!Number.isInteger(n) || n < 1 || n > ids.length) throw new Error(`--prompt-tokens must each be 1 to ${ids.length}`);
 }
+const scratch = mkdtempSync(join(tmpdir(), "bench-prefill-"));
+process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
+const idsFile = join(scratch, "ids.txt");
 
 function once(engine, n) {
-  const args = ["generate", "--model", model, ...(weights ? ["--weights", weights] : []), "--ids", readme.slice(0, n).join(","), "--max-new", "2",
-    "--greedy", "--timing", "--device", device];
+  writeFileSync(idsFile, ids.slice(0, n).join(","));
+  const args = ["generate", "--model", model, ...(weights ? ["--weights", weights] : []), "--ids-file", idsFile, "--max-new", "2",
+    "--greedy", "--timing", "--device", device, ...passed];
   const r = spawnSync(engine, args, { encoding: "utf8", maxBuffer: 1 << 26 });
   if (r.status !== 0) throw new Error(`${engine} exited ${r.status}: ${r.stderr}`);
   const m = r.stderr.match(/timing: (\d+) prompt tokens in ([\d.]+) ms/);
@@ -88,7 +101,12 @@ if (device === "cuda") {
   const q = spawnSync("nvidia-smi", ["--query-gpu=name,driver_version", "--format=csv,noheader"], { encoding: "utf8" });
   gpu = q.status === 0 ? q.stdout.trim().split("\n")[0] : "nvidia-smi not available";
 }
-console.log(`command: <engine> generate --model ${model}${weights ? ` --weights ${weights}` : ""} --ids <the first n tokens of README.md> --max-new 2 --greedy --timing --device ${device}`);
+const commit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).stdout.trim() || "unknown";
+// The files are read from the working tree, which is the commit's only if none of them has changed since.
+const changed = spawnSync("git", ["status", "--porcelain", "--", ...texts], { cwd: ROOT, encoding: "utf8" }).stdout.trim() !== "";
+const named = texts.map((p) => p.slice(ROOT.length + 1).replace(/\\/g, "/")).join(", then ");
+console.log(`command: <engine> generate --model ${model}${weights ? ` --weights ${weights}` : ""} --ids-file <the first n tokens of ${named}> --max-new 2 --greedy --timing --device ${device}${passed.length ? " " + passed.join(" ") : ""}`);
+console.log(`text: ${named} at commit ${commit}${changed ? ", with changes not committed" : ""}, ${ids.length} tokens`);
 console.log(`machine: ${cpus()[0].model.trim()}, ${type()} ${release()}${gpu ? `; GPU ${gpu}` : ""}`);
 engines.forEach((e, i) => console.log(`engine ${i + 1}: ${e}`));
 
