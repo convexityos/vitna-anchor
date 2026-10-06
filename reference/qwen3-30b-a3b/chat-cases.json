@@ -1,0 +1,127 @@
+{
+ "about": "Conversations in OpenAI's message shape, with tools, for gate A11: reference/record_chat_template.py renders each through Qwen3-30B-A3B's own chat template, and the engine must write the same prompt.",
+ "cases": [
+  {
+   "id": "plain",
+   "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"}
+   ]
+  },
+  {
+   "id": "user-only",
+   "messages": [{"role": "user", "content": "Hello"}]
+  },
+  {
+   "id": "thinking-off",
+   "enable_thinking": false,
+   "messages": [{"role": "user", "content": "Answer in one word: what colour is the sky?"}]
+  },
+  {
+   "id": "multi-turn",
+   "messages": [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "Hi!"},
+    {"role": "assistant", "content": "<think>\nThe user greets me.\n</think>\n\nHello! How can I help?"},
+    {"role": "user", "content": "Tell me a joke."}
+   ]
+  },
+  {
+   "id": "reasoning-content",
+   "messages": [
+    {"role": "user", "content": "Capital of France?"},
+    {"role": "assistant", "content": "Paris.", "reasoning_content": "France's capital is Paris."},
+    {"role": "user", "content": "And of Italy?"}
+   ]
+  },
+  {
+   "id": "tools",
+   "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What's the weather in Paris?"}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Get the current weather in a city.", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "The city, e.g. Paris"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["location"]}}},
+    {"type": "function", "function": {"name": "search", "description": "Search the web. Quote \"exact phrases\", escape a backslash \\ as \\\\.\nOne query at a time.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}}, "required": ["query"]}}}
+   ]
+  },
+  {
+   "id": "tools-no-system",
+   "messages": [{"role": "user", "content": "List the files here."}],
+   "tools": [
+    {"type": "function", "function": {"name": "shell", "description": "Run a shell command and return its output.", "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}, "timeout_ms": {"type": "number"}}, "required": ["command"]}}}
+   ]
+  },
+  {
+   "id": "tool-call-string-arguments",
+   "messages": [
+    {"role": "user", "content": "What's the weather in Paris?"},
+    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "{\"temperature\": 18, \"sky\": \"clear\"}"}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Get the current weather in a city.", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}}
+   ]
+  },
+  {
+   "id": "tool-call-object-arguments",
+   "messages": [
+    {"role": "user", "content": "東京の天気は？"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_7", "type": "function", "function": {"name": "get_weather", "arguments": {"location": "東京", "unit": "celsius", "note": "line\nbreak \"quoted\" tab\t"}}}]},
+    {"role": "tool", "tool_call_id": "call_7", "content": "晴れ、22度 ☀️"}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "天気を調べる", "parameters": {"type": "object", "properties": {"location": {"type": "string"}, "unit": {"type": "string"}, "note": {"type": "string"}}, "required": ["location"]}}}
+   ]
+  },
+  {
+   "id": "parallel-tool-calls",
+   "messages": [
+    {"role": "system", "content": "Use tools when they help."},
+    {"role": "user", "content": "Weather in Paris and in Rome?"},
+    {"role": "assistant", "content": "Let me check both.", "tool_calls": [
+     {"id": "call_a", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"}},
+     {"id": "call_b", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Rome\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_a", "content": "18 and clear"},
+    {"role": "tool", "tool_call_id": "call_b", "content": "24 and sunny"}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Get the current weather in a city.", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}}
+   ]
+  },
+  {
+   "id": "multi-step",
+   "messages": [
+    {"role": "user", "content": "How warm is Paris?"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "18"},
+    {"role": "assistant", "content": "<think>\nThe tool says 18.\n</think>\n\nIt is 18 degrees in Paris."},
+    {"role": "user", "content": "And Rome?"},
+    {"role": "assistant", "content": "", "reasoning_content": "Same tool, for Rome.", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Rome\"}"}}]},
+    {"role": "tool", "tool_call_id": "c2", "content": "24"}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "get_weather", "description": "Get the current weather in a city.", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}}
+   ]
+  },
+  {
+   "id": "numbers",
+   "messages": [{"role": "user", "content": "Pick a number."}],
+   "tools": [
+    {"type": "function", "function": {"name": "pick", "description": "Pick a number in a range.", "parameters": {"type": "object", "properties": {"x": {"type": "number", "minimum": -1.5, "maximum": 100.0, "multipleOf": 0.1, "default": 1e-05, "examples": [0, 3.14159, 1e20, 10000000000000000, -0.0, 2.5e-7, 123456789012]}}, "required": ["x"], "additionalProperties": false}}}
+   ]
+  },
+  {
+   "id": "empty-and-nested",
+   "messages": [
+    {"role": "system", "content": ""},
+    {"role": "user", "content": "Run it."}
+   ],
+   "tools": [
+    {"type": "function", "function": {"name": "run", "description": "", "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {"name": "nested", "description": "Nested objects and arrays.", "parameters": {"type": "object", "properties": {"opts": {"type": "object", "properties": {"flags": {"type": "array", "items": {"type": "boolean"}}, "meta": {"type": ["string", "null"]}}}}}}}
+   ]
+  }
+ ]
+}
