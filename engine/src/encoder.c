@@ -38,8 +38,8 @@
  * 384 wide). */
 #define PASS_ROWS 2048
 
-/* Outputs of a matrix product each task computes, and rows each row-wise task takes. */
-#define DENSE_CHUNK 32
+/* Outputs of a matrix product each task computes, a multiple of the tile's three, and rows each row-wise task takes. */
+#define DENSE_CHUNK 24
 #define ROW_CHUNK 64
 
 static bool fail(char* err, size_t err_len, const char* fmt, const char* a, const char* b) {
@@ -215,8 +215,9 @@ static float dot_avx2(const float* a, const float* b, size_t n) {
 }
 
 /* y[i][j] = b[j] + x[i] . w[j], rows 0 to n - 1, outputs j0 to j1 - 1. Four
- * rows by two outputs at a time, each pair with a running sum of its own,
- * so each weight vector loaded serves four rows. */
+ * rows by three outputs at a time, each pair with a running sum of its own:
+ * twelve sums in flight, enough to keep both FMA units busy through their
+ * latency, and each weight vector loaded serves four rows. */
 ENC_AVX2
 static void dense_avx2(const float* x, size_t n, const vitna_dense_t* d, float* y, size_t j0, size_t j1) {
     const size_t in = d->in, out = d->out, n8 = in & ~(size_t)7;
@@ -227,40 +228,42 @@ static void dense_avx2(const float* x, size_t n, const vitna_dense_t* d, float* 
         const float* x2 = x1 + in;
         const float* x3 = x2 + in;
         size_t j = j0;
-        for (; j + 2 <= j1; j += 2) {
+        for (; j + 3 <= j1; j += 3) {
             const float* w0 = d->w + j * in;
             const float* w1 = w0 + in;
-            __m256 a00 = _mm256_setzero_ps(), a01 = a00, a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00;
+            const float* w2 = w1 + in;
+            __m256 a00 = _mm256_setzero_ps(), a01 = a00, a02 = a00, a10 = a00, a11 = a00, a12 = a00;
+            __m256 a20 = a00, a21 = a00, a22 = a00, a30 = a00, a31 = a00, a32 = a00;
             for (size_t k = 0; k < n8; k += 8) {
-                const __m256 wa = _mm256_loadu_ps(w0 + k), wb = _mm256_loadu_ps(w1 + k);
+                const __m256 wa = _mm256_loadu_ps(w0 + k), wb = _mm256_loadu_ps(w1 + k), wc = _mm256_loadu_ps(w2 + k);
                 __m256 v = _mm256_loadu_ps(x0 + k);
                 a00 = _mm256_fmadd_ps(v, wa, a00);
                 a01 = _mm256_fmadd_ps(v, wb, a01);
+                a02 = _mm256_fmadd_ps(v, wc, a02);
                 v = _mm256_loadu_ps(x1 + k);
                 a10 = _mm256_fmadd_ps(v, wa, a10);
                 a11 = _mm256_fmadd_ps(v, wb, a11);
+                a12 = _mm256_fmadd_ps(v, wc, a12);
                 v = _mm256_loadu_ps(x2 + k);
                 a20 = _mm256_fmadd_ps(v, wa, a20);
                 a21 = _mm256_fmadd_ps(v, wb, a21);
+                a22 = _mm256_fmadd_ps(v, wc, a22);
                 v = _mm256_loadu_ps(x3 + k);
                 a30 = _mm256_fmadd_ps(v, wa, a30);
                 a31 = _mm256_fmadd_ps(v, wb, a31);
+                a32 = _mm256_fmadd_ps(v, wc, a32);
             }
-            float s[8] = { hsum8(a00), hsum8(a01), hsum8(a10), hsum8(a11), hsum8(a20), hsum8(a21), hsum8(a30), hsum8(a31) };
+            float s[12] = { hsum8(a00), hsum8(a01), hsum8(a02), hsum8(a10), hsum8(a11), hsum8(a12),
+                            hsum8(a20), hsum8(a21), hsum8(a22), hsum8(a30), hsum8(a31), hsum8(a32) };
+            const float* xr[4] = { x0, x1, x2, x3 };
+            const float* wr[3] = { w0, w1, w2 };
             for (size_t k = n8; k < in; k++) {
-                s[0] += x0[k] * w0[k];
-                s[1] += x0[k] * w1[k];
-                s[2] += x1[k] * w0[k];
-                s[3] += x1[k] * w1[k];
-                s[4] += x2[k] * w0[k];
-                s[5] += x2[k] * w1[k];
-                s[6] += x3[k] * w0[k];
-                s[7] += x3[k] * w1[k];
+                for (size_t r = 0; r < 4; r++) {
+                    for (size_t o = 0; o < 3; o++) s[3 * r + o] += xr[r][k] * wr[o][k];
+                }
             }
-            const float b0 = d->b ? d->b[j] : 0.0f, b1 = d->b ? d->b[j + 1] : 0.0f;
             for (size_t r = 0; r < 4; r++) {
-                y[(i + r) * out + j] = s[2 * r] + b0;
-                y[(i + r) * out + j + 1] = s[2 * r + 1] + b1;
+                for (size_t o = 0; o < 3; o++) y[(i + r) * out + j + o] = s[3 * r + o] + (d->b ? d->b[j + o] : 0.0f);
             }
         }
         for (; j < j1; j++) {
@@ -281,6 +284,94 @@ static void axpy_avx2(float p, const float* v, float* acc, size_t n) {
     const __m256 pv = _mm256_set1_ps(p);
     for (size_t k = 0; k < n8; k += 8) _mm256_storeu_ps(acc + k, _mm256_fmadd_ps(pv, _mm256_loadu_ps(v + k), _mm256_loadu_ps(acc + k)));
     for (size_t k = n8; k < n; k++) acc[k] += p * v[k];
+}
+
+/* exp of eight values: Cephes's single-precision expf, a range reduction by
+ * ln 2 in two parts and a degree-6 polynomial, within 2 ulp of the true value
+ * for inputs from -87 to 88. Below that it gives about 1e-38, never 0, so a
+ * caller that needs an exact 0 sets it. */
+ENC_AVX2
+static __m256 exp8(__m256 x) {
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.3762626647949f));
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
+    __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f), _mm256_set1_ps(0.5f)));
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), x);
+    y = _mm256_add_ps(y, _mm256_set1_ps(1.0f));
+    const __m256i n = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(n));
+}
+
+ENC_AVX2
+static inline float hmax8(__m256 v) {
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+
+/* One head of one text. The text's keys for the head are held transposed,
+ * head dimension by position, so eight positions' scores are the eight lanes
+ * of one running sum over the head's dimensions, in that order for every
+ * position, four groups of eight at a time; positions past the text, up to a
+ * multiple of eight, are zeros whose scores are set to minus infinity, and
+ * whose weights are set to exactly 0. scratch holds head_dim + 1 rows of the
+ * text's positions rounded up to eight. */
+ENC_AVX2
+static void attention_avx2(const float* q, const float* k, const float* v, float* ctx, size_t H, size_t dh, size_t L, float* scratch) {
+    const size_t Lp = (L + 7) & ~(size_t)7;
+    float* kt = scratch;
+    float* s = scratch + dh * Lp;
+    for (size_t d = 0; d < dh; d++) {
+        float* row = kt + d * Lp;
+        for (size_t j = 0; j < L; j++) row[j] = k[j * H + d];
+        for (size_t j = L; j < Lp; j++) row[j] = 0.0f;
+    }
+    const __m256 scale = _mm256_set1_ps(1.0f / sqrtf((float)dh));
+    for (size_t i = 0; i < L; i++) {
+        const float* qi = q + i * H;
+        size_t jb = 0;
+        for (; jb + 32 <= Lp; jb += 32) {
+            __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            for (size_t d = 0; d < dh; d++) {
+                const __m256 qd = _mm256_set1_ps(qi[d]);
+                const float* kr = kt + d * Lp + jb;
+                a0 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(kr), a0);
+                a1 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(kr + 8), a1);
+                a2 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(kr + 16), a2);
+                a3 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(kr + 24), a3);
+            }
+            _mm256_storeu_ps(s + jb, _mm256_mul_ps(a0, scale));
+            _mm256_storeu_ps(s + jb + 8, _mm256_mul_ps(a1, scale));
+            _mm256_storeu_ps(s + jb + 16, _mm256_mul_ps(a2, scale));
+            _mm256_storeu_ps(s + jb + 24, _mm256_mul_ps(a3, scale));
+        }
+        for (; jb < Lp; jb += 8) {
+            __m256 a0 = _mm256_setzero_ps();
+            for (size_t d = 0; d < dh; d++) a0 = _mm256_fmadd_ps(_mm256_set1_ps(qi[d]), _mm256_loadu_ps(kt + d * Lp + jb), a0);
+            _mm256_storeu_ps(s + jb, _mm256_mul_ps(a0, scale));
+        }
+        for (size_t j = L; j < Lp; j++) s[j] = -INFINITY;
+        __m256 mv = _mm256_set1_ps(-INFINITY);
+        for (size_t j = 0; j < Lp; j += 8) mv = _mm256_max_ps(mv, _mm256_loadu_ps(s + j));
+        const __m256 m = _mm256_set1_ps(hmax8(mv));
+        for (size_t j = 0; j < Lp; j += 8) _mm256_storeu_ps(s + j, exp8(_mm256_sub_ps(_mm256_loadu_ps(s + j), m)));
+        for (size_t j = L; j < Lp; j++) s[j] = 0.0f;
+        __m256 sv = _mm256_setzero_ps();
+        for (size_t j = 0; j < Lp; j += 8) sv = _mm256_add_ps(sv, _mm256_loadu_ps(s + j));
+        const __m256 sum = _mm256_set1_ps(hsum8(sv));
+        for (size_t j = 0; j < Lp; j += 8) _mm256_storeu_ps(s + j, _mm256_div_ps(_mm256_loadu_ps(s + j), sum));
+        float* ci = ctx + i * H;
+        memset(ci, 0, dh * sizeof(float));
+        for (size_t j = 0; j < L; j++) axpy_avx2(s[j], v + j * H, ci, dh);
+    }
 }
 #endif
 
@@ -329,6 +420,12 @@ static void layer_norm(float* x, const float* w, const float* b, size_t n, float
 
 /* --- A pass: one group of texts through the model --- */
 
+/* Floats of scratch one thread's attention needs: a text's keys for one head,
+ * transposed, and its scores, each its positions rounded up to eight. */
+static size_t scratch_floats(const vitna_encoder_config_t* cfg) {
+    return ((cfg->max_tokens + 7) & ~(size_t)7) * (cfg->head_dim + 1);
+}
+
 typedef struct {
     vitna_encoder_t* e;
     size_t n;                    /* texts */
@@ -337,7 +434,7 @@ typedef struct {
     const size_t* offs;          /* each text's first row */
     size_t rows;
     float *x, *q, *k, *v, *ctx, *tmp, *up;
-    float* scores;               /* (workers + 1) x max_tokens */
+    float* scores;               /* (workers + 1) x scratch_floats(): each thread's attention scratch */
     const vitna_encoder_layer_t* layer;
     /* the product in progress */
     const float* in;
@@ -391,8 +488,15 @@ static void attention_task(void* c, size_t task, size_t worker) {
     const size_t H = cfg->hidden, dh = cfg->head_dim;
     const size_t t = task / cfg->n_heads, h = task % cfg->n_heads;
     const size_t L = p->lens[t], off = p->offs[t];
+    float* s = p->scores + worker * scratch_floats(cfg);
+#if defined(ENC_X86)
+    if (simd_path() == 1) {
+        const size_t at = off * H + h * dh;
+        attention_avx2(p->q + at, p->k + at, p->v + at, p->ctx + at, H, dh, L, s);
+        return;
+    }
+#endif
     const float scale = 1.0f / sqrtf((float)dh);
-    float* s = p->scores + worker * cfg->max_tokens;
     for (size_t i = 0; i < L; i++) {
         const float* qi = p->q + (off + i) * H + h * dh;
         float m = -INFINITY;
@@ -476,7 +580,7 @@ static bool run_pass(vitna_encoder_t* e, const int32_t* const* ids, const size_t
     p.ctx = (float*)malloc(p.rows * H * sizeof(float));
     p.tmp = (float*)malloc(p.rows * H * sizeof(float));
     p.up = (float*)malloc(p.rows * I * sizeof(float));
-    p.scores = (float*)malloc((workers + 1) * cfg->max_tokens * sizeof(float));
+    p.scores = (float*)malloc((workers + 1) * scratch_floats(cfg) * sizeof(float));
     const bool ok = p.x && p.q && p.k && p.v && p.ctx && p.tmp && p.up && p.scores;
     if (ok) {
         const size_t row_tasks = (p.rows + ROW_CHUNK - 1) / ROW_CHUNK;
