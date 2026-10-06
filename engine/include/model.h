@@ -61,6 +61,7 @@ typedef struct {
     size_t n_experts;         /* experts in each layer's MLP; 0 for a dense model */
     size_t n_experts_used;    /* experts each token goes through */
     bool renormalize;         /* the experts' weights divided by their sum (norm_topk_prob: Qwen3's) */
+    bool qwen3;               /* model_type qwen3_moe, whose chat template the server writes (chat.h) */
 } vitna_llama_config_t;
 
 typedef struct {

@@ -124,6 +124,7 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
             vitna_json_as_bool(vitna_json_get(cfg, "tie_word_embeddings"), &c->tied_embeddings);
             c->qk_norm = moe;
             c->qk_norm_per_head = qwen3;
+            c->qwen3 = qwen3;
             /* OlmoeConfig's and Qwen3MoeConfig's default is false. */
             c->renormalize = false;
             if (moe) vitna_json_as_bool(vitna_json_get(cfg, "norm_topk_prob"), &c->renormalize);

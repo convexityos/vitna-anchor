@@ -1571,6 +1571,29 @@ static int cmd_serve(const args_t* a) {
             vitna_api_set_test_logits(api, true);
             fprintf(stderr, "VITNA_TEST_LOGITS is set, for a test: each response names a hash of its logits.\n");
         }
+        /* For tests only: VITNA_TEST_TEMPLATE=qwen3 writes conversations in
+         * Qwen3's chat template and reads replies back as Qwen3's, whatever
+         * the model, and VITNA_TEST_REPLY=1 takes a request's own
+         * vitna_test_reply as its reply, so tests/api-surface.test.mjs can
+         * drive tool calls and reasoning through every API on a model too
+         * small to write them. */
+        const char* test_template = getenv("VITNA_TEST_TEMPLATE");
+        if (test_template && *test_template) {
+            if (strcmp(test_template, "qwen3") != 0) {
+                fprintf(stderr, "VITNA_TEST_TEMPLATE must be qwen3, not %s\n", test_template);
+                vitna_api_free(api);
+                vitna_llama_free(&m);
+                vitna_tokenizer_free(tok);
+                return 1;
+            }
+            vitna_api_set_qwen3_template(api, true);
+            fprintf(stderr, "VITNA_TEST_TEMPLATE is set, for a test: conversations are written in Qwen3's chat template.\n");
+        }
+        const char* test_reply = getenv("VITNA_TEST_REPLY");
+        if (test_reply && *test_reply) {
+            vitna_api_set_test_reply(api, true);
+            fprintf(stderr, "VITNA_TEST_REPLY is set, for a test: a request's vitna_test_reply is its reply.\n");
+        }
         char device[400];
         printf("Loaded %s: %zu layers, %zu-token context, %s.\n", vitna_api_model_id(api), m.cfg.n_layers, m.ctx, vitna_llama_device(&m, device, sizeof(device)));
         cfg.engine_ctx = api;

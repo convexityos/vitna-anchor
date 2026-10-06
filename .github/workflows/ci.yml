@@ -129,6 +129,14 @@ jobs:
         env:
           VITNA_REQUIRE_ENGINE: "1"
         run: node --test --test-reporter=spec tests/chat-template.test.mjs
+      # And the three APIs over it: OpenAI's chat and Responses and
+      # Anthropic's Messages, each written as one conversation and answered
+      # in its own shape, whole and streamed, tool calls and reasoning
+      # included, driven through the pinned model by test hooks.
+      - name: Gate A11, OpenAI's and Anthropic's APIs over one conversation
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/api-surface.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"

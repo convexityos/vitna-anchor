@@ -10,7 +10,9 @@
  */
 
 #include "api.h"
+#include "chat.h"
 #include "compat.h"
+#include "convert.h"
 #include "json.h"
 #include "jsonpfx.h"
 #include "sampler.h"
@@ -22,7 +24,10 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_STOPS 4
+/* Stop sequences a request may give: OpenAI's limit of 4, and more for
+ * Anthropic's stop_sequences, which has none. */
+#define OPENAI_MAX_STOPS 4
+#define MAX_STOPS 16
 
 /* JSON mode's mask is a function of the object so far, as the automaton's
  * state holds it, and of nothing else, and the same states come round again
@@ -71,7 +76,10 @@ struct vitna_api {
     bool prefix_cache;
     bool mask_cache;                /* whether JSON mode's masks are kept (vitna_api_set_mask_cache) */
     bool test_logits;               /* for tests: responses name their logits' hash (vitna_api_set_test_logits) */
+    bool test_reply;                /* for tests: a request's vitna_test_reply is its reply (vitna_api_set_test_reply) */
     size_t speculate;               /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
+    bool qwen3;                     /* conversations in Qwen3's chat template, else ChatML (vitna_api_set_qwen3_template) */
+    int32_t tool_call_token;        /* <tool_call> as one token of the vocabulary, or -1 */
 
     /* The scheduler's alone, on its thread. */
     uint64_t counter;
@@ -115,8 +123,18 @@ struct vitna_api {
     vitna_thread_t thread;
 };
 
+/* The API a request came in on, which decides its parameters and the shape
+ * of its response. */
+typedef enum {
+    API_COMPLETIONS,        /* OpenAI's /v1/completions */
+    API_CHAT,               /* OpenAI's /v1/chat/completions */
+    API_MESSAGES,           /* Anthropic's /v1/messages */
+    API_RESPONSES,          /* OpenAI's /v1/responses */
+} api_kind_t;
+
 typedef struct {
-    bool chat;
+    api_kind_t kind;
+    bool chat;              /* a conversation: any kind but completions */
     size_t max_tokens;
     bool has_max_tokens;
     float temperature;
@@ -131,6 +149,19 @@ typedef struct {
     bool include_usage;
     bool has_stream_options;
     bool json;              /* response_format json_object: only a valid JSON object may be generated */
+
+    /* A conversation in Qwen3's template, its reply read back (chat.h). */
+    bool parse;             /* the reply is read into reasoning, text and tool calls */
+    bool think;             /* it may open with <think> */
+    bool tools;             /* its <tool_call> blocks are calls */
+    int32_t ban;            /* a token never taken (<tool_call> under tool_choice none), or -1 */
+    const char* prefill;    /* the reply's start, which the prompt already holds: a forced tool call's opening */
+    size_t prefill_len;
+    const int32_t* forced;  /* for tests: the reply's tokens, taken in place of the model's choices */
+    size_t n_forced;
+    bool has_test_prompt;   /* for tests: the prompt's hash goes in a header (vitna_api_set_test_reply) */
+    uint64_t test_prompt;
+    const vitna_json_value_t* root; /* the request, for the fields a Responses response repeats */
 } params_t;
 
 typedef struct {
@@ -197,13 +228,33 @@ static void error_json(vitna_strbuf_t* b, const api_error_t* e) {
     vitna_sb_puts(b, "}}");
 }
 
-static int respond_error(vitna_sink_t* s, const api_error_t* e) {
+/* Anthropic's error type for a status: its API's names for the same failures. */
+static const char* anthropic_error_type(int status) {
+    if (status == 404) return "not_found_error";
+    if (status >= 500) return "api_error";
+    return "invalid_request_error";
+}
+
+/* {"type":"error","error":{...}}: Anthropic's error body, and its stream's error event. */
+static void anthropic_error_json(vitna_strbuf_t* b, const api_error_t* e) {
+    vitna_sb_printf(b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", anthropic_error_type(e->status));
+    vitna_sb_json_string(b, (const unsigned char*)e->message, strlen(e->message));
+    vitna_sb_puts(b, "}}");
+}
+
+/* An error response in the shape of the API the request came in on. */
+static int respond_error_as(vitna_sink_t* s, const api_error_t* e, api_kind_t kind) {
     vitna_strbuf_t b;
     vitna_sb_init(&b);
-    error_json(&b, e);
+    if (kind == API_MESSAGES) anthropic_error_json(&b, e);
+    else error_json(&b, e);
     respond(s, e->status, e->status == 405 ? "Allow: POST\r\n" : NULL, b.data, b.len);
     vitna_sb_free(&b);
     return e->status;
+}
+
+static int respond_error(vitna_sink_t* s, const api_error_t* e) {
+    return respond_error_as(s, e, API_CHAT);
 }
 
 static void unsupported(api_error_t* e, const char* param, const char* why) {
@@ -234,23 +285,50 @@ static bool is_zero_or_null(const vitna_json_value_t* v) {
     return vitna_json_is_null(v) || (vitna_json_as_number(v, &d) && d == 0.0);
 }
 
-static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p, api_error_t* e, vitna_strbuf_t* ignored) {
+/* The keys a request's converter reads (convert.h), or a completion's
+ * prompt, which parse_params leaves to them. */
+static bool conversation_key(api_kind_t kind, const char* k) {
+    static const char* const completions[] = { "prompt", NULL };
+    static const char* const chat[] = { "messages", "tools", "tool_choice", "functions", "function_call", "chat_template_kwargs", "reasoning_effort", NULL };
+    static const char* const messages[] = { "messages", "system", "tools", "tool_choice", "thinking", NULL };
+    static const char* const responses[] = { "input", "instructions", "tools", "tool_choice", "reasoning", NULL };
+    const char* const* keys = kind == API_COMPLETIONS ? completions : kind == API_CHAT ? chat : kind == API_MESSAGES ? messages : responses;
+    for (size_t i = 0; keys[i]; i++) {
+        if (strcmp(k, keys[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Bookkeeping for a hosted API, which changes nothing here. */
+static bool bookkeeping(api_kind_t kind, const char* k) {
+    static const char* const keys[] = { "user", "metadata", "store", "service_tier", "parallel_tool_calls", "prompt_cache_key", "safety_identifier", NULL };
+    for (size_t i = 0; keys[i]; i++) {
+        if (strcmp(k, keys[i]) == 0) return true;
+    }
+    /* What a Responses client asks to have included: nothing kept server side here. */
+    return kind == API_RESPONSES && strcmp(k, "include") == 0;
+}
+
+static bool parse_params(const vitna_api_t* api, const vitna_json_value_t* root, api_kind_t kind, params_t* p, api_error_t* e, vitna_strbuf_t* ignored) {
     memset(p, 0, sizeof(*p));
-    p->chat = chat;
+    p->kind = kind;
+    p->chat = kind != API_COMPLETIONS;
     p->temperature = 1.0f;
     p->top_p = 1.0f;
+    p->ban = -1;
+    p->root = root;
+    const bool openai = kind == API_COMPLETIONS || kind == API_CHAT; /* the two shapes with OpenAI's sampling parameters */
     for (size_t i = 0; i < root->u.object.count; i++) {
         const char* k = root->u.object.members[i].key;
         const vitna_json_value_t* v = root->u.object.members[i].value;
         double d;
         bool b;
-        if (strcmp(k, "model") == 0 || strcmp(k, (chat ? "messages" : "prompt")) == 0) continue;
-        if (strcmp(k, "user") == 0 || strcmp(k, "metadata") == 0 || strcmp(k, "store") == 0 || strcmp(k, "service_tier") == 0 ||
-            strcmp(k, "parallel_tool_calls") == 0 || strcmp(k, "prompt_cache_key") == 0 || strcmp(k, "safety_identifier") == 0) {
-            continue; /* bookkeeping for a hosted API; changes nothing here */
-        }
+        if (strcmp(k, "model") == 0 || conversation_key(kind, k) || bookkeeping(kind, k)) continue;
+        if (api->test_reply && strcmp(k, "vitna_test_reply") == 0) continue;
         if (vitna_json_is_null(v)) continue;
-        if (strcmp(k, "max_tokens") == 0 || (chat && strcmp(k, "max_completion_tokens") == 0)) {
+        const bool max_key = kind == API_RESPONSES ? strcmp(k, "max_output_tokens") == 0
+                                                   : strcmp(k, "max_tokens") == 0 || (kind == API_CHAT && strcmp(k, "max_completion_tokens") == 0);
+        if (max_key) {
             if (!vitna_json_as_number(v, &d) || !integral(d) || d < 1) {
                 set_error(e, 400, "invalid_request_error", "invalid_value", k, "`%s` must be a positive integer", k);
                 return false;
@@ -258,8 +336,10 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
             p->max_tokens = (size_t)d;
             p->has_max_tokens = true;
         } else if (strcmp(k, "temperature") == 0) {
-            if (!vitna_json_as_number(v, &d) || d < 0 || d > 2) {
-                set_error(e, 400, "invalid_request_error", "invalid_value", k, "`temperature` must be a number from 0 to 2");
+            /* Anthropic's scale ends at 1, OpenAI's at 2. */
+            const double top = kind == API_MESSAGES ? 1 : 2;
+            if (!vitna_json_as_number(v, &d) || d < 0 || d > top) {
+                set_error(e, 400, "invalid_request_error", "invalid_value", k, "`temperature` must be a number from 0 to %d", (int)top);
                 return false;
             }
             p->temperature = (float)d;
@@ -282,7 +362,7 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
             }
             p->seed = (uint64_t)(long long)d;
             p->has_seed = true;
-        } else if (strcmp(k, "stop") == 0) {
+        } else if (openai && strcmp(k, "stop") == 0) {
             if (v->type == VITNA_JSON_STRING) {
                 if (v->u.string.len == 0) {
                     set_error(e, 400, "invalid_request_error", "invalid_value", k, "a stop sequence cannot be empty");
@@ -291,7 +371,7 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
                 p->stops[0] = v->u.string.ptr;
                 p->stop_lens[0] = v->u.string.len;
                 p->n_stops = 1;
-            } else if (v->type == VITNA_JSON_ARRAY && v->u.array.count <= MAX_STOPS) {
+            } else if (v->type == VITNA_JSON_ARRAY && v->u.array.count <= OPENAI_MAX_STOPS) {
                 for (size_t j = 0; j < v->u.array.count; j++) {
                     const vitna_json_value_t* s = v->u.array.items[j];
                     if (s->type != VITNA_JSON_STRING || s->u.string.len == 0) {
@@ -302,47 +382,68 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
                     p->stop_lens[p->n_stops++] = s->u.string.len;
                 }
             } else {
-                set_error(e, 400, "invalid_request_error", "invalid_value", k, "`stop` must be a string or up to %d strings", MAX_STOPS);
+                set_error(e, 400, "invalid_request_error", "invalid_value", k, "`stop` must be a string or up to %d strings", OPENAI_MAX_STOPS);
                 return false;
+            }
+        } else if (kind == API_MESSAGES && strcmp(k, "stop_sequences") == 0) {
+            if (v->type != VITNA_JSON_ARRAY || v->u.array.count > MAX_STOPS) {
+                set_error(e, 400, "invalid_request_error", "invalid_value", k, "`stop_sequences` must be up to %d strings", MAX_STOPS);
+                return false;
+            }
+            for (size_t j = 0; j < v->u.array.count; j++) {
+                const vitna_json_value_t* s = v->u.array.items[j];
+                if (s->type != VITNA_JSON_STRING || s->u.string.len == 0) {
+                    set_error(e, 400, "invalid_request_error", "invalid_value", k, "each stop sequence must be a non-empty string");
+                    return false;
+                }
+                p->stops[p->n_stops] = s->u.string.ptr;
+                p->stop_lens[p->n_stops++] = s->u.string.len;
             }
         } else if (strcmp(k, "stream") == 0) {
             if (!vitna_json_as_bool(v, &p->stream)) {
                 set_error(e, 400, "invalid_request_error", "invalid_value", k, "`stream` must be true or false");
                 return false;
             }
-        } else if (strcmp(k, "stream_options") == 0) {
+        } else if (kind != API_MESSAGES && strcmp(k, "stream_options") == 0) {
             if (v->type != VITNA_JSON_OBJECT) {
                 set_error(e, 400, "invalid_request_error", "invalid_value", k, "`stream_options` must be an object");
                 return false;
             }
-            p->has_stream_options = true;
-            vitna_json_as_bool(vitna_json_get(v, "include_usage"), &p->include_usage);
-        } else if (strcmp(k, "n") == 0 || strcmp(k, "best_of") == 0) {
+            /* Responses' only option hides the stream's lengths, and a local server has nothing to hide them from. */
+            p->has_stream_options = openai;
+            if (openai) vitna_json_as_bool(vitna_json_get(v, "include_usage"), &p->include_usage);
+        } else if (openai && (strcmp(k, "n") == 0 || strcmp(k, "best_of") == 0)) {
             if (!vitna_json_as_number(v, &d) || d != 1) {
                 unsupported(e, k, "it returns one choice per request");
                 return false;
             }
-        } else if (strcmp(k, "logprobs") == 0) {
+        } else if (openai && strcmp(k, "logprobs") == 0) {
             if (!(vitna_json_as_bool(v, &b) && !b)) {
                 unsupported(e, k, "it does not return log probabilities yet");
                 return false;
             }
-        } else if (strcmp(k, "top_logprobs") == 0) {
-            unsupported(e, k, "it does not return log probabilities yet");
-            return false;
-        } else if (strcmp(k, "presence_penalty") == 0 || strcmp(k, "frequency_penalty") == 0) {
+        } else if (kind != API_MESSAGES && strcmp(k, "top_logprobs") == 0) {
+            if (!is_zero_or_null(v)) {
+                unsupported(e, k, "it does not return log probabilities yet");
+                return false;
+            }
+        } else if (openai && (strcmp(k, "presence_penalty") == 0 || strcmp(k, "frequency_penalty") == 0)) {
             if (!is_zero_or_null(v)) {
                 unsupported(e, k, "it applies no penalties to logits");
                 return false;
             }
-        } else if (strcmp(k, "logit_bias") == 0) {
+        } else if (openai && strcmp(k, "logit_bias") == 0) {
             if (!(v->type == VITNA_JSON_OBJECT && v->u.object.count == 0)) {
                 unsupported(e, k, "it applies no bias to logits");
                 return false;
             }
-        } else if (strcmp(k, "response_format") == 0) {
-            const char* t = vitna_json_as_string(vitna_json_get(v, "type"));
-            if (t && strcmp(t, "json_object") == 0) {
+        } else if ((openai && strcmp(k, "response_format") == 0) || (kind == API_RESPONSES && strcmp(k, "text") == 0)) {
+            /* response_format, or Responses' text.format: the same types. */
+            const vitna_json_value_t* f = kind == API_RESPONSES ? vitna_json_get(v, "format") : v;
+            const char* t = vitna_json_as_string(vitna_json_get(f, "type"));
+            if (kind == API_RESPONSES && (!f || vitna_json_is_null(f))) {
+                /* text carries only its verbosity, which a model without the setting cannot follow */
+            } else if (t && strcmp(t, "json_object") == 0) {
                 p->json = true;
             } else if (t && strcmp(t, "json_schema") == 0) {
                 unsupported(e, k, "it constrains output to a JSON object (type json_object) but not yet to a schema");
@@ -351,25 +452,44 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
                 unsupported(e, k, "its types are text and json_object");
                 return false;
             }
-        } else if (strcmp(k, "tools") == 0 || strcmp(k, "functions") == 0) {
+        } else if (kind == API_COMPLETIONS && (strcmp(k, "tools") == 0 || strcmp(k, "functions") == 0)) {
             if (!(v->type == VITNA_JSON_ARRAY && v->u.array.count == 0)) {
-                unsupported(e, k, "it has no tool calling");
+                unsupported(e, k, "a completion has no tool calling: send a conversation to /v1/chat/completions");
                 return false;
             }
-        } else if (strcmp(k, "tool_choice") == 0 || strcmp(k, "function_call") == 0) {
+        } else if (kind == API_COMPLETIONS && (strcmp(k, "tool_choice") == 0 || strcmp(k, "function_call") == 0)) {
             const char* c = vitna_json_as_string(v);
             if (!c || (strcmp(c, "none") != 0 && strcmp(c, "auto") != 0)) {
-                unsupported(e, k, "it has no tool calling");
+                unsupported(e, k, "a completion has no tool calling: send a conversation to /v1/chat/completions");
                 return false;
             }
-        } else if (!chat && strcmp(k, "echo") == 0) {
+        } else if (kind == API_COMPLETIONS && strcmp(k, "echo") == 0) {
             if (!(vitna_json_as_bool(v, &b) && !b)) {
                 unsupported(e, k, "it returns only the completion");
                 return false;
             }
-        } else if (!chat && strcmp(k, "suffix") == 0) {
+        } else if (kind == API_COMPLETIONS && strcmp(k, "suffix") == 0) {
             unsupported(e, k, "it does not insert text");
             return false;
+        } else if (kind == API_RESPONSES && (strcmp(k, "previous_response_id") == 0 || strcmp(k, "conversation") == 0)) {
+            unsupported(e, k, "it keeps no responses or conversations, so send the whole conversation as `input`");
+            return false;
+        } else if (kind == API_RESPONSES && strcmp(k, "background") == 0) {
+            if (!(vitna_json_as_bool(v, &b) && !b)) {
+                unsupported(e, k, "it answers while the client waits");
+                return false;
+            }
+        } else if (kind == API_RESPONSES && strcmp(k, "truncation") == 0) {
+            const char* t = vitna_json_as_string(v);
+            if (!t || strcmp(t, "disabled") != 0) {
+                unsupported(e, k, "it never drops input to make it fit: a conversation too long for the context is refused");
+                return false;
+            }
+        } else if (kind == API_MESSAGES && strcmp(k, "mcp_servers") == 0) {
+            if (!(v->type == VITNA_JSON_ARRAY && v->u.array.count == 0)) {
+                unsupported(e, k, "it connects to no MCP servers: the client runs its own tools");
+                return false;
+            }
         } else if (ignored->len < 400) {
             /* Named in a response header, so only header-safe characters:
              * a field name that is not [A-Za-z0-9_.-] is written with _ for
@@ -384,6 +504,10 @@ static bool parse_params(const vitna_json_value_t* root, bool chat, params_t* p,
     }
     if (p->has_stream_options && !p->stream) {
         set_error(e, 400, "invalid_request_error", "invalid_value", "stream_options", "`stream_options` is only allowed when `stream` is true");
+        return false;
+    }
+    if (kind == API_MESSAGES && !p->has_max_tokens) {
+        set_error(e, 400, "invalid_request_error", "missing_required_parameter", "max_tokens", "`max_tokens` is required");
         return false;
     }
     return true;
@@ -413,67 +537,152 @@ bool vitna_chatml_format(const char* const* roles, const char* const* contents, 
     return true;
 }
 
-/* Messages as ChatML: each "<|im_start|>{role}\n{content}<|im_end|>\n", then
- * "<|im_start|>assistant\n" for the reply. A developer message is a system one. */
-static bool chat_prompt(const vitna_json_value_t* messages, vitna_strbuf_t* out, api_error_t* e) {
-    char* param = e->param_buf;
-    if (!messages || messages->type != VITNA_JSON_ARRAY || messages->u.array.count == 0) {
-        set_error(e, 400, "invalid_request_error", "invalid_value", "messages", "`messages` must be a non-empty array");
+/* A converted conversation (convert.h) as ChatML: each
+ * "<|im_start|>{role}\n{content}<|im_end|>\n", then "<|im_start|>assistant\n"
+ * for the reply, or, to continue the last message, that message left open.
+ * ChatML has no place for tools, tool calls or their results, so a
+ * conversation with any is refused. An assistant's reasoning is left out:
+ * a ChatML model writes none. */
+static bool chatml_prompt(const vitna_chat_request_t* cr, api_kind_t kind, vitna_strbuf_t* out, api_error_t* e) {
+    if (cr->tools.len) {
+        unsupported(e, "tools", "it has no tool calling");
         return false;
     }
-    for (size_t i = 0; i < messages->u.array.count; i++) {
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(cr->messages.data, cr->messages.len, err, sizeof(err));
+    const vitna_json_value_t* messages = doc ? vitna_json_root(doc) : NULL;
+    if (!messages) {
+        set_error(e, 500, "server_error", NULL, NULL, "out of memory");
+        return false;
+    }
+    const size_t n = messages->u.array.count;
+    bool ok = true;
+    for (size_t i = 0; i < n && ok; i++) {
         const vitna_json_value_t* m = messages->u.array.items[i];
         const char* role = vitna_json_as_string(vitna_json_get(m, "role"));
-        snprintf(param, sizeof(e->param_buf), "messages[%zu]", i);
-        if (m->type != VITNA_JSON_OBJECT || !role) {
-            set_error(e, 400, "invalid_request_error", "invalid_value", param, "each message needs a role");
-            return false;
-        }
-        if (strcmp(role, "developer") == 0) role = "system";
-        if (strcmp(role, "tool") == 0 || strcmp(role, "function") == 0) {
-            unsupported(e, param, "it has no tool calling, so there are no tool results to read");
-            return false;
-        }
-        if (strcmp(role, "system") != 0 && strcmp(role, "user") != 0 && strcmp(role, "assistant") != 0) {
-            set_error(e, 400, "invalid_request_error", "invalid_value", param, "unknown role \"%s\"", role);
-            return false;
-        }
-        const vitna_json_value_t* name = vitna_json_get(m, "name");
-        const vitna_json_value_t* calls = vitna_json_get(m, "tool_calls");
-        if (name && !vitna_json_is_null(name)) {
-            unsupported(e, param, "a message's `name` has no place in this model's chat format");
-            return false;
-        }
-        if (calls && !vitna_json_is_null(calls) && !(calls->type == VITNA_JSON_ARRAY && calls->u.array.count == 0)) {
-            unsupported(e, param, "it has no tool calling");
-            return false;
-        }
         const vitna_json_value_t* content = vitna_json_get(m, "content");
-        if (content && content->type == VITNA_JSON_STRING) {
-            chatml_append(out, role, content->u.string.ptr, content->u.string.len);
-        } else if (content && content->type == VITNA_JSON_ARRAY) {
-            vitna_strbuf_t text;
-            vitna_sb_init(&text);
-            for (size_t j = 0; j < content->u.array.count; j++) {
-                const vitna_json_value_t* part = content->u.array.items[j];
-                const char* type = vitna_json_as_string(vitna_json_get(part, "type"));
-                const vitna_json_value_t* t = vitna_json_get(part, "text");
-                if (!type || strcmp(type, "text") != 0 || !t || t->type != VITNA_JSON_STRING) {
-                    vitna_sb_free(&text);
-                    unsupported(e, param, "the model reads text only");
-                    return false;
-                }
-                vitna_sb_append(&text, t->u.string.ptr, t->u.string.len);
-            }
-            chatml_append(out, role, text.data ? text.data : "", text.len);
-            vitna_sb_free(&text);
+        /* A chat request's messages convert one for one; the other shapes' do not. */
+        if (kind == API_CHAT) snprintf(e->param_buf, sizeof(e->param_buf), "messages[%zu]", i);
+        else snprintf(e->param_buf, sizeof(e->param_buf), "%s", kind == API_RESPONSES ? "input" : "messages");
+        if (strcmp(role, "tool") == 0) {
+            unsupported(e, e->param_buf, "it has no tool calling, so there are no tool results to read");
+            ok = false;
+        } else if (vitna_json_get(m, "tool_calls")) {
+            unsupported(e, e->param_buf, "it has no tool calling");
+            ok = false;
         } else {
-            set_error(e, 400, "invalid_request_error", "invalid_value", param, "each message needs text content");
-            return false;
+            vitna_sb_puts(out, "<|im_start|>");
+            vitna_sb_puts(out, role);
+            vitna_sb_puts(out, "\n");
+            vitna_sb_append(out, content->u.string.ptr, content->u.string.len);
+            if (!(cr->continue_final && i == n - 1)) vitna_sb_puts(out, "<|im_end|>\n");
         }
     }
-    vitna_sb_puts(out, "<|im_start|>assistant\n");
-    return true;
+    if (ok && !cr->continue_final) vitna_sb_puts(out, "<|im_start|>assistant\n");
+    vitna_json_free(doc);
+    return ok;
+}
+
+/* The opening of a tool call the model is made to write: Qwen3's
+ * <tool_call>, then the call's JSON up to the name the model chooses, or,
+ * for a named tool, up to its arguments. */
+static void forced_opening(vitna_strbuf_t* out, const vitna_chat_request_t* cr) {
+    vitna_sb_puts(out, "<tool_call>\n{\"name\": ");
+    if (cr->tool_choice == VITNA_TOOLS_NAMED) {
+        vitna_json_value_t name;
+        memset(&name, 0, sizeof(name));
+        name.type = VITNA_JSON_STRING;
+        name.u.string.ptr = cr->tool_name;
+        name.u.string.len = strlen(cr->tool_name);
+        vitna_json_write_py(out, &name);
+        vitna_sb_puts(out, ", \"arguments\": ");
+    } else {
+        vitna_sb_puts(out, "\"");
+    }
+}
+
+/* A conversation's prompt, and how its reply is read back, for a request of
+ * any of the three shapes: converted (convert.h), then written in the
+ * model's chat template. With Qwen3's, a tool_choice that forces a call
+ * writes the call's opening into the prompt (prefill), and none bans the
+ * <tool_call> token while the tools stay in the prompt, so its start is the
+ * same whatever the choice and a cached prefix serves either. */
+static bool chat_build(const vitna_api_t* api, const vitna_json_value_t* root, params_t* p, vitna_strbuf_t* prompt, vitna_strbuf_t* prefill,
+                       api_error_t* e) {
+    vitna_chat_request_t cr;
+    vitna_chat_request_init(&cr);
+    vitna_json_doc_t* md = NULL;
+    vitna_json_doc_t* td = NULL;
+    char err[160];
+    bool ok = p->kind == API_CHAT ? vitna_convert_chat(root, &cr) : p->kind == API_MESSAGES ? vitna_convert_messages(root, &cr) : vitna_convert_responses(root, &cr);
+    if (!ok) {
+        snprintf(e->param_buf, sizeof(e->param_buf), "%s", cr.param);
+        if (!cr.param[0]) set_error(e, 500, "server_error", NULL, NULL, "%s", cr.message);
+        else if (cr.unsupported) unsupported(e, e->param_buf, cr.message);
+        else set_error(e, 400, "invalid_request_error", "invalid_value", e->param_buf, "%s", cr.message);
+        goto done;
+    }
+    if (!api->qwen3) {
+        ok = chatml_prompt(&cr, p->kind, prompt, e);
+        goto done;
+    }
+    const bool has_tools = cr.tools.len > 0;
+    const bool forced = cr.tool_choice == VITNA_TOOLS_REQUIRED || cr.tool_choice == VITNA_TOOLS_NAMED;
+    const char* json_param = p->kind == API_RESPONSES ? "text" : "response_format";
+    int thinking = cr.enable_thinking;
+    ok = false;
+    if (p->json && thinking == 1) {
+        unsupported(e, json_param, "JSON mode holds the reply to a JSON object from its first token, so the model cannot think first");
+        goto done;
+    }
+    if (p->json && forced) {
+        unsupported(e, json_param, "JSON mode holds the reply to a JSON object, and a forced tool call is not one");
+        goto done;
+    }
+    if (forced && thinking == 1) {
+        set_error(e, 400, "invalid_request_error", "invalid_value", "tool_choice",
+                  "a tool_choice that forces a tool call cannot be combined with thinking: the call is written from the reply's first token");
+        goto done;
+    }
+    if (p->json || forced) thinking = 0;
+    md = vitna_json_parse(cr.messages.data, cr.messages.len, err, sizeof(err));
+    td = has_tools ? vitna_json_parse(cr.tools.data, cr.tools.len, err, sizeof(err)) : NULL;
+    if (!md || (has_tools && !td)) {
+        set_error(e, 500, "server_error", NULL, NULL, "out of memory");
+        goto done;
+    }
+    if (!vitna_chat_qwen3(prompt, vitna_json_root(md), td ? vitna_json_root(td) : NULL, thinking, !cr.continue_final, err, sizeof(err))) {
+        set_error(e, 400, "invalid_request_error", "invalid_value", p->kind == API_RESPONSES ? "input" : "messages", "%s", err);
+        goto done;
+    }
+    if (cr.continue_final) {
+        /* The last message, the assistant's, left open to be continued. */
+        static const char end[] = "<|im_end|>\n";
+        const size_t k = sizeof(end) - 1;
+        if (prompt->len < k || memcmp(prompt->data + prompt->len - k, end, k) != 0) {
+            set_error(e, 500, "server_error", NULL, NULL, "the chat template did not end the last message as it should");
+            goto done;
+        }
+        prompt->len -= k;
+        prompt->data[prompt->len] = '\0';
+    }
+    if (forced) {
+        forced_opening(prefill, &cr);
+        vitna_sb_append(prompt, prefill->data, prefill->len);
+    }
+    p->parse = true;
+    p->think = thinking != 0 && !cr.continue_final;
+    p->tools = has_tools && cr.tool_choice != VITNA_TOOLS_NONE && !p->json;
+    p->ban = has_tools && cr.tool_choice == VITNA_TOOLS_NONE ? api->tool_call_token : -1;
+    p->prefill = prefill->data;
+    p->prefill_len = prefill->len;
+    ok = prompt->ok && prefill->ok;
+    if (!ok) set_error(e, 500, "server_error", NULL, NULL, "out of memory");
+done:
+    vitna_json_free(md);
+    vitna_json_free(td);
+    vitna_chat_request_free(&cr);
+    return ok;
 }
 
 static bool completion_prompt(const vitna_api_t* api, const vitna_json_value_t* prompt, vitna_token_list_t* ids, api_error_t* e) {
@@ -506,19 +715,44 @@ static bool completion_prompt(const vitna_api_t* api, const vitna_json_value_t* 
 
 /* --- Generation --- */
 
+/* A part of a reply as it goes out: its reasoning or its text, gathered
+ * while it lasts, or one tool call. A response sent whole is written from
+ * the parts at the end; a stream sends each as it grows. */
+typedef struct {
+    vitna_reply_kind_t kind;
+    vitna_strbuf_t data;    /* the reasoning or text, or the call's name */
+    vitna_strbuf_t args;    /* a call's arguments, as JSON */
+    bool open;              /* reasoning or text that may still grow */
+    size_t call;            /* a call: which of the reply's calls it is */
+} part_t;
+
 typedef struct {
     vitna_api_t* api;
     vitna_sink_t* sink;
     const params_t* p;
     char id[48];
+    uint64_t uid;           /* what the response's id, and its parts' and calls', are made from */
     long long created;
-    vitna_strbuf_t text;   /* generated bytes, cut at a stop sequence */
-    size_t emitted;        /* bytes of text already streamed */
+    vitna_strbuf_t text;    /* the reply: the prefill, then the generated bytes, cut at a stop sequence */
+    size_t emitted;         /* bytes of text already streamed: a completion's, or a reply not read back */
+    vitna_reply_parser_t rp;
+    part_t* parts;
+    size_t n_parts, cap_parts, n_calls;
+    bool failed;            /* a part could not be kept: out of memory */
+    size_t seq;             /* Responses: the events sent, so the next one's sequence_number */
+    int stop;               /* the stop sequence that ended the reply, or -1 */
+    size_t forced_at;       /* for tests: the forced tokens taken */
+    bool think_closed;      /* </think> has been generated */
+    size_t reasoning_tokens;/* the tokens up to and including the one that closed the reasoning */
 } gen_t;
 
 static void usage_json(vitna_strbuf_t* sb, const vitna_api_result_t* r) {
     vitna_sb_printf(sb, "{\"prompt_tokens\":%zu,\"completion_tokens\":%zu,\"total_tokens\":%zu,\"prompt_tokens_details\":{\"cached_tokens\":%zu}}",
                     r->prompt_tokens, r->completion_tokens, r->prompt_tokens + r->completion_tokens, r->cached_tokens);
+}
+
+static void put_string(vitna_strbuf_t* sb, const char* s, size_t n) {
+    vitna_sb_json_string(sb, (const unsigned char*)(s ? s : ""), s ? n : 0);
 }
 
 /* One server-sent event. text is a delta, finish the finish reason or NULL,
@@ -560,16 +794,418 @@ static void send_chunk(gen_t* g, const unsigned char* text, size_t n, const char
     vitna_sb_free(&sb);
 }
 
-/* The last event of a stream that fails after its 200 has gone out. Its data
- * is the body an error response would have had, and no final chunk or [DONE]
- * follows it, so the reply so far cannot pass for a whole one. */
+/* A chat chunk whose delta holds the members given, as "content":"...". */
+static void chat_chunk(gen_t* g, const vitna_strbuf_t* delta) {
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    vitna_sb_puts(&sb, "data: {\"id\":");
+    vitna_sb_json_string(&sb, (const unsigned char*)g->id, strlen(g->id));
+    vitna_sb_printf(&sb, ",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":", g->created);
+    vitna_sb_json_string(&sb, (const unsigned char*)g->api->model_id, strlen(g->api->model_id));
+    vitna_sb_puts(&sb, ",\"choices\":[{\"index\":0,\"delta\":{");
+    vitna_sb_append(&sb, delta->data, delta->len);
+    vitna_sb_puts(&sb, "},\"logprobs\":null,\"finish_reason\":null}]}\n\n");
+    sink_out(g->sink, sb.data, sb.len);
+    vitna_sb_free(&sb);
+}
+
+/* An event of Anthropic's stream: its type, then the members given. */
+static void anthropic_event(gen_t* g, const char* type, const vitna_strbuf_t* members) {
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    vitna_sb_printf(&sb, "event: %s\ndata: {\"type\":\"%s\"", type, type);
+    if (members && members->len) {
+        vitna_sb_puts(&sb, ",");
+        vitna_sb_append(&sb, members->data, members->len);
+    }
+    vitna_sb_puts(&sb, "}\n\n");
+    sink_out(g->sink, sb.data, sb.len);
+    vitna_sb_free(&sb);
+}
+
+/* An event of a Responses stream: its type and sequence_number, then the members given. */
+static void responses_event(gen_t* g, const char* type, const vitna_strbuf_t* members) {
+    vitna_strbuf_t sb;
+    vitna_sb_init(&sb);
+    vitna_sb_printf(&sb, "event: %s\ndata: {\"type\":\"%s\",\"sequence_number\":%zu", type, type, g->seq++);
+    if (members && members->len) {
+        vitna_sb_puts(&sb, ",");
+        vitna_sb_append(&sb, members->data, members->len);
+    }
+    vitna_sb_puts(&sb, "}\n\n");
+    sink_out(g->sink, sb.data, sb.len);
+    vitna_sb_free(&sb);
+}
+
+/* The id of a part of the reply (salt 1) or of a call (salt 2): a prefix
+ * and 16 hex digits made from the response's own, so a stream's events and
+ * the response it ends with name each the same. */
+static void sub_id(char* buf, size_t len, const char* prefix, uint64_t uid, uint64_t salt, size_t i) {
+    snprintf(buf, len, "%s%016llx", prefix, (unsigned long long)mix64(uid ^ (salt * 0x9E3779B97F4A7C15ULL) ^ ((uint64_t)(i + 1) << 20)));
+}
+
+static void call_id(const gen_t* g, const part_t* q, char* buf, size_t len) {
+    sub_id(buf, len, g->p->kind == API_MESSAGES ? "toolu_" : "call_", g->uid, 2, q->call);
+}
+
+/* A Responses output item's id: rs_, msg_ or fc_ by its kind. */
+static void item_id(const gen_t* g, size_t i, char* buf, size_t len) {
+    const vitna_reply_kind_t kind = g->parts[i].kind;
+    sub_id(buf, len, kind == VITNA_REPLY_REASONING ? "rs_" : kind == VITNA_REPLY_TEXT ? "msg_" : "fc_", g->uid, 1, i);
+}
+
+/* The text of a reply's parts of one kind, run together. */
+static void parts_text(const gen_t* g, vitna_reply_kind_t kind, vitna_strbuf_t* out) {
+    for (size_t i = 0; i < g->n_parts; i++) {
+        if (g->parts[i].kind == kind) vitna_sb_append(out, g->parts[i].data.data, g->parts[i].data.len);
+    }
+}
+
+static bool has_part(const gen_t* g, vitna_reply_kind_t kind) {
+    for (size_t i = 0; i < g->n_parts; i++) {
+        if (g->parts[i].kind == kind) return true;
+    }
+    return false;
+}
+
+/* --- Anthropic's Messages: a response's shape --- */
+
+/* A content block: thinking, text or tool_use; at its start, empty. */
+static void anthropic_block(const gen_t* g, size_t i, vitna_strbuf_t* b, bool start) {
+    const part_t* q = &g->parts[i];
+    if (q->kind == VITNA_REPLY_REASONING) {
+        vitna_sb_puts(b, "{\"type\":\"thinking\",\"thinking\":");
+        put_string(b, start ? "" : q->data.data, start ? 0 : q->data.len);
+        vitna_sb_puts(b, ",\"signature\":\"\"}");
+    } else if (q->kind == VITNA_REPLY_TEXT) {
+        vitna_sb_puts(b, "{\"type\":\"text\",\"text\":");
+        put_string(b, start ? "" : q->data.data, start ? 0 : q->data.len);
+        vitna_sb_puts(b, "}");
+    } else {
+        char id[40];
+        call_id(g, q, id, sizeof(id));
+        vitna_sb_printf(b, "{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":", id);
+        put_string(b, q->data.data, q->data.len);
+        vitna_sb_puts(b, ",\"input\":");
+        if (start) vitna_sb_puts(b, "{}");
+        else vitna_sb_append(b, q->args.data, q->args.len);
+        vitna_sb_puts(b, "}");
+    }
+}
+
+/* Anthropic's usage: the prompt's tokens read from the cache counted apart
+ * from the rest, as its API counts cache reads. */
+static void anthropic_usage(vitna_strbuf_t* b, const vitna_api_result_t* r, bool start) {
+    vitna_sb_printf(b, "{\"input_tokens\":%zu,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":%zu,\"output_tokens\":%zu}",
+                    r->prompt_tokens - r->cached_tokens, r->cached_tokens, start ? (size_t)0 : r->completion_tokens);
+}
+
+static const char* anthropic_stop_reason(const gen_t* g, const char* finish) {
+    if (strcmp(finish, "length") == 0) return "max_tokens";
+    if (g->stop >= 0) return "stop_sequence";
+    return g->n_calls ? "tool_use" : "end_turn";
+}
+
+static void anthropic_message(const gen_t* g, const vitna_api_result_t* r, const char* finish, vitna_strbuf_t* b) {
+    vitna_sb_puts(b, "{\"id\":");
+    put_string(b, g->id, strlen(g->id));
+    vitna_sb_puts(b, ",\"type\":\"message\",\"role\":\"assistant\",\"model\":");
+    put_string(b, g->api->model_id, strlen(g->api->model_id));
+    vitna_sb_puts(b, ",\"content\":[");
+    for (size_t i = 0; finish && i < g->n_parts; i++) {
+        if (i) vitna_sb_puts(b, ",");
+        anthropic_block(g, i, b, false);
+    }
+    vitna_sb_puts(b, "],\"stop_reason\":");
+    if (finish) vitna_sb_printf(b, "\"%s\"", anthropic_stop_reason(g, finish));
+    else vitna_sb_puts(b, "null");
+    vitna_sb_puts(b, ",\"stop_sequence\":");
+    if (finish && g->stop >= 0) put_string(b, g->p->stops[g->stop], g->p->stop_lens[g->stop]);
+    else vitna_sb_puts(b, "null");
+    vitna_sb_puts(b, ",\"usage\":");
+    anthropic_usage(b, r, !finish);
+    vitna_sb_puts(b, "}");
+}
+
+/* --- OpenAI's Responses: a response's shape --- */
+
+static void output_text_part(vitna_strbuf_t* b, const char* text, size_t n) {
+    vitna_sb_puts(b, "{\"type\":\"output_text\",\"text\":");
+    put_string(b, text, n);
+    vitna_sb_puts(b, ",\"annotations\":[],\"logprobs\":[]}");
+}
+
+/* An output item: reasoning, a message, or a function call; until done, without its content. */
+static void responses_item(const gen_t* g, size_t i, vitna_strbuf_t* b, bool done) {
+    const part_t* q = &g->parts[i];
+    char id[40];
+    item_id(g, i, id, sizeof(id));
+    if (q->kind == VITNA_REPLY_REASONING) {
+        vitna_sb_printf(b, "{\"type\":\"reasoning\",\"id\":\"%s\",\"summary\":[],\"content\":[", id);
+        if (done) {
+            vitna_sb_puts(b, "{\"type\":\"reasoning_text\",\"text\":");
+            put_string(b, q->data.data, q->data.len);
+            vitna_sb_puts(b, "}");
+        }
+        vitna_sb_puts(b, "]}");
+    } else if (q->kind == VITNA_REPLY_TEXT) {
+        vitna_sb_printf(b, "{\"type\":\"message\",\"id\":\"%s\",\"status\":\"%s\",\"role\":\"assistant\",\"content\":[", id, done ? "completed" : "in_progress");
+        if (done) output_text_part(b, q->data.data, q->data.len);
+        vitna_sb_puts(b, "]}");
+    } else {
+        char call[40];
+        call_id(g, q, call, sizeof(call));
+        vitna_sb_printf(b, "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":", id, call);
+        put_string(b, q->data.data, q->data.len);
+        vitna_sb_puts(b, ",\"arguments\":");
+        put_string(b, done ? q->args.data : "", done ? q->args.len : 0);
+        vitna_sb_printf(b, ",\"status\":\"%s\"}", done ? "completed" : "in_progress");
+    }
+}
+
+/* A member of the request repeated in the response, or fallback without one. */
+static void echo(vitna_strbuf_t* b, const vitna_json_value_t* v, const char* fallback) {
+    if (v && !vitna_json_is_null(v)) vitna_json_write_py(b, v);
+    else vitna_sb_puts(b, fallback);
+}
+
+/* The response object: as created (in_progress, before any output), as it
+ * ends (completed, or incomplete when it ran out of tokens), or failed. */
+static void responses_object(const gen_t* g, const vitna_api_result_t* r, const char* status, const api_error_t* err, vitna_strbuf_t* b) {
+    const params_t* p = g->p;
+    const vitna_json_value_t* root = p->root;
+    const vitna_json_value_t* reasoning = vitna_json_get(root, "reasoning");
+    vitna_sb_puts(b, "{\"id\":");
+    put_string(b, g->id, strlen(g->id));
+    vitna_sb_printf(b, ",\"object\":\"response\",\"created_at\":%lld,\"status\":\"%s\",\"background\":false,\"error\":", g->created, status);
+    if (err) {
+        vitna_sb_puts(b, "{\"code\":\"server_error\",\"message\":");
+        put_string(b, err->message, strlen(err->message));
+        vitna_sb_puts(b, "}");
+    } else {
+        vitna_sb_puts(b, "null");
+    }
+    vitna_sb_puts(b, ",\"incomplete_details\":");
+    vitna_sb_puts(b, strcmp(status, "incomplete") == 0 ? "{\"reason\":\"max_output_tokens\"}" : "null");
+    vitna_sb_puts(b, ",\"instructions\":");
+    echo(b, vitna_json_get(root, "instructions"), "null");
+    vitna_sb_puts(b, ",\"max_output_tokens\":");
+    if (p->has_max_tokens) vitna_sb_printf(b, "%zu", p->max_tokens);
+    else vitna_sb_puts(b, "null");
+    vitna_sb_puts(b, ",\"model\":");
+    put_string(b, g->api->model_id, strlen(g->api->model_id));
+    vitna_sb_puts(b, ",\"output\":[");
+    for (size_t i = 0; r && i < g->n_parts; i++) {
+        if (i) vitna_sb_puts(b, ",");
+        responses_item(g, i, b, true);
+    }
+    vitna_sb_puts(b, "],\"parallel_tool_calls\":");
+    echo(b, vitna_json_get(root, "parallel_tool_calls"), "true");
+    vitna_sb_puts(b, ",\"previous_response_id\":null,\"reasoning\":{\"effort\":");
+    echo(b, reasoning && reasoning->type == VITNA_JSON_OBJECT ? vitna_json_get(reasoning, "effort") : NULL, "null");
+    vitna_sb_puts(b, ",\"summary\":null},\"store\":false,\"temperature\":");
+    echo(b, vitna_json_get(root, "temperature"), "1.0");
+    vitna_sb_printf(b, ",\"text\":{\"format\":{\"type\":\"%s\"}},\"tool_choice\":", p->json ? "json_object" : "text");
+    echo(b, vitna_json_get(root, "tool_choice"), "\"auto\"");
+    vitna_sb_puts(b, ",\"tools\":");
+    echo(b, vitna_json_get(root, "tools"), "[]");
+    vitna_sb_puts(b, ",\"top_p\":");
+    echo(b, vitna_json_get(root, "top_p"), "1.0");
+    vitna_sb_puts(b, ",\"truncation\":\"disabled\",\"usage\":");
+    if (r) {
+        vitna_sb_printf(b,
+                        "{\"input_tokens\":%zu,\"input_tokens_details\":{\"cached_tokens\":%zu},\"output_tokens\":%zu,\"output_tokens_details\":"
+                        "{\"reasoning_tokens\":%zu},\"total_tokens\":%zu}",
+                        r->prompt_tokens, r->cached_tokens, r->completion_tokens, g->reasoning_tokens, r->prompt_tokens + r->completion_tokens);
+    } else {
+        vitna_sb_puts(b, "null");
+    }
+    vitna_sb_puts(b, ",\"user\":null,\"metadata\":{}}");
+}
+
+/* --- A reply's parts as a stream sends them --- */
+
+/* A part opening: Anthropic's content block, or Responses' output item. */
+static void stream_open(gen_t* g, size_t i) {
+    vitna_strbuf_t m;
+    vitna_sb_init(&m);
+    if (g->p->kind == API_MESSAGES) {
+        vitna_sb_printf(&m, "\"index\":%zu,\"content_block\":", i);
+        anthropic_block(g, i, &m, true);
+        anthropic_event(g, "content_block_start", &m);
+    } else if (g->p->kind == API_RESPONSES) {
+        vitna_sb_printf(&m, "\"output_index\":%zu,\"item\":", i);
+        responses_item(g, i, &m, false);
+        responses_event(g, "response.output_item.added", &m);
+        if (g->parts[i].kind == VITNA_REPLY_TEXT) {
+            char id[40];
+            item_id(g, i, id, sizeof(id));
+            vitna_sb_clear(&m);
+            vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"content_index\":0,\"part\":", id, i);
+            output_text_part(&m, "", 0);
+            responses_event(g, "response.content_part.added", &m);
+        }
+    }
+    vitna_sb_free(&m);
+}
+
+/* Bytes of a part: reasoning, text, or a call's arguments, whole. */
+static void stream_delta(gen_t* g, size_t i, const char* s, size_t n) {
+    const part_t* q = &g->parts[i];
+    vitna_strbuf_t m;
+    vitna_sb_init(&m);
+    char id[40];
+    if (g->p->kind == API_CHAT) {
+        if (q->kind == VITNA_REPLY_TOOL_CALL) {
+            call_id(g, q, id, sizeof(id));
+            vitna_sb_printf(&m, "\"tool_calls\":[{\"index\":%zu,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":", q->call, id);
+            put_string(&m, q->data.data, q->data.len);
+            vitna_sb_puts(&m, ",\"arguments\":");
+            put_string(&m, s, n);
+            vitna_sb_puts(&m, "}}]");
+        } else {
+            vitna_sb_puts(&m, q->kind == VITNA_REPLY_REASONING ? "\"reasoning_content\":" : "\"content\":");
+            put_string(&m, s, n);
+        }
+        chat_chunk(g, &m);
+    } else if (g->p->kind == API_MESSAGES) {
+        const char* type = q->kind == VITNA_REPLY_REASONING ? "thinking_delta" : q->kind == VITNA_REPLY_TEXT ? "text_delta" : "input_json_delta";
+        const char* field = q->kind == VITNA_REPLY_REASONING ? "thinking" : q->kind == VITNA_REPLY_TEXT ? "text" : "partial_json";
+        vitna_sb_printf(&m, "\"index\":%zu,\"delta\":{\"type\":\"%s\",\"%s\":", i, type, field);
+        put_string(&m, s, n);
+        vitna_sb_puts(&m, "}");
+        anthropic_event(g, "content_block_delta", &m);
+    } else if (g->p->kind == API_RESPONSES) {
+        item_id(g, i, id, sizeof(id));
+        if (q->kind == VITNA_REPLY_TOOL_CALL) {
+            vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"delta\":", id, i);
+            put_string(&m, s, n);
+            responses_event(g, "response.function_call_arguments.delta", &m);
+        } else {
+            vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"content_index\":0,\"delta\":", id, i);
+            put_string(&m, s, n);
+            if (q->kind == VITNA_REPLY_TEXT) vitna_sb_puts(&m, ",\"logprobs\":[]");
+            responses_event(g, q->kind == VITNA_REPLY_TEXT ? "response.output_text.delta" : "response.reasoning_text.delta", &m);
+        }
+    }
+    vitna_sb_free(&m);
+}
+
+/* A part closing: Anthropic's block stops; Responses' item is done, with its text whole. */
+static void stream_close(gen_t* g, size_t i) {
+    const part_t* q = &g->parts[i];
+    vitna_strbuf_t m;
+    vitna_sb_init(&m);
+    if (g->p->kind == API_MESSAGES) {
+        vitna_sb_printf(&m, "\"index\":%zu", i);
+        anthropic_event(g, "content_block_stop", &m);
+    } else if (g->p->kind == API_RESPONSES) {
+        char id[40];
+        item_id(g, i, id, sizeof(id));
+        if (q->kind == VITNA_REPLY_TOOL_CALL) {
+            vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"name\":", id, i);
+            put_string(&m, q->data.data, q->data.len);
+            vitna_sb_puts(&m, ",\"arguments\":");
+            put_string(&m, q->args.data, q->args.len);
+            responses_event(g, "response.function_call_arguments.done", &m);
+        } else {
+            vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"content_index\":0,\"text\":", id, i);
+            put_string(&m, q->data.data, q->data.len);
+            if (q->kind == VITNA_REPLY_TEXT) vitna_sb_puts(&m, ",\"logprobs\":[]");
+            responses_event(g, q->kind == VITNA_REPLY_TEXT ? "response.output_text.done" : "response.reasoning_text.done", &m);
+            if (q->kind == VITNA_REPLY_TEXT) {
+                vitna_sb_clear(&m);
+                vitna_sb_printf(&m, "\"item_id\":\"%s\",\"output_index\":%zu,\"content_index\":0,\"part\":", id, i);
+                output_text_part(&m, q->data.data, q->data.len);
+                responses_event(g, "response.content_part.done", &m);
+            }
+        }
+        vitna_sb_clear(&m);
+        vitna_sb_printf(&m, "\"output_index\":%zu,\"item\":", i);
+        responses_item(g, i, &m, true);
+        responses_event(g, "response.output_item.done", &m);
+    }
+    vitna_sb_free(&m);
+}
+
+/* The last part, if it is reasoning or text still open, is done. */
+static void close_part(gen_t* g) {
+    if (!g->n_parts || !g->parts[g->n_parts - 1].open) return;
+    g->parts[g->n_parts - 1].open = false;
+    if (g->p->stream) stream_close(g, g->n_parts - 1);
+}
+
+static part_t* new_part(gen_t* g, vitna_reply_kind_t kind) {
+    if (g->n_parts == g->cap_parts) {
+        const size_t cap = g->cap_parts ? 2 * g->cap_parts : 4;
+        part_t* parts = (part_t*)realloc(g->parts, cap * sizeof(part_t));
+        if (!parts) {
+            g->failed = true;
+            return NULL;
+        }
+        g->parts = parts;
+        g->cap_parts = cap;
+    }
+    part_t* q = &g->parts[g->n_parts++];
+    memset(q, 0, sizeof(*q));
+    q->kind = kind;
+    vitna_sb_init(&q->data);
+    vitna_sb_init(&q->args);
+    return q;
+}
+
+/* A part of the reply as the parser reads it (vitna_reply_feed): kept, and
+ * sent on in a stream. Reasoning or text joins the part before it while that
+ * one is of its kind; a call is a part of its own, sent whole. */
+static void on_part(void* ctx, const vitna_reply_part_t* rp) {
+    gen_t* g = (gen_t*)ctx;
+    const bool stream = g->p->stream;
+    part_t* last = g->n_parts ? &g->parts[g->n_parts - 1] : NULL;
+    if (rp->kind != VITNA_REPLY_TOOL_CALL && last && last->open && last->kind == rp->kind) {
+        vitna_sb_append(&last->data, rp->data, rp->len);
+        if (stream) stream_delta(g, g->n_parts - 1, rp->data, rp->len);
+        return;
+    }
+    close_part(g);
+    part_t* q = new_part(g, rp->kind);
+    if (!q) return;
+    const size_t i = g->n_parts - 1;
+    vitna_sb_append(&q->data, rp->data, rp->len);
+    if (rp->kind == VITNA_REPLY_TOOL_CALL) {
+        vitna_sb_append(&q->args, rp->args, rp->args_len);
+        q->call = g->n_calls++;
+        if (stream) {
+            stream_open(g, i);
+            stream_delta(g, i, rp->args, rp->args_len);
+            stream_close(g, i);
+        }
+        return;
+    }
+    q->open = true;
+    if (stream) {
+        stream_open(g, i);
+        stream_delta(g, i, rp->data, rp->len);
+    }
+}
+
+/* The last event of a stream that fails after its 200 has gone out, in the
+ * shape of its API: an error event (OpenAI's chat and completions, and
+ * Anthropic's), or Responses' response.failed. No final chunk, [DONE] or
+ * message_stop follows it, so the reply so far cannot pass for a whole one. */
 static void send_error_event(gen_t* g, const api_error_t* e) {
     vitna_strbuf_t sb;
     vitna_sb_init(&sb);
-    vitna_sb_puts(&sb, "data: ");
-    error_json(&sb, e);
-    vitna_sb_puts(&sb, "\n\n");
-    sink_out(g->sink, sb.data, sb.len);
+    if (g->p->kind == API_RESPONSES) {
+        vitna_sb_puts(&sb, "\"response\":");
+        responses_object(g, NULL, "failed", e, &sb);
+        responses_event(g, "response.failed", &sb);
+    } else {
+        vitna_sb_puts(&sb, g->p->kind == API_MESSAGES ? "event: error\ndata: " : "data: ");
+        if (g->p->kind == API_MESSAGES) anthropic_error_json(&sb, e);
+        else error_json(&sb, e);
+        vitna_sb_puts(&sb, "\n\n");
+        sink_out(g->sink, sb.data, sb.len);
+    }
     vitna_sb_free(&sb);
 }
 
@@ -589,15 +1225,20 @@ static size_t stop_holdback(const params_t* p, const char* text, size_t len) {
 }
 
 /* Where the earliest stop sequence begins, looking only where bytes added
- * since from could complete one; -1 for none. */
-static long long find_stop(const params_t* p, const char* text, size_t len, size_t from) {
+ * since from could complete one and never before floor (the prefill, which
+ * the model did not write); -1 for none, else with *which the sequence. */
+static long long find_stop(const params_t* p, const char* text, size_t len, size_t from, size_t floor, int* which) {
     long long best = -1;
     for (size_t i = 0; i < p->n_stops; i++) {
         size_t sl = p->stop_lens[i];
         size_t start = from >= sl ? from - sl + 1 : 0;
+        if (start < floor) start = floor;
         for (size_t q = start; q + sl <= len; q++) {
             if (memcmp(text + q, p->stops[i], sl) == 0) {
-                if (best < 0 || (long long)q < best) best = (long long)q;
+                if (best < 0 || (long long)q < best) {
+                    best = (long long)q;
+                    *which = (int)i;
+                }
                 break;
             }
         }
@@ -605,6 +1246,7 @@ static long long find_stop(const params_t* p, const char* text, size_t len, size
     return best;
 }
 
+/* A completion's text as far as it can be streamed. */
 static void stream_ready(gen_t* g, bool final) {
     size_t safe = g->text.len;
     if (!final) {
@@ -613,6 +1255,25 @@ static void stream_ready(gen_t* g, bool final) {
     }
     if (safe > g->emitted) {
         send_chunk(g, (const unsigned char*)g->text.data + g->emitted, safe - g->emitted, NULL, NULL, false, false);
+        g->emitted = safe;
+    }
+}
+
+/* A conversation's reply as far as it can be read: through the parser into
+ * reasoning, text and calls, or, for a template whose replies are not read
+ * back, as text. Without final, what could still begin a stop sequence, or
+ * end inside a character, waits. */
+static void reply_ready(gen_t* g, bool final) {
+    size_t safe = g->text.len;
+    if (!final) {
+        safe -= stop_holdback(g->p, g->text.data, g->text.len);
+        safe = vitna_utf8_complete_prefix((const unsigned char*)g->text.data, safe);
+    }
+    if (g->p->parse) {
+        vitna_reply_feed(&g->rp, g->text.data ? g->text.data : "", safe, final, on_part, g);
+    } else if (safe > g->emitted) {
+        const vitna_reply_part_t part = { VITNA_REPLY_TEXT, g->text.data + g->emitted, safe - g->emitted, NULL, 0 };
+        on_part(g, &part);
         g->emitted = safe;
     }
 }
@@ -720,7 +1381,21 @@ static int take_token(take_t* tk, vitna_sampler_t* sampler, float* row, int32_t*
         *tk->finish = "stop";
         return TAKE_END_NONE;
     }
-    const int32_t next = vitna_sample(sampler, row, tk->cfg);
+    if (p->ban >= 0) row[p->ban] = -INFINITY;
+    int32_t next;
+    if (p->forced) {
+        /* For tests: the reply given, a token at a time, then its end, as
+         * the model's own end-of-text token would end it. */
+        if (g->forced_at == p->n_forced) {
+            *chosen = 0;
+            tk->r->completion_tokens++;
+            *tk->finish = "stop";
+            return TAKE_END;
+        }
+        next = p->forced[g->forced_at++];
+    } else {
+        next = vitna_sample(sampler, row, tk->cfg);
+    }
     *chosen = next;
     tk->r->completion_tokens++;
     if (vitna_tokenizer_is_special(tk->api->tok, next)) {
@@ -734,7 +1409,7 @@ static int take_token(take_t* tk, vitna_sampler_t* sampler, float* row, int32_t*
         vitna_sb_append(&g->text, bytes, n);
         if (p->json) vitna_jsonpfx_feed(&tk->json, bytes, n);
     }
-    long long cut = find_stop(p, g->text.data ? g->text.data : "", g->text.len, before);
+    long long cut = find_stop(p, g->text.data ? g->text.data : "", g->text.len, before, p->prefill_len, &g->stop);
     if (cut >= 0) {
         g->text.len = (size_t)cut;
         *tk->finish = "stop";
@@ -744,7 +1419,21 @@ static int take_token(take_t* tk, vitna_sampler_t* sampler, float* row, int32_t*
         *tk->finish = "stop"; /* the object has closed, and nothing may follow it */
         return TAKE_END;
     }
-    if (p->stream) stream_ready(g, false);
+    if (p->think && !g->think_closed) {
+        /* The reasoning's tokens: those up to the one that closes it. */
+        static const char close[] = "</think>";
+        const size_t k = sizeof(close) - 1;
+        for (size_t i = before >= k - 1 ? before - (k - 1) : 0; i + k <= g->text.len && !g->think_closed; i++) {
+            if (memcmp(g->text.data + i, close, k) == 0) {
+                g->think_closed = true;
+                g->reasoning_tokens = tk->r->completion_tokens;
+            }
+        }
+    }
+    if (p->stream) {
+        if (p->chat) reply_ready(g, false);
+        else stream_ready(g, false);
+    }
     return TAKE_GO;
 }
 
@@ -930,8 +1619,13 @@ static void job_begin(vitna_api_t* api, job_t* j) {
     g->sink = &j->sink;
     g->p = p;
     g->created = (long long)time(NULL);
-    snprintf(g->id, sizeof(g->id), "%s%016llx", p->chat ? "chatcmpl-" : "cmpl-", (unsigned long long)fresh_u64(api));
+    g->uid = fresh_u64(api);
+    static const char* const id_prefix[] = { "cmpl-", "chatcmpl-", "msg_", "resp_" };
+    snprintf(g->id, sizeof(g->id), "%s%016llx", id_prefix[p->kind], (unsigned long long)g->uid);
     vitna_sb_init(&g->text);
+    if (p->prefill_len) vitna_sb_append(&g->text, p->prefill, p->prefill_len);
+    g->stop = -1;
+    vitna_reply_init(&g->rp, p->think, p->tools);
 
     const uint64_t seed = p->has_seed ? p->seed : fresh_u64(api);
     j->rng = seed;
@@ -943,6 +1637,7 @@ static void job_begin(vitna_api_t* api, job_t* j) {
     vitna_sb_init(&j->headers);
     vitna_sb_printf(&j->headers, "x-vitna-seed: %llu\r\n", (unsigned long long)seed);
     if (j->ignored && *j->ignored) vitna_sb_printf(&j->headers, "x-vitna-ignored: %s\r\n", j->ignored);
+    if (p->has_test_prompt) vitna_sb_printf(&j->headers, "x-vitna-test-prompt: %016llx\r\n", (unsigned long long)p->test_prompt);
 
     if (p->stream) {
         vitna_strbuf_t h;
@@ -950,7 +1645,6 @@ static void job_begin(vitna_api_t* api, job_t* j) {
         vitna_sb_printf(&h, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n%s\r\n", j->headers.data);
         sink_out(&j->sink, h.data, h.len);
         vitna_sb_free(&h);
-        if (p->chat) send_chunk(g, NULL, 0, NULL, NULL, true, false);
     }
 
     /* Reuse the longest prefix the sequence's cache already holds from the
@@ -964,6 +1658,27 @@ static void job_begin(vitna_api_t* api, job_t* j) {
     vitna_llama_truncate(m, j->seq, reuse);
     q->cached.count = reuse;
     j->r.cached_tokens = reuse;
+
+    /* A stream opens: chat's first chunk names the role; Anthropic's
+     * message_start carries the usage of the prompt, cache reads apart; a
+     * Responses stream says the response is created and in progress. */
+    if (p->stream) {
+        vitna_strbuf_t ev;
+        vitna_sb_init(&ev);
+        if (p->kind == API_CHAT) {
+            send_chunk(g, NULL, 0, NULL, NULL, true, false);
+        } else if (p->kind == API_MESSAGES) {
+            vitna_sb_puts(&ev, "\"message\":");
+            anthropic_message(g, &j->r, NULL, &ev);
+            anthropic_event(g, "message_start", &ev);
+        } else if (p->kind == API_RESPONSES) {
+            vitna_sb_puts(&ev, "\"response\":");
+            responses_object(g, NULL, "in_progress", NULL, &ev);
+            responses_event(g, "response.created", &ev);
+            responses_event(g, "response.in_progress", &ev);
+        }
+        vitna_sb_free(&ev);
+    }
 
     /* The rest of the prompt runs next (job_prompt), then a token at a time.
      * ok stays true while every step runs. */
@@ -1239,6 +1954,103 @@ static void run_round(vitna_api_t* api, job_t* running) {
     take_all(api, running, live);
 }
 
+/* Chat's finish reason: tool_calls when the reply ended on its own after calling one. */
+static const char* chat_finish(const gen_t* g, const char* finish) {
+    return g->n_calls && strcmp(finish, "stop") == 0 ? "tool_calls" : finish;
+}
+
+/* A Responses response's status at its end. */
+static const char* responses_status(const char* finish) {
+    return strcmp(finish, "length") == 0 ? "incomplete" : "completed";
+}
+
+/* The end of a stream that ran to its end. */
+static void stream_end(gen_t* g, job_t* j) {
+    const params_t* p = j->p;
+    vitna_strbuf_t ev;
+    vitna_sb_init(&ev);
+    if (p->kind == API_MESSAGES) {
+        vitna_sb_printf(&ev, "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":", anthropic_stop_reason(g, j->finish));
+        if (g->stop >= 0) put_string(&ev, p->stops[g->stop], p->stop_lens[g->stop]);
+        else vitna_sb_puts(&ev, "null");
+        vitna_sb_printf(&ev, "},\"usage\":{\"output_tokens\":%zu}", j->r.completion_tokens);
+        anthropic_event(g, "message_delta", &ev);
+        anthropic_event(g, "message_stop", NULL);
+    } else if (p->kind == API_RESPONSES) {
+        const char* status = responses_status(j->finish);
+        vitna_sb_puts(&ev, "\"response\":");
+        responses_object(g, &j->r, status, NULL, &ev);
+        responses_event(g, strcmp(status, "completed") == 0 ? "response.completed" : "response.incomplete", &ev);
+    } else {
+        if (!p->chat) stream_ready(g, true);
+        send_chunk(g, NULL, 0, p->chat ? chat_finish(g, j->finish) : j->finish, &j->r, false, false);
+        if (p->include_usage) send_chunk(g, NULL, 0, NULL, &j->r, false, true);
+        sink_out(&j->sink, "data: [DONE]\n\n", 14);
+    }
+    vitna_sb_free(&ev);
+}
+
+/* The body of a response sent whole. */
+static void response_body(const gen_t* g, const job_t* j, vitna_strbuf_t* b) {
+    const params_t* p = j->p;
+    if (p->kind == API_MESSAGES) {
+        anthropic_message(g, &j->r, j->finish, b);
+        return;
+    }
+    if (p->kind == API_RESPONSES) {
+        responses_object(g, &j->r, responses_status(j->finish), NULL, b);
+        return;
+    }
+    vitna_sb_puts(b, "{\"id\":");
+    vitna_sb_json_string(b, (const unsigned char*)g->id, strlen(g->id));
+    vitna_sb_printf(b, ",\"object\":\"%s\",\"created\":%lld,\"model\":", p->chat ? "chat.completion" : "text_completion", g->created);
+    vitna_sb_json_string(b, (const unsigned char*)g->api->model_id, strlen(g->api->model_id));
+    vitna_sb_puts(b, ",\"choices\":[{\"index\":0,");
+    if (p->chat && p->parse) {
+        /* Read back: the text, null when the reply is only calls; the
+         * reasoning, if any, beside it; then the calls. */
+        vitna_strbuf_t t;
+        vitna_sb_init(&t);
+        vitna_sb_puts(b, "\"message\":{\"role\":\"assistant\",\"content\":");
+        parts_text(g, VITNA_REPLY_TEXT, &t);
+        if (!has_part(g, VITNA_REPLY_TEXT) && g->n_calls) vitna_sb_puts(b, "null");
+        else put_string(b, t.data, t.len);
+        if (has_part(g, VITNA_REPLY_REASONING)) {
+            vitna_sb_clear(&t);
+            parts_text(g, VITNA_REPLY_REASONING, &t);
+            vitna_sb_puts(b, ",\"reasoning_content\":");
+            put_string(b, t.data, t.len);
+        }
+        vitna_sb_free(&t);
+        if (g->n_calls) {
+            vitna_sb_puts(b, ",\"tool_calls\":[");
+            for (size_t i = 0, k = 0; i < g->n_parts; i++) {
+                const part_t* q = &g->parts[i];
+                if (q->kind != VITNA_REPLY_TOOL_CALL) continue;
+                char id[40];
+                call_id(g, q, id, sizeof(id));
+                vitna_sb_printf(b, "%s{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":", k++ ? "," : "", id);
+                put_string(b, q->data.data, q->data.len);
+                vitna_sb_puts(b, ",\"arguments\":");
+                put_string(b, q->args.data, q->args.len);
+                vitna_sb_puts(b, "}}");
+            }
+            vitna_sb_puts(b, "]");
+        }
+        vitna_sb_puts(b, "}");
+    } else if (p->chat) {
+        vitna_sb_puts(b, "\"message\":{\"role\":\"assistant\",\"content\":");
+        vitna_sb_json_string(b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
+        vitna_sb_puts(b, "}");
+    } else {
+        vitna_sb_puts(b, "\"text\":");
+        vitna_sb_json_string(b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
+    }
+    vitna_sb_printf(b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", p->chat ? chat_finish(g, j->finish) : j->finish);
+    usage_json(b, &j->r);
+    vitna_sb_puts(b, "}");
+}
+
 /* A request's end: the rest of its response. */
 static void job_end(vitna_api_t* api, job_t* j) {
     const params_t* p = j->p;
@@ -1252,41 +2064,40 @@ static void job_end(vitna_api_t* api, job_t* j) {
     j->text = NULL;
     j->pass = NULL;
 
+    if (j->ok && g->text.ok && p->chat) {
+        /* The rest of the reply, read to its end. */
+        reply_ready(g, true);
+        close_part(g);
+        /* Reasoning tokens are counted only for a reply that opened with
+         * <think>: to the token that closed it, or every one if none did. */
+        if (!(p->think && g->text.len >= 7 && memcmp(g->text.data, "<think>", 7) == 0)) g->reasoning_tokens = 0;
+        else if (!g->think_closed) g->reasoning_tokens = j->r.completion_tokens;
+        for (size_t i = 0; i < g->n_parts; i++) g->failed = g->failed || !g->parts[i].data.ok || !g->parts[i].args.ok;
+    }
     if (!j->ok) {
         set_error(&e, 500, "server_error", NULL, NULL, "The model failed to run a step, so the reply could not be completed.");
         if (p->stream) send_error_event(g, &e);
-        else j->r.status = respond_error(&j->sink, &e);
-    } else if (!g->text.ok) {
+        else j->r.status = respond_error_as(&j->sink, &e, p->kind);
+    } else if (!g->text.ok || g->failed) {
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
-        if (!p->stream) j->r.status = respond_error(&j->sink, &e);
+        if (p->stream) send_error_event(g, &e);
+        else j->r.status = respond_error_as(&j->sink, &e, p->kind);
     } else if (p->stream) {
-        stream_ready(g, true);
-        send_chunk(g, NULL, 0, j->finish, &j->r, false, false);
-        if (p->include_usage) send_chunk(g, NULL, 0, NULL, &j->r, false, true);
-        sink_out(&j->sink, "data: [DONE]\n\n", 14);
+        stream_end(g, j);
     } else {
         vitna_strbuf_t b;
         vitna_sb_init(&b);
-        vitna_sb_puts(&b, "{\"id\":");
-        vitna_sb_json_string(&b, (const unsigned char*)g->id, strlen(g->id));
-        vitna_sb_printf(&b, ",\"object\":\"%s\",\"created\":%lld,\"model\":", p->chat ? "chat.completion" : "text_completion", g->created);
-        vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-        vitna_sb_puts(&b, ",\"choices\":[{\"index\":0,");
-        if (p->chat) {
-            vitna_sb_puts(&b, "\"message\":{\"role\":\"assistant\",\"content\":");
-            vitna_sb_json_string(&b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
-            vitna_sb_puts(&b, "}");
-        } else {
-            vitna_sb_puts(&b, "\"text\":");
-            vitna_sb_json_string(&b, (const unsigned char*)(g->text.data ? g->text.data : ""), g->text.len);
-        }
-        vitna_sb_printf(&b, ",\"logprobs\":null,\"finish_reason\":\"%s\"}],\"usage\":", j->finish);
-        usage_json(&b, &j->r);
-        vitna_sb_puts(&b, "}");
+        response_body(g, j, &b);
         if (api->test_logits) vitna_sb_printf(&j->headers, "x-vitna-test-logits: %016llx\r\n", (unsigned long long)j->logits_hash);
         respond(&j->sink, 200, j->headers.data, b.data, b.len);
         vitna_sb_free(&b);
     }
+    for (size_t i = 0; i < g->n_parts; i++) {
+        vitna_sb_free(&g->parts[i].data);
+        vitna_sb_free(&g->parts[i].args);
+    }
+    free(g->parts);
+    g->parts = NULL;
     vitna_sb_free(&j->headers);
     vitna_sb_free(&g->text);
 }
@@ -1328,7 +2139,7 @@ static void lose(vitna_api_t* api, job_t* running) {
         api_error_t e;
         lost_error(api, &e);
         j->r.prompt_tokens = j->ids->count; /* as run_job reports a request it refuses */
-        j->r.status = respond_error(&j->sink, &e);
+        j->r.status = respond_error_as(&j->sink, &e, j->p->kind);
         vitna_mutex_lock(&api->lock);
         j->done = true;
         vitna_cond_signal(&j->cv);
@@ -1408,25 +2219,28 @@ static vitna_api_result_t run_job(vitna_api_t* api, vitna_sink_t* sink, const pa
     vitna_api_result_t r = { 200, ids->count, 0, 0 };
     const vitna_llama_t* m = api->model;
     api_error_t e;
+    /* The parameters a refusal names, in the request's own shape. */
+    const char* conversation = p->kind == API_COMPLETIONS ? "prompt" : p->kind == API_RESPONSES ? "input" : "messages";
+    const char* max_param = p->kind == API_RESPONSES ? "max_output_tokens" : "max_tokens";
     if (ids->count == 0) {
-        set_error(&e, 400, "invalid_request_error", "invalid_value", p->chat ? "messages" : "prompt", "the prompt has no tokens");
-        r.status = respond_error(sink, &e);
+        set_error(&e, 400, "invalid_request_error", "invalid_value", conversation, "the prompt has no tokens");
+        r.status = respond_error_as(sink, &e, p->kind);
         return r;
     }
     size_t room = ids->count < m->ctx ? m->ctx - ids->count : 0;
     size_t max_new = p->has_max_tokens ? p->max_tokens : (p->chat ? room : 16);
     if (room == 0 || max_new > room) {
-        set_error(&e, 400, "invalid_request_error", "context_length_exceeded", p->has_max_tokens ? "max_tokens" : (p->chat ? "messages" : "prompt"),
+        set_error(&e, 400, "invalid_request_error", "context_length_exceeded", p->has_max_tokens ? max_param : conversation,
                   "This model's context holds %zu tokens. The prompt is %zu tokens, which leaves room for %zu, and %zu were asked for.",
                   m->ctx, ids->count, room, max_new);
-        r.status = respond_error(sink, &e);
+        r.status = respond_error_as(sink, &e, p->kind);
         return r;
     }
 
     job_t* j = (job_t*)calloc(1, sizeof(job_t));
     if (!j) {
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
-        r.status = respond_error(sink, &e);
+        r.status = respond_error_as(sink, &e, p->kind);
         return r;
     }
     j->api = api;
@@ -1450,7 +2264,7 @@ static vitna_api_result_t run_job(vitna_api_t* api, vitna_sink_t* sink, const pa
         free(j);
         if (lost) lost_error(api, &e);
         else set_error(&e, 500, "server_error", NULL, NULL, "the server could not start the thread that runs requests");
-        r.status = respond_error(sink, &e);
+        r.status = respond_error_as(sink, &e, p->kind);
         return r;
     }
     if (api->queue_tail) api->queue_tail->next = j;
@@ -1519,6 +2333,7 @@ vitna_api_t* vitna_api_create(vitna_llama_t* model, const vitna_tokenizer_t* tok
     memcpy(api->model_id, model_id, n);
     api->prefix_cache = true;
     api->mask_cache = true;
+    vitna_api_set_qwen3_template(api, model->cfg.qwen3);
     /* The cache starts empty, and each sequence's cached list says so. */
     vitna_llama_reset(model);
     return api;
@@ -1564,6 +2379,20 @@ bool vitna_api_lost(vitna_api_t* api) {
 
 void vitna_api_set_test_logits(vitna_api_t* api, bool on) {
     api->test_logits = on;
+}
+
+void vitna_api_set_test_reply(vitna_api_t* api, bool on) {
+    api->test_reply = on;
+}
+
+void vitna_api_set_qwen3_template(vitna_api_t* api, bool on) {
+    api->qwen3 = on;
+    /* <tool_call> as the one token Qwen3's vocabulary has for it, which
+     * tool_choice none bans; a vocabulary that spells it in pieces has none. */
+    api->tool_call_token = -1;
+    vitna_token_list_t ids = {0};
+    if (on && vitna_tokenizer_encode(api->tok, "<tool_call>", 11, &ids) && ids.count == 1) api->tool_call_token = ids.ids[0];
+    vitna_token_list_free(&ids);
 }
 
 void vitna_api_set_mask_cache(vitna_api_t* api, bool on) {
@@ -1857,54 +2686,121 @@ done:
     return r;
 }
 
-static vitna_api_result_t completion_route(vitna_api_t* api, bool chat, const char* body, size_t body_len, vitna_sink_t* sink) {
+/* The body as a JSON object naming this server's model, if it names one;
+ * NULL, with the error set, otherwise. */
+static const vitna_json_value_t* request_root(const vitna_api_t* api, vitna_json_doc_t* doc, const char* jerr, api_error_t* e) {
+    const vitna_json_value_t* root = doc ? vitna_json_root(doc) : NULL;
+    if (!root || root->type != VITNA_JSON_OBJECT) {
+        set_error(e, 400, "invalid_request_error", "invalid_json", NULL, "The body must be a JSON object%s%s", doc ? "" : ": ", doc ? "" : jerr);
+        return NULL;
+    }
+    const char* model = vitna_json_as_string(vitna_json_get(root, "model"));
+    if (model && strcmp(model, api->model_id) != 0) {
+        set_error(e, 404, "invalid_request_error", "model_not_found", "model", "The model `%s` does not exist. This server serves `%s`.", model,
+                  api->model_id);
+        return NULL;
+    }
+    return root;
+}
+
+/* A request that generates, of any of the four kinds: its parameters, its
+ * prompt (a completion's own, or a conversation in the model's template),
+ * then its job. */
+static vitna_api_result_t generate_route(vitna_api_t* api, api_kind_t kind, const char* body, size_t body_len, vitna_sink_t* sink) {
     vitna_api_result_t r = { 200, 0, 0, 0 };
     api_error_t e;
     char jerr[160];
     vitna_json_doc_t* doc = vitna_json_parse(body ? body : "", body_len, jerr, sizeof(jerr));
-    const vitna_json_value_t* root = doc ? vitna_json_root(doc) : NULL;
     params_t p;
-    vitna_strbuf_t ignored, prompt;
+    vitna_strbuf_t ignored, prompt, prefill;
     vitna_token_list_t ids = {0};
+    vitna_token_list_t forced = {0};
     vitna_sb_init(&ignored);
     vitna_sb_init(&prompt);
+    vitna_sb_init(&prefill);
 
-    if (!root || root->type != VITNA_JSON_OBJECT) {
-        set_error(&e, 400, "invalid_request_error", "invalid_json", NULL, "The body must be a JSON object%s%s", doc ? "" : ": ", doc ? "" : jerr);
-        r.status = respond_error(sink, &e);
-        goto done;
-    }
-    const char* model = vitna_json_as_string(vitna_json_get(root, "model"));
-    if (model && strcmp(model, api->model_id) != 0) {
-        set_error(&e, 404, "invalid_request_error", "model_not_found", "model",
-                  "The model `%s` does not exist. This server serves `%s`.", model, api->model_id);
-        r.status = respond_error(sink, &e);
-        goto done;
-    }
-    if (!parse_params(root, chat, &p, &e, &ignored)) {
-        r.status = respond_error(sink, &e);
-        goto done;
-    }
-    if (chat) {
-        if (!chat_prompt(vitna_json_get(root, "messages"), &prompt, &e)) {
-            r.status = respond_error(sink, &e);
-            goto done;
-        }
+    const vitna_json_value_t* root = request_root(api, doc, jerr, &e);
+    if (!root || !parse_params(api, root, kind, &p, &e, &ignored)) goto fail;
+    if (kind == API_COMPLETIONS) {
+        if (!completion_prompt(api, vitna_json_get(root, "prompt"), &ids, &e)) goto fail;
+    } else {
+        if (!chat_build(api, root, &p, &prompt, &prefill, &e)) goto fail;
         if (!vitna_tokenizer_encode(api->tok, prompt.data, prompt.len, &ids)) {
             set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
-            r.status = respond_error(sink, &e);
-            goto done;
+            goto fail;
         }
-    } else if (!completion_prompt(api, vitna_json_get(root, "prompt"), &ids, &e)) {
-        r.status = respond_error(sink, &e);
-        goto done;
+    }
+    /* For tests: an FNV-1a hash of the prompt a conversation was written
+     * as, and the reply a request gives, taken in place of the model's
+     * (vitna_api_set_test_reply). */
+    if (api->test_reply && kind != API_COMPLETIONS) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < prompt.len; i++) h = (h ^ (unsigned char)prompt.data[i]) * 0x100000001b3ULL;
+        p.test_prompt = h;
+        p.has_test_prompt = true;
+    }
+    const vitna_json_value_t* reply = api->test_reply ? vitna_json_get(root, "vitna_test_reply") : NULL;
+    if (reply && reply->type == VITNA_JSON_STRING) {
+        static const int32_t none = 0;
+        if (!vitna_tokenizer_encode(api->tok, reply->u.string.ptr, reply->u.string.len, &forced)) {
+            set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+            goto fail;
+        }
+        p.forced = forced.count ? forced.ids : &none;
+        p.n_forced = forced.count;
     }
     r = run_job(api, sink, &p, &ids, ignored.data);
+    goto done;
 
+fail:
+    r.status = respond_error_as(sink, &e, kind);
 done:
     vitna_token_list_free(&ids);
+    vitna_token_list_free(&forced);
     vitna_sb_free(&ignored);
     vitna_sb_free(&prompt);
+    vitna_sb_free(&prefill);
+    vitna_json_free(doc);
+    return r;
+}
+
+/* POST /v1/messages/count_tokens: the tokens a Messages request's prompt
+ * holds as the model reads it, its template and any prefill included, in
+ * Anthropic's response. Nothing runs. */
+static vitna_api_result_t count_tokens_route(vitna_api_t* api, const char* body, size_t body_len, vitna_sink_t* sink) {
+    vitna_api_result_t r = { 200, 0, 0, 0 };
+    api_error_t e;
+    char jerr[160];
+    vitna_json_doc_t* doc = vitna_json_parse(body ? body : "", body_len, jerr, sizeof(jerr));
+    params_t p;
+    memset(&p, 0, sizeof(p));
+    p.kind = API_MESSAGES;
+    p.chat = true;
+    p.ban = -1;
+    vitna_strbuf_t prompt, prefill, out;
+    vitna_token_list_t ids = {0};
+    vitna_sb_init(&prompt);
+    vitna_sb_init(&prefill);
+    vitna_sb_init(&out);
+
+    const vitna_json_value_t* root = request_root(api, doc, jerr, &e);
+    if (!root || !chat_build(api, root, &p, &prompt, &prefill, &e)) goto fail;
+    if (!vitna_tokenizer_encode(api->tok, prompt.data, prompt.len, &ids)) {
+        set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
+        goto fail;
+    }
+    vitna_sb_printf(&out, "{\"input_tokens\":%zu}", ids.count);
+    respond(sink, 200, NULL, out.data, out.len);
+    r.prompt_tokens = ids.count;
+    goto done;
+
+fail:
+    r.status = respond_error_as(sink, &e, API_MESSAGES);
+done:
+    vitna_token_list_free(&ids);
+    vitna_sb_free(&prompt);
+    vitna_sb_free(&prefill);
+    vitna_sb_free(&out);
     vitna_json_free(doc);
     return r;
 }
@@ -1923,6 +2819,12 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
     bool chat = strcmp(route, "/v1/chat/completions") == 0;
     bool completions = strcmp(route, "/v1/completions") == 0;
     bool embeddings = strcmp(route, "/v1/embeddings") == 0;
+    bool messages = strcmp(route, "/v1/messages") == 0;
+    bool count = strcmp(route, "/v1/messages/count_tokens") == 0;
+    bool responses = strcmp(route, "/v1/responses") == 0;
+    const bool generates = chat || completions || messages || count || responses;
+    /* Errors answer in the shape of the API asked: Anthropic's for its routes, OpenAI's for the rest. */
+    const api_kind_t kind = messages || count ? API_MESSAGES : responses ? API_RESPONSES : completions ? API_COMPLETIONS : API_CHAT;
 
     if (get && (strcmp(route, "/health") == 0 || strcmp(route, "/v1/health") == 0)) {
         vitna_strbuf_t b;
@@ -1936,7 +2838,8 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
         } else if (api) {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
             vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu}", api->model->ctx, api->model->seqs);
+            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu,\"chat_template\":\"%s\"}", api->model->ctx, api->model->seqs,
+                            api->qwen3 ? "qwen3" : "chatml");
         } else {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":null,\"generation\":false,\"message\":\"" NO_MODEL_MESSAGE "\"}");
         }
@@ -1958,15 +2861,15 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
         vitna_sb_free(&b);
         return r;
     }
-    if ((chat || completions || embeddings) && !post) {
+    if ((generates || embeddings) && !post) {
         set_error(&e, 405, "invalid_request_error", "method_not_allowed", NULL, "%s takes POST", route);
-        r.status = respond_error(sink, &e);
+        r.status = respond_error_as(sink, &e, kind);
         return r;
     }
-    if (chat || completions || embeddings) {
+    if (generates || embeddings) {
         if (!api) {
             set_error(&e, 501, "not_implemented", "no_model", NULL, NO_MODEL_MESSAGE);
-            r.status = respond_error(sink, &e);
+            r.status = respond_error_as(sink, &e, kind);
             return r;
         }
         /* A model does one or the other: an embedding model generates no
@@ -1982,10 +2885,12 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
         if (!embeddings && api->encoder) {
             set_error(&e, 404, "invalid_request_error", "model_not_supported", "model",
                       "The model `%s` produces embeddings and generates no text. Send it to /v1/embeddings.", api->model_id);
-            r.status = respond_error(sink, &e);
+            r.status = respond_error_as(sink, &e, kind);
             return r;
         }
-        return embeddings ? embeddings_route(api, body, body_len, sink) : completion_route(api, chat, body, body_len, sink);
+        if (embeddings) return embeddings_route(api, body, body_len, sink);
+        if (count) return count_tokens_route(api, body, body_len, sink);
+        return generate_route(api, kind, body, body_len, sink);
     }
     set_error(&e, 404, "invalid_request_error", "not_found", NULL, "Not found: %s %s", method, route);
     r.status = respond_error(sink, &e);
