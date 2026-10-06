@@ -935,7 +935,7 @@ export function probeRemoteUrl(url, { timeoutMs = 10_000 } = {}) {
     // the idle socket held the process open for minutes after a dry run.
     const req = client(
       url,
-      { method: "HEAD", agent: false, headers: { "User-Agent": "vitna-anchor/0.1.0" } },
+      { method: "HEAD", agent: false, headers: { "User-Agent": "vitna-anchor/0.2.0" } },
       (res) => {
         res.resume();
         resolve(res.statusCode >= 200 && res.statusCode < 400);
@@ -973,7 +973,7 @@ export function downloadFile(url, destPath, options = {}) {
         {
           method: "GET",
           headers: {
-            "User-Agent": "vitna-anchor/0.1.0",
+            "User-Agent": "vitna-anchor/0.2.0",
             Accept: "*/*",
           },
         },
