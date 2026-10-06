@@ -137,6 +137,12 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/api-surface.test.mjs
+      # Gate A12's chat page: built into the engine as it is in
+      # engine/web/chat.html, its pure parts run in Node, and served at /.
+      - name: Gate A12, the chat page the server serves
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/chat-page.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"

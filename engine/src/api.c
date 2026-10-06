@@ -192,15 +192,30 @@ static const char* reason_phrase(int status) {
     }
 }
 
-static void respond(vitna_sink_t* s, int status, const char* headers, const char* body, size_t len) {
+static void respond_as(vitna_sink_t* s, int status, const char* type, const char* headers, const char* body, size_t len) {
     vitna_strbuf_t h;
     vitna_sb_init(&h);
-    vitna_sb_printf(&h, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n%s\r\n",
-                    status, reason_phrase(status), len, headers ? headers : "");
+    vitna_sb_printf(&h, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n%s\r\n", status, reason_phrase(status), type,
+                    len, headers ? headers : "");
     sink_out(s, h.data, h.len);
     sink_out(s, body, len);
     vitna_sb_free(&h);
 }
+
+static void respond(vitna_sink_t* s, int status, const char* headers, const char* body, size_t len) {
+    respond_as(s, status, "application/json", headers, body, len);
+}
+
+/* The chat page (engine/web/chat.html, built in as chat_page.c). Its policy
+ * lets it run its own script and styles and talk to this server alone: it
+ * loads nothing from anywhere, and no other page may frame it. */
+extern const char vitna_chat_page[];
+extern const size_t vitna_chat_page_len;
+
+#define CHAT_PAGE_HEADERS                                                                                                                   \
+    "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' " \
+    "data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"                                                                 \
+    "X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-cache\r\n"
 
 static void set_error(api_error_t* e, int status, const char* type, const char* code, const char* param, const char* fmt, ...) {
     e->status = status;
@@ -2862,6 +2877,10 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
     /* Errors answer in the shape of the API asked: Anthropic's for its routes, OpenAI's for the rest. */
     const api_kind_t kind = messages || count ? API_MESSAGES : responses || input_tokens ? API_RESPONSES : completions ? API_COMPLETIONS : API_CHAT;
 
+    if (get && (strcmp(route, "/") == 0 || strcmp(route, "/chat") == 0)) {
+        respond_as(sink, 200, "text/html; charset=utf-8", CHAT_PAGE_HEADERS, vitna_chat_page, vitna_chat_page_len);
+        return r;
+    }
     if (get && (strcmp(route, "/health") == 0 || strcmp(route, "/v1/health") == 0)) {
         vitna_strbuf_t b;
         vitna_sb_init(&b);
