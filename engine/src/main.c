@@ -1081,6 +1081,16 @@ static int serve_encoder(const args_t* a, vitna_server_config_t* cfg) {
         vitna_tokenizer_free(tok);
         return 1;
     }
+    /* One pass before serving reads every weight once, so the first request
+     * is not the one that waits for the checkpoint to come in from the drive. */
+    vitna_token_list_t warm = {0};
+    float* warm_out = (float*)malloc(e.cfg.hidden * sizeof(float));
+    if (warm_out && vitna_tokenizer_encode(tok, "", 0, &warm) && warm.count > 0 && warm.count <= e.cfg.max_tokens) {
+        const int32_t* row = warm.ids;
+        vitna_encoder_embed(&e, &row, &warm.count, 1, e.cfg.pooling, e.cfg.normalize, warm_out, NULL);
+    }
+    vitna_token_list_free(&warm);
+    free(warm_out);
     char id[128];
     if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
     else dir_basename(a->model, id, sizeof(id));

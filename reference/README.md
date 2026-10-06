@@ -1,8 +1,10 @@
-# The reference (gates A1 and A5)
+# The reference (gates A1, A5 and A14)
 
 Gate A2 asks whether the engine computes what the model computes. This directory is the answer key. It pins one model, holds token ids and logits recorded from a pinned reference implementation, and says how close the engine has to come.
 
 Gate A5 needs a second answer key, for a mixture of experts. It is [below](#a-mixture-of-experts-gate-a5), and follows A1's in everything but what a mixture of experts adds.
+
+Gate A14 holds an embedding model to a third answer key, [at the end](#an-embedding-model-gate-a14).
 
 ## The model
 
@@ -138,3 +140,61 @@ Step 2 runs OLMoE in the engine, on the CPU, and the same file compares it with 
 - Greedy decoding unpinned, token for token, up to the first decision where the engine's router goes another way than the reference's, which must be one the routing rule allows.
 
 How it was checked, and what it found, is in the [top-level README](../README.md#how-gate-a5s-forward-pass-was-checked).
+
+## An embedding model (gate A14)
+
+Gate A14 has the engine produce text embeddings, which a search index stores and compares, and serve them at `/v1/embeddings`. It starts as A1 did: one model pinned, and a recording to hold the engine to.
+
+### The model
+
+[bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT, pinned in [`bge-small-en-v1.5/model.json`](bge-small-en-v1.5/model.json) at revision `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`, with the size and SHA-256 of each of its ten files. It is BERT: 12 layers 384 wide with 12 heads, absolute position embeddings for 512 positions, LayerNorm after each residual add (epsilon 1e-12), and an MLP 1,536 wide with GELU in its erf form. Its tokenizer is WordPiece over 30,522 entries, lowercasing and stripping accents. Its sentence-transformers files say how a text becomes one vector: the last hidden state at the `[CLS]` position, divided by its L2 norm. The weights are 133 MB in float32, small enough to embed a search index on a server's CPU, which is why it was chosen over larger models that rank higher. Its card asks for a query to start with `Represent this sentence for searching relevant passages: `, and for documents to go as they are.
+
+```bash
+node scripts/fetch-model.mjs bge-small-en-v1.5           # into models/bge-small-en-v1.5, each file checked against the pin
+```
+
+### The recording
+
+[`record_embed.py`](record_embed.py) imports `record.py`'s helpers and version pin (`requirements.txt`), runs the model through transformers on the CPU in float32 with eager attention on one thread, and writes [`bge-small-en-v1.5/fixture.json`](bge-small-en-v1.5/fixture.json) (343 KB) from [`bge-small-en-v1.5/inputs.json`](bge-small-en-v1.5/inputs.json):
+
+- The tokenizer's ids for 23 inputs and 38 corpus strings, from transformers and from the tokenizers library running `tokenizer.json`, which agree on every one: queries with the instruction and passages, a 509-token passage, an empty string, accents and case, CJK, kana and Hangul, Greek and Cyrillic in capitals, emoji with joiners, control and invisible characters, private-use and unassigned code points, words at and past the 100-character limit, and the special tokens written in the text.
+- For every input, from one forward pass: the embedding as the model's modules compute it, the norm of the `[CLS]` state before it is divided by it, and the mean of the last hidden state over every position, normalized, which is the pooling other BERT-family models use, so the engine's mean pooling is checked against the same pass without pinning a second model.
+
+The committed fixture was recorded on 2026-10-06 on an AMD Ryzen 7 3700X (Windows 11, x86-64) with Python 3.12.10, in about 20 s. `--check` reproduces it there bit for bit, and the [Reference workflow](../.github/workflows/reference.yml) runs it on GitHub's x86-64 Linux and Windows runners.
+
+```bash
+python reference/record_embed.py           # write the fixture
+python reference/record_embed.py --check   # record into memory and compare with the committed fixture
+python reference/embed_sensitivity.py      # what plausible defects do, against the tolerance
+```
+
+### The tokenizer's Unicode
+
+Comparing the engine's tokenizer with the tokenizers library over every code point found that the library's BERT steps do not take their character data from one Unicode version. They come from three Rust crates: the categories (which characters are other, nonspacing marks, or punctuation) from `unicode_categories`, Unicode 8.0; NFD from `unicode-normalization-alignments`, Unicode 9.0; and lowercase from Rust's standard library, Unicode 17.0 for the build that `tokenizers` 0.23.2 ships. Python 3.12's tables, Unicode 15.0, disagree with the library on 624 of the code points between two letters: marks, format characters and punctuation added since 8.0 that the library neither drops nor splits off, U+11938, which its NFD does not decompose, and the characters given lowercase forms in Unicode 16 and 17. Combining classes from Unicode 10.0 or later also reorder marks the library leaves in place. The engine follows the library, since the model was trained on what the library produces, and [`gen_wordpiece_unicode.py`](../engine/tools/gen_wordpiece_unicode.py) builds each table from the data file of its own version, downloaded from unicode.org and checked by SHA-256. Two more of the library's choices show the same way: it keeps unassigned code points, which then become the unknown token, and it begins CJK Extension E at U+2B920, where the Python BERT tokenizer begins it at U+2B820. With these, the engine and the library give the same ids for all 1,112,064 code points between two letters and 200,000 random strings ([`check_wordpiece.py`](../engine/tools/check_wordpiece.py)).
+
+### The tolerance
+
+Written in [`compare.mjs`](compare.mjs), which the tests use:
+
+| What | Must hold |
+|---|---|
+| Token ids | Exactly equal to the model's own `tokenizer.json`'s, as the tokenizers library runs it, for every input and corpus string |
+| Embeddings | Within 1e-5 absolute, every value of every input's embedding, both as the model pools it and by the mean, each normalized |
+| The `[CLS]` state's norm | Within 1e-5 of the reference's, relatively |
+
+Why 1e-5: arithmetic in float64 moves the reference's embeddings by at most 2.5e-7, which is the scale of float32 rounding, and six defects an implementation could make and still produce plausible vectors move some value by far more:
+
+| Defect | Largest difference |
+|---|---|
+| GELU in its tanh form | 7.0e-4 |
+| LayerNorm epsilon 1e-5 rather than 1e-12 | 1.1e-4 |
+| The token-type embedding left out | 8.6e-2 |
+| Attention scores not scaled | 0.22 |
+| Positions counted from 1 | 4.8e-2 |
+| Mean pooling without `[CLS]` and `[SEP]` | 0.21 |
+
+The line was first written at 1e-4, in `record_embed.py` before the engine could embed a text. It was moved to 1e-5 after the engine's first comparison, a largest difference of 3.1e-7 that passes either way, because the measurement above showed that 1e-4 caught the wrong epsilon by only 13%. At 1e-5 that defect is eleven times the line, and rounding a fortieth of it.
+
+### The engine against it
+
+`tests/reference-embed.test.mjs` checks that the fixture matches its pin, inputs and recorders, and that the comparison accepts the reference's own embeddings and rejects wrong ones; then, with the model and a built engine, that the engine's tokenizer gives every id exactly, that its embeddings are within the tolerance (largest difference 3.05e-7 pooled at `[CLS]` and 1.52e-7 by the mean, on the machine that recorded the fixture), that it gives the same bits on 1 and 3 threads and with the texts sent alone or in another order, and that a text longer than 512 tokens is refused. `tests/embeddings-serve.test.mjs` checks the same embeddings through `/v1/embeddings`.

@@ -14,13 +14,16 @@ Rust crates that carry Unicode data of three different ages:
 - Rust's standard library, Unicode 17.0: char::to_lowercase, the lowercase
   step, with SpecialCasing's unconditional mappings.
 
-Those versions were found, not assumed: engine/tools/check_wordpiece.py runs
-the tokenizers library over every code point and random strings, and a table
-from any other version disagrees with it (Unicode 15.0's categories on about
-8,600 code points, its NFD on U+11938, its lowercase on the 29 characters
-Unicode 16 and 17 added cases for). So this header takes each table from the
-data file of its own version, downloaded from unicode.org and checked against
-the SHA-256 below, and not from this Python's unicodedata.
+Those versions were found, not assumed, by running the library over every
+code point between two letters, as engine/tools/check_wordpiece.py does, and
+over random strings. Tables from another version disagree with it: Python
+3.12's, Unicode 15.0, on 624 code points (the marks, format characters and
+punctuation added since 8.0, U+11938, which the library's NFD does not
+decompose, and the characters Unicode 16 and 17 gave lowercase forms), and
+combining classes from 10.0 or later reorder marks the library does not. So
+this header takes each table from the data file of its own version,
+downloaded from unicode.org and checked against the SHA-256 below, and not
+from this Python's unicodedata.
 
 Unassigned code points are in none of the classes, as in those crates: the
 library keeps them, and a word holding one becomes the unknown token.
