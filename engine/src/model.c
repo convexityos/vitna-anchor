@@ -306,6 +306,7 @@ bool vitna_llama_load(vitna_llama_t* m, const char* dir, size_t ctx, size_t seqs
 bool vitna_llama_load_ex(vitna_llama_t* m, const char* dir, const char* weights, size_t ctx, size_t seqs, char* err,
                          size_t err_len) {
     memset(m, 0, sizeof(*m));
+    m->gpu_kv_layers = -1;
     if (!read_config(&m->cfg, dir, err, err_len)) return false;
     const vitna_llama_config_t* c = &m->cfg;
     if (!open_checkpoint(m, dir, weights, err, err_len)) {
@@ -841,6 +842,23 @@ static bool moe_rows_on_gpu(vitna_llama_t* m, const vitna_cuda_row_t* rows, size
 
 void vitna_llama_no_rows(vitna_llama_t* m) {
     m->no_rows = true;
+}
+
+void vitna_llama_test_long_from(vitna_llama_t* m, size_t n) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) vitna_cuda_test_long_from(m->cuda, n);
+#else
+    (void)m;
+    (void)n;
+#endif
+}
+
+size_t vitna_llama_gpu_kv_layers(const vitna_llama_t* m) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) return (size_t)vitna_cuda_kv_layers(m->cuda);
+#endif
+    (void)m;
+    return 0;
 }
 
 bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits) {

@@ -143,6 +143,12 @@ typedef struct {
     float** rows_outs;        /* rows_max: where each row's logits go */
     bool no_rows;
 
+    /* Read by vitna_llama_use_cuda for a mixture of experts: the layers
+     * whose key-value cache the GPU holds, the others' kept in page-locked
+     * host memory (gate A10); -1, as loaded, for as many as it has room for
+     * beside the rest and the least expert cache. */
+    int gpu_kv_layers;
+
     /* Set when a step on the GPU fails with an error CUDA calls sticky (an
      * illegal address, a kernel that faulted, and others), after which the
      * device can run nothing more in this process: every later step fails
@@ -402,6 +408,19 @@ bool vitna_llama_expert_on_gpu(const vitna_llama_t* m, size_t l, size_t e, const
  * same values, bit for bit; this is what a test compares them with.
  */
 void vitna_llama_no_rows(vitna_llama_t* m);
+
+/**
+ * For tests, after vitna_llama_use_cuda: rows of a mixture of experts on the
+ * GPU that attend to more than n positions take a long context's attention
+ * (gate A10), which otherwise starts past 1,024, and every run of a prompt's
+ * rows among them shares the cache's tiles however short. Each row gives the
+ * same values in that arithmetic whichever kernel runs it, bit for bit; this
+ * is how a test makes short prompts check that.
+ */
+void vitna_llama_test_long_from(vitna_llama_t* m, size_t n);
+
+/** On the GPU, the layers whose key-value cache the device holds; 0 otherwise. */
+size_t vitna_llama_gpu_kv_layers(const vitna_llama_t* m);
 
 /**
  * What the GPU's expert cache has done so far, in a sentence, for --timing:

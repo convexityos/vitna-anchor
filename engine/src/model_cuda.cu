@@ -176,6 +176,15 @@
 #define PENDING_MAX 64
 #define EXPERT_MARGIN ((size_t)512 << 20)
 
+/* Gate A10: what a mixture's key-value cache leaves free on the device
+ * besides the least expert cache and EXPERT_MARGIN, in deciding how many of
+ * its layers the device holds. On this machine's Windows driver the device
+ * had 373 MiB less free after the weights were copied in whenever the cache
+ * had left about a GiB or less, and none less with 2 GiB left, so a plan
+ * without this left the expert cache nothing. Measured on one machine; a
+ * margin, not a model of the driver. */
+#define KV_HEADROOM ((size_t)512 << 20)
+
 /* --cpu-experts (moe_experts_split): the layers with misses after which a
  * side the split has left out is given one expert, to measure it again. A
  * probe that loses costs a layer one expert's difference, about a
@@ -294,8 +303,28 @@ struct vitna_cuda_model {
     const float* cos_t;     /* [ctx][head_dim / 2] */
     const float* sin_t;
     int seqs;               /* sequences the cache holds */
-    float* k_cache;         /* [n_layers][seqs][ctx][n_kv_heads * head_dim] */
+    float* k_cache;         /* [kv_layers][seqs][ctx][n_kv_heads * head_dim]: the layers whose cache the device holds */
     float* v_cache;
+    /* Gate A10: the key-value cache of layers kv_layers on, which the device
+     * did not have room for, in page-locked host memory, [n_layers -
+     * kv_layers][seqs][ctx][n_kv_heads * head_dim]. Such a layer's attention
+     * runs on a copy in k_stage and v_stage, [seqs][ctx][n_kv_heads *
+     * head_dim]: what its rows read is copied in first (stage_kv), and what
+     * they wrote is copied back after. */
+    int kv_layers;
+    float *k_host, *v_host;
+    float *k_stage, *v_stage;
+    int *s_lo, *s_hi, *s_n; /* host [seqs]: a step's or pass's lowest and highest position in each sequence, and its rows there */
+    /* A long context's attention (attention_long_kernel): rows attending to
+     * more than long_from positions; its chunks' states, [MULTI_MAX][n_heads]
+     * [chunks_max] for lpart_m and lpart_l and [.][.][.][head_dim] for lpart_o;
+     * whether attention_long_rows_kernel runs here (it asks for more shared
+     * memory than a block gets unasked), and the fewest rows of a run it takes. */
+    int long_from;
+    int chunks_max;
+    float *lpart_m, *lpart_l, *lpart_o;
+    bool long_rows;
+    int long_run;
     float *x, *q, *att, *act, *logits;
     float *part_m, *part_l, *part_o; /* attention's slices: [n_heads][splits], and [.][.][head_dim] */
     unsigned int* done;              /* per key-value head, the slices finished in this layer */
@@ -351,6 +380,7 @@ struct vitna_cuda_model {
     int rows_g;             /* rows in a group that is normalized into shared memory */
     int r_n;                /* rows in the pass under way */
     row_t* r_rows;
+    row_t* h_rows;          /* host [MOE_ROWS]: the pass's rows, as given for its first layer */
     float *r_x, *r_xn, *r_xn2, *r_xg, *r_proj, *r_q, *r_att, *r_kraw, *r_act, *r_router, *r_logits;
     int32_t* r_idx;
     float* r_w;
@@ -795,7 +825,8 @@ __global__ void attn_in_kernel(const float* __restrict__ x, const float* __restr
 __global__ void __launch_bounds__(THREADS, 4)
     attention_kernel(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc, float* __restrict__ att,
                      float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_o, unsigned int* __restrict__ done,
-                     const row_t* __restrict__ rows, size_t seq_stride, int head_dim, int kv_dim, int group, float scale, int split_out) {
+                     const row_t* __restrict__ rows, size_t seq_stride, int head_dim, int kv_dim, int group, float scale, int split_out,
+                     int reach) {
     extern __shared__ float4 shared4[];
     __shared__ int last;
     const int split = blockIdx.z, kvh = blockIdx.y;
@@ -803,6 +834,10 @@ __global__ void __launch_bounds__(THREADS, 4)
      * output, slices and a count of its own, and runs exactly as a step at
      * its position in its sequence would; a step is row 0 of a grid one wide. */
     const int tz = blockIdx.x;
+    const int n = rows[tz].pos + 1;
+    /* A row that attends to more than reach positions is a long context's
+     * (attention_long_kernel), and another kernel takes it. */
+    if (n > reach) return;
     const size_t n_heads = (size_t)gridDim.y * group;
     q += (size_t)tz * n_heads * head_dim;
     att += (size_t)tz * n_heads * head_dim;
@@ -810,7 +845,6 @@ __global__ void __launch_bounds__(THREADS, 4)
     part_l += (size_t)tz * n_heads * ATTENTION_SPLITS;
     part_o += (size_t)tz * n_heads * ATTENTION_SPLITS * head_dim;
     done += (size_t)tz * gridDim.y;
-    const int n = rows[tz].pos + 1;
     const size_t seq_at = (size_t)rows[tz].seq * seq_stride;
     /* As many slices as n needs at ATTENTION_MIN_SLICE positions each, up
      * to the grid's depth; the blocks past them have nothing to do. */
@@ -913,6 +947,365 @@ __global__ void __launch_bounds__(THREADS, 4)
         att[split_out ? (size_t)split_at((int)at, (int)(n_heads * head_dim)) : at] = o / sum;
     }
     if (threadIdx.x == 0) done[kvh] = 0; /* ready for the next layer */
+}
+
+/* --- A long context (gate A10) ---
+ *
+ * attention_kernel holds a slice's scores in shared memory, and a pass of a
+ * prompt's rows reads the whole cache again for every MULTI_MAX of them: at
+ * 32K positions that is hours. A row that attends to more than g->long_from
+ * positions runs in another arithmetic instead, one that rows can share the
+ * cache's tiles in. Its positions go LONG_TILE at a time from position 0,
+ * each tile folded into a running max, sum and weighted sum of the values
+ * (long_tile_softmax, then the values in order); every LONG_CHUNK positions
+ * that running state, a chunk's, starts again, and the chunks are merged
+ * into the row's in order (long_merge). attention_long_kernel computes a
+ * step's chunks at once, a block each, and the last block merges them;
+ * attention_long_rows_kernel takes a run of a prompt's rows through every
+ * tile in order, each tile staged once for all of them. Both compute a row
+ * with the same operations in the same order, so its output is the same
+ * bits whichever ran it. In both, a row and a head are sixteen lanes of a
+ * warp: lane x scores the tile's positions 2x and 2x + 1, and keeps the
+ * weighted values of dimensions 4x to 4x + 3 of every 64 (long_dim). */
+#define LONG_TILE 32
+#define LONG_CHUNK 256
+#define LONG_FROM 1024 /* the positions a row attends to past which it takes this arithmetic */
+#define LONG_BQ 64     /* the rows a block of attention_long_rows_kernel takes */
+#define LONG_RUN 16    /* the fewest rows of a run that it takes; fewer go a step at a time */
+static_assert(LONG_TILE == 32 && LONG_CHUNK % LONG_TILE == 0 && THREADS == 256 && LONG_BQ == 64,
+              "a tile is two positions for each of sixteen lanes; 16 by 16 threads take 64 rows, four each");
+
+/* Dimension k of a lane's head_dim / 16. */
+__device__ __forceinline__ int long_dim(int lane16, int k) { return 4 * lane16 + 64 * (k >> 2) + (k & 3); }
+
+/* A tile's softmax for one row and head, from this lane's two scores
+ * (NEG_INF for a position the row does not attend to): the running max m
+ * moves to take the tile's in, the running sum l is scaled by alpha =
+ * exp(old max - new max) and the tile's weights added, and the lane's two
+ * weights come back in p0 and p1. The sixteen lanes of the row call it
+ * together, and the whole warp with them. A tile with nothing to attend to
+ * leaves the state as it was, as if it were not there. */
+__device__ __forceinline__ void long_tile_softmax(float s0, float s1, float& m, float& l, float& alpha, float& p0, float& p1) {
+    float mt = fmaxf(s0, s1);
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+    const float mn = fmaxf(m, mt);
+    alpha = mn == NEG_INF ? 1.0f : expf(m - mn);
+    p0 = s0 == NEG_INF ? 0.0f : expf(s0 - mn);
+    p1 = s1 == NEG_INF ? 0.0f : expf(s1 - mn);
+    float ts = p0 + p1;
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) ts += __shfl_xor_sync(0xffffffffu, ts, off);
+    l = fmaf(l, alpha, ts);
+    m = mn;
+}
+
+/* A chunk's state (m, l, o) merged into the row's (M, L, O), whose max moves
+ * to take the chunk's in. A chunk with nothing in it changes nothing. */
+template <int ND>
+__device__ __forceinline__ void long_merge(float& M, float& L, float O[ND], float m, float l, const float o[ND]) {
+    const float mn = fmaxf(M, m);
+    const float a = mn == NEG_INF ? 1.0f : expf(M - mn);
+    const float b = mn == NEG_INF ? 0.0f : expf(m - mn);
+    L = fmaf(l, b, L * a);
+#pragma unroll
+    for (int k = 0; k < ND; k++) O[k] = fmaf(o[k], b, O[k] * a);
+    M = mn;
+}
+
+/* A step's attention, or several rows' as steps, for rows attending to more
+ * than LONG_FROM positions: block (row, key-value head, chunk), sixteen
+ * lanes for each query head of the group (a group of one has a second,
+ * idle). Each block stages its chunk's tiles in shared memory, keeps its
+ * heads' running state through them, and writes it out; the last block of
+ * the row and key-value head merges the chunks in order, as
+ * attention_long_rows_kernel does as it goes. part_m and part_l hold
+ * [n_heads][chunks_max] a row, part_o [n_heads][chunks_max][head_dim]. */
+template <int D>
+__global__ void __launch_bounds__(THREADS) attention_long_kernel(const float* __restrict__ q, const float* __restrict__ kc,
+                                                                 const float* __restrict__ vc, float* __restrict__ att, float* __restrict__ part_m,
+                                                                 float* __restrict__ part_l, float* __restrict__ part_o,
+                                                                 unsigned int* __restrict__ done, const row_t* __restrict__ rows,
+                                                                 size_t seq_stride, int kv_dim, int group, int chunks_max, float scale,
+                                                                 int split_out) {
+    constexpr int ND = D / 16;
+    constexpr int KS = D + 1; /* a tile's keys a position a row, one float apart in banks */
+    __shared__ __align__(16) float ks[LONG_TILE * KS];
+    __shared__ __align__(16) float vs[LONG_TILE * D];
+    __shared__ __align__(16) float qs[16 * D]; /* up to sixteen query heads of a group */
+    __shared__ float ps[16 * LONG_TILE];
+    __shared__ int last;
+    const int tz = blockIdx.x, kvh = blockIdx.y, c = blockIdx.z;
+    const int n = rows[tz].pos + 1;
+    const int chunks = (n + LONG_CHUNK - 1) / LONG_CHUNK;
+    if (c >= chunks) return;
+    const int n_heads = gridDim.y * group;
+    q += (size_t)tz * n_heads * D;
+    att += (size_t)tz * n_heads * D;
+    part_m += (size_t)tz * n_heads * chunks_max;
+    part_l += (size_t)tz * n_heads * chunks_max;
+    part_o += (size_t)tz * n_heads * chunks_max * D;
+    done += (size_t)tz * gridDim.y;
+    const float* kh = kc + (size_t)rows[tz].seq * seq_stride + (size_t)kvh * D;
+    const float* vh = vc + (size_t)rows[tz].seq * seq_stride + (size_t)kvh * D;
+    const int hh = threadIdx.x >> 4, x = threadIdx.x & 15;
+    const bool live = hh < group;
+    const int h = kvh * group + hh;
+    const int heads = blockDim.x >> 4; /* the group's heads, and an idle one to make a whole warp */
+
+    for (int i = threadIdx.x; i < heads * D; i += blockDim.x) qs[i] = i < group * D ? q[(size_t)kvh * group * D + i] : 0.0f;
+
+    float m = NEG_INF, l = 0.0f, o[ND];
+#pragma unroll
+    for (int k = 0; k < ND; k++) o[k] = 0.0f;
+    const int end = min(n, (c + 1) * LONG_CHUNK);
+    for (int k0 = c * LONG_CHUNK; k0 < end; k0 += LONG_TILE) {
+        __syncthreads(); /* the queries are written, and the tile before has been read */
+        for (int i = threadIdx.x; i < LONG_TILE * (D / 4); i += blockDim.x) {
+            const int j = i / (D / 4), c4 = i % (D / 4);
+            float4 kv = make_float4(0.0f, 0.0f, 0.0f, 0.0f), vv = kv;
+            if (k0 + j < n) {
+                kv = *reinterpret_cast<const float4*>(kh + (size_t)(k0 + j) * kv_dim + 4 * c4);
+                vv = *reinterpret_cast<const float4*>(vh + (size_t)(k0 + j) * kv_dim + 4 * c4);
+            }
+            float* kr = ks + j * KS + 4 * c4;
+            kr[0] = kv.x;
+            kr[1] = kv.y;
+            kr[2] = kv.z;
+            kr[3] = kv.w;
+            *reinterpret_cast<float4*>(vs + j * D + 4 * c4) = vv;
+        }
+        __syncthreads();
+        float s[2];
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++) {
+            const int j = 2 * x + jj;
+            s[jj] = NEG_INF;
+            if (k0 + j < n) {
+                const float* qh = qs + hh * D;
+                const float* kr = ks + j * KS;
+                float acc = 0.0f;
+#pragma unroll 8
+                for (int d = 0; d < D; d++) acc = fmaf(qh[d], kr[d], acc);
+                s[jj] = acc * scale;
+            }
+        }
+        float alpha, p0, p1;
+        long_tile_softmax(s[0], s[1], m, l, alpha, p0, p1);
+        ps[hh * LONG_TILE + 2 * x] = p0;
+        ps[hh * LONG_TILE + 2 * x + 1] = p1;
+        __syncwarp();
+        const int lim = min(LONG_TILE, n - k0);
+#pragma unroll
+        for (int k = 0; k < ND; k++) o[k] = o[k] * alpha;
+        for (int j = 0; j < LONG_TILE; j++) {
+            if (j < lim) {
+                const float p = ps[hh * LONG_TILE + j];
+#pragma unroll
+                for (int k = 0; k < ND; k++) o[k] = fmaf(p, vs[j * D + long_dim(x, k)], o[k]);
+            }
+        }
+    }
+
+    if (live) {
+        const size_t at = (size_t)h * chunks_max + c;
+        if (x == 0) {
+            part_m[at] = m;
+            part_l[at] = l;
+        }
+#pragma unroll
+        for (int k = 0; k < ND; k++) part_o[at * D + long_dim(x, k)] = o[k];
+    }
+    /* Every block publishes its chunk; the last of this key-value head's merges. */
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&done[kvh], 1u) == (unsigned int)chunks - 1;
+    __syncthreads();
+    if (!last) return;
+    if (live) {
+        float M = NEG_INF, L = 0.0f, O[ND];
+#pragma unroll
+        for (int k = 0; k < ND; k++) O[k] = 0.0f;
+        for (int cc = 0; cc < chunks; cc++) {
+            /* Other blocks wrote these: read them from L2, past this SM's L1. */
+            const size_t at = (size_t)h * chunks_max + cc;
+            float oc[ND];
+#pragma unroll
+            for (int k = 0; k < ND; k++) oc[k] = __ldcg(&part_o[at * D + long_dim(x, k)]);
+            long_merge<ND>(M, L, O, __ldcg(&part_m[at]), __ldcg(&part_l[at]), oc);
+        }
+#pragma unroll
+        for (int k = 0; k < ND; k++) {
+            const int i = h * D + long_dim(x, k);
+            att[split_out ? split_at(i, n_heads * D) : i] = O[k] / L;
+        }
+    }
+    if (threadIdx.x == 0) done[kvh] = 0; /* ready for the next layer */
+}
+
+/* The dynamic shared memory of attention_long_rows_kernel: the queries,
+ * transposed, D rows of LONG_BQ + 4; a tile's keys, transposed, D rows of
+ * LONG_TILE + 4; its values, LONG_TILE rows of D + 4; and its weights,
+ * LONG_BQ rows of LONG_TILE + 4. */
+#define LONG_ROWS_SHARED(D) \
+    ((size_t)((D) * (LONG_BQ + 4) + (D) * (LONG_TILE + 4) + LONG_TILE * ((D) + 4) + LONG_BQ * (LONG_TILE + 4)) * sizeof(float))
+
+/* A run of a prompt's rows, of one sequence at consecutive positions from
+ * p_first, each attending to more than LONG_FROM positions: block (x, h)
+ * takes query head h of LONG_BQ of the rows, the last first, since they
+ * read the most. It goes through the positions LONG_TILE at a time,
+ * staging each tile's keys (transposed) and values in shared memory once
+ * for every row, and reads the next tile into registers while this one
+ * computes. Thread (y, x) scores rows 4y to 4y + 3 against the tile's
+ * positions 2x and 2x + 1, so the sixteen lanes that share a row hold its
+ * tile as attention_long_kernel's do, and keeps those rows' weighted values
+ * of the dimensions long_dim gives lane x. Each row runs exactly as
+ * attention_long_kernel runs it: a tile past the row's own position leaves
+ * its state as it was, and so does merging a chunk it has nothing in. */
+template <int D>
+__global__ void __launch_bounds__(THREADS, 1) attention_long_rows_kernel(const float* __restrict__ q, const float* __restrict__ kc,
+                                                                         const float* __restrict__ vc, float* __restrict__ att, int p_first,
+                                                                         int nr, int kv_dim, int q_dim, int group, float scale, int split_out) {
+    constexpr int ND = D / 16, RM = LONG_BQ / 16;
+    constexpr int QS = LONG_BQ + 4, KS = LONG_TILE + 4, VS = D + 4, SLOTS = LONG_TILE * (D / 4) / THREADS;
+    static_assert(LONG_TILE * (D / 4) % THREADS == 0, "a tile's float4s divide among the threads");
+    extern __shared__ float4 shared4[];
+    float* qs = reinterpret_cast<float*>(shared4); /* [D][QS] */
+    float* ks = qs + D * QS;                       /* [D][KS] */
+    float* vs = ks + D * KS;                       /* [LONG_TILE][VS] */
+    float* ps = vs + LONG_TILE * VS;               /* [LONG_BQ][KS] */
+    const int h = blockIdx.y, kvh = h / group;
+    const int t0 = (gridDim.x - 1 - blockIdx.x) * LONG_BQ; /* the block's first row in the run */
+    const int rows = min(LONG_BQ, nr - t0);
+    const int tid = threadIdx.x, y = tid >> 4, x = tid & 15;
+    const int r0 = y * RM;
+    const int end = p_first + t0 + rows; /* the positions the block reads: 0 to end - 1 */
+    int n[RM];                           /* the positions each of the thread's rows attends to, 0 past the run */
+#pragma unroll
+    for (int i = 0; i < RM; i++) n[i] = r0 + i < rows ? p_first + t0 + r0 + i + 1 : 0;
+
+    float4 kr[SLOTS], vr[SLOTS];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int u = 0; u < SLOTS; u++) {
+            const int i = tid + u * THREADS;
+            const int j = i / (D / 4), c4 = i % (D / 4);
+            kr[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            vr[u] = kr[u];
+            if (k0 + j < end) {
+                const size_t src = (size_t)(k0 + j) * kv_dim + (size_t)kvh * D + 4 * c4;
+                kr[u] = *reinterpret_cast<const float4*>(kc + src);
+                vr[u] = *reinterpret_cast<const float4*>(vc + src);
+            }
+        }
+    };
+    fetch(0); /* the first tile, read while the queries are staged */
+
+    for (int i = tid; i < LONG_BQ * (D / 4); i += THREADS) {
+        const int r = i / (D / 4), c4 = i % (D / 4);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r < rows) v = *reinterpret_cast<const float4*>(q + (size_t)(t0 + r) * q_dim + (size_t)h * D + 4 * c4);
+        qs[(4 * c4) * QS + r] = v.x;
+        qs[(4 * c4 + 1) * QS + r] = v.y;
+        qs[(4 * c4 + 2) * QS + r] = v.z;
+        qs[(4 * c4 + 3) * QS + r] = v.w;
+    }
+
+    float m[RM], l[RM], o[RM][ND], M[RM], L[RM], O[RM][ND];
+#pragma unroll
+    for (int i = 0; i < RM; i++) {
+        m[i] = M[i] = NEG_INF;
+        l[i] = L[i] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < ND; k++) o[i][k] = O[i][k] = 0.0f;
+    }
+    for (int k0 = 0; k0 < end; k0 += LONG_TILE) {
+        __syncthreads(); /* the tile before has been read, and the queries written */
+#pragma unroll
+        for (int u = 0; u < SLOTS; u++) {
+            const int i = tid + u * THREADS;
+            const int j = i / (D / 4), c4 = i % (D / 4);
+            ks[(4 * c4) * KS + j] = kr[u].x;
+            ks[(4 * c4 + 1) * KS + j] = kr[u].y;
+            ks[(4 * c4 + 2) * KS + j] = kr[u].z;
+            ks[(4 * c4 + 3) * KS + j] = kr[u].w;
+            *reinterpret_cast<float4*>(vs + j * VS + 4 * c4) = vr[u];
+        }
+        __syncthreads();
+        if (k0 + LONG_TILE < end) fetch(k0 + LONG_TILE); /* the next tile, in flight while this one computes */
+
+        float s[RM][2];
+#pragma unroll
+        for (int i = 0; i < RM; i++) s[i][0] = s[i][1] = 0.0f;
+#pragma unroll 8
+        for (int d = 0; d < D; d++) {
+            const float2 b = *reinterpret_cast<const float2*>(ks + d * KS + 2 * x);
+            const float4 a = *reinterpret_cast<const float4*>(qs + d * QS + r0);
+            const float av[4] = { a.x, a.y, a.z, a.w };
+#pragma unroll
+            for (int i = 0; i < RM; i++) {
+                s[i][0] = fmaf(av[i], b.x, s[i][0]);
+                s[i][1] = fmaf(av[i], b.y, s[i][1]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < RM; i++) {
+            float sc[2];
+#pragma unroll
+            for (int jj = 0; jj < 2; jj++) sc[jj] = k0 + 2 * x + jj < n[i] ? s[i][jj] * scale : NEG_INF;
+            float alpha, p0, p1;
+            long_tile_softmax(sc[0], sc[1], m[i], l[i], alpha, p0, p1);
+            ps[(r0 + i) * KS + 2 * x] = p0;
+            ps[(r0 + i) * KS + 2 * x + 1] = p1;
+#pragma unroll
+            for (int k = 0; k < ND; k++) o[i][k] = o[i][k] * alpha;
+        }
+        __syncwarp(); /* a row's weights are its own sixteen lanes' */
+        int lim[RM];
+#pragma unroll
+        for (int i = 0; i < RM; i++) lim[i] = n[i] - k0;
+        for (int j = 0; j < LONG_TILE; j++) {
+            float v[ND];
+#pragma unroll
+            for (int k4 = 0; k4 < ND; k4 += 4) {
+                const float4 w = *reinterpret_cast<const float4*>(vs + j * VS + long_dim(x, k4));
+                v[k4] = w.x;
+                v[k4 + 1] = w.y;
+                v[k4 + 2] = w.z;
+                v[k4 + 3] = w.w;
+            }
+#pragma unroll
+            for (int i = 0; i < RM; i++) {
+                if (j < lim[i]) {
+                    const float p = ps[(r0 + i) * KS + j];
+#pragma unroll
+                    for (int k = 0; k < ND; k++) o[i][k] = fmaf(p, v[k], o[i][k]);
+                }
+            }
+        }
+        /* The end of a chunk, or of the positions: each row's chunk merges into it, and the next starts empty. */
+        if ((k0 + LONG_TILE) % LONG_CHUNK == 0 || k0 + LONG_TILE >= end) {
+#pragma unroll
+            for (int i = 0; i < RM; i++) {
+                long_merge<ND>(M[i], L[i], O[i], m[i], l[i], o[i]);
+                m[i] = NEG_INF;
+                l[i] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < ND; k++) o[i][k] = 0.0f;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < RM; i++) {
+        if (r0 + i < rows) {
+            float* out = att + (size_t)(t0 + r0 + i) * q_dim;
+#pragma unroll
+            for (int k = 0; k < ND; k++) {
+                const int at = h * D + long_dim(x, k);
+                out[split_out ? split_at(at, q_dim) : at] = O[i][k] / L[i];
+            }
+        }
+    }
 }
 
 /* y += W x, a warp per row: the output and down projections, added to the residual. */
@@ -2139,11 +2532,108 @@ static unsigned int grid_for(const struct vitna_cuda_model* g, int units) {
 /* Attention's dynamic shared memory: the group's queries, and a slice's
  * scores at the longest. A slice is at most ATTENTION_MIN_SLICE positions
  * until every split is in use, and ctx / ATTENTION_SPLITS after. */
+/* Whether a long context runs in its own arithmetic here (attention_long_kernel):
+ * for a mixture of experts, whose head size and group its kernels take. */
+static bool long_capable(const struct vitna_cuda_model* g) {
+    return g->moe && (g->head_dim == 64 || g->head_dim == 128) && g->n_heads / g->n_kv_heads <= 16;
+}
+
+/* The most positions a row attention_kernel takes attends to. */
+static int attention_reach(const struct vitna_cuda_model* g) {
+    return long_capable(g) && g->long_from < g->ctx ? g->long_from : g->ctx;
+}
+
 static size_t attention_shared(const struct vitna_cuda_model* g) {
     const size_t group = (size_t)(g->n_heads / g->n_kv_heads);
-    size_t per = ((size_t)g->ctx + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS;
+    size_t per = ((size_t)attention_reach(g) + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS;
     if (per < ATTENTION_MIN_SLICE) per = ATTENTION_MIN_SLICE;
     return group * ((size_t)g->head_dim + per) * sizeof(float);
+}
+
+/* Layer l's key-value cache, where its attention reads and writes it: the
+ * device's own, or for a layer kept in host memory the staging copy, which
+ * stage_kv fills first. */
+static void layer_cache(const struct vitna_cuda_model* g, int l, float** kc, float** vc) {
+    const size_t layer = (size_t)g->seqs * g->ctx * g->n_kv_heads * g->head_dim;
+    if (l < g->kv_layers) {
+        *kc = g->k_cache + (size_t)l * layer;
+        *vc = g->v_cache + (size_t)l * layer;
+    } else {
+        *kc = g->k_stage;
+        *vc = g->v_stage;
+    }
+}
+
+/* For a layer whose cache is in host memory, the copies around its
+ * attention, on the model's stream: in, what the n rows will read, which in
+ * each sequence is every position before the rows' first, or when the rows
+ * are not one apart, every position to their last; out, the positions from
+ * their first to their last, which they wrote. A position they write is
+ * copied in only when it lies between two of them, and then back unchanged
+ * or as written. */
+static cudaError_t stage_kv(const struct vitna_cuda_model* g, int l, const row_t* rows, int n, bool in) {
+    if (l < g->kv_layers) return cudaSuccess;
+    const size_t kv_dim = (size_t)g->n_kv_heads * g->head_dim, seq_stride = (size_t)g->ctx * kv_dim;
+    const size_t hl = (size_t)(l - g->kv_layers);
+    float* hk = g->k_host + hl * g->seqs * seq_stride;
+    float* hv = g->v_host + hl * g->seqs * seq_stride;
+    for (int s = 0; s < g->seqs; s++) {
+        g->s_lo[s] = INT_MAX;
+        g->s_hi[s] = -1;
+        g->s_n[s] = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        const int s = rows[i].seq;
+        if (rows[i].pos < g->s_lo[s]) g->s_lo[s] = rows[i].pos;
+        if (rows[i].pos > g->s_hi[s]) g->s_hi[s] = rows[i].pos;
+        g->s_n[s]++;
+    }
+    cudaError_t e = cudaSuccess;
+    for (int s = 0; e == cudaSuccess && s < g->seqs; s++) {
+        if (g->s_n[s] == 0) continue;
+        const bool apart = g->s_n[s] != g->s_hi[s] - g->s_lo[s] + 1;
+        const size_t from = in ? 0 : (size_t)g->s_lo[s];
+        const size_t to = in ? (size_t)(apart ? g->s_hi[s] + 1 : g->s_lo[s]) : (size_t)g->s_hi[s] + 1;
+        if (to <= from) continue;
+        const size_t off = (size_t)s * seq_stride + from * kv_dim, bytes = (to - from) * kv_dim * sizeof(float);
+        const cudaMemcpyKind kind = in ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
+        e = cudaMemcpyAsync(in ? g->k_stage + off : hk + off, in ? hk + off : g->k_stage + off, bytes, kind, g->stream);
+        if (e == cudaSuccess) e = cudaMemcpyAsync(in ? g->v_stage + off : hv + off, in ? hv + off : g->v_stage + off, bytes, kind, g->stream);
+    }
+    return e;
+}
+
+/* attention_long_kernel for k rows, at most MULTI_MAX, of which the most
+ * positions any attends to is n_max: rows and q, att from the first. */
+static void launch_attention_long(const struct vitna_cuda_model* g, int k, int n_max, const float* q, const float* kc, const float* vc,
+                                  float* att, const row_t* rows, int split_out) {
+    const int group = g->n_heads / g->n_kv_heads, kv_dim = g->n_kv_heads * g->head_dim;
+    const dim3 grid(k, g->n_kv_heads, (n_max + LONG_CHUNK - 1) / LONG_CHUNK);
+    const unsigned int threads = 16 * (group + (group & 1));
+    const size_t seq_stride = (size_t)g->ctx * kv_dim;
+    if (g->head_dim == 128) {
+        attention_long_kernel<128><<<grid, threads, 0, g->stream>>>(q, kc, vc, att, g->lpart_m, g->lpart_l, g->lpart_o, g->done, rows, seq_stride,
+                                                                    kv_dim, group, g->chunks_max, g->scale, split_out);
+    } else {
+        attention_long_kernel<64><<<grid, threads, 0, g->stream>>>(q, kc, vc, att, g->lpart_m, g->lpart_l, g->lpart_o, g->done, rows, seq_stride,
+                                                                   kv_dim, group, g->chunks_max, g->scale, split_out);
+    }
+}
+
+/* attention_long_rows_kernel for a run of nr rows of sequence seq from
+ * position p_first: q and att from the run's first row. */
+static void launch_attention_long_rows(const struct vitna_cuda_model* g, int nr, int seq, int p_first, const float* q, const float* kc,
+                                       const float* vc, float* att, int split_out) {
+    const int group = g->n_heads / g->n_kv_heads, kv_dim = g->n_kv_heads * g->head_dim, q_dim = g->n_heads * g->head_dim;
+    const size_t at = (size_t)seq * g->ctx * kv_dim;
+    const dim3 grid((nr + LONG_BQ - 1) / LONG_BQ, g->n_heads);
+    if (g->head_dim == 128) {
+        attention_long_rows_kernel<128><<<grid, THREADS, LONG_ROWS_SHARED(128), g->stream>>>(q, kc + at, vc + at, att, p_first, nr, kv_dim, q_dim,
+                                                                                             group, g->scale, split_out);
+    } else {
+        attention_long_rows_kernel<64><<<grid, THREADS, LONG_ROWS_SHARED(64), g->stream>>>(q, kc + at, vc + at, att, p_first, nr, kv_dim, q_dim,
+                                                                                           group, g->scale, split_out);
+    }
 }
 
 /* Layer l's attention for the token g->rows names, in model.c's order: RMSNorm
@@ -2166,22 +2656,29 @@ static void enqueue_qk_norm(const struct vitna_cuda_model* g, cudaStream_t s, co
     }
 }
 
-static void enqueue_attention(const struct vitna_cuda_model* g, int l) {
+/* n is the positions the token attends to, its position plus one, or 0
+ * where the host does not know it (a dense model's captured graph, whose
+ * rows never take a long context's arithmetic). */
+static void enqueue_attention(const struct vitna_cuda_model* g, int l, int n) {
     const cudaStream_t s = g->stream;
     const int H = g->hidden, hd = g->head_dim, half = hd / 2;
     const int q_dim = g->n_heads * hd, kv_dim = g->n_kv_heads * hd;
     const int group = g->n_heads / g->n_kv_heads;
     const size_t seq_stride = (size_t)g->ctx * kv_dim;
     const dlayer_t* L = &g->layers[l];
-    float* kc = g->k_cache + (size_t)l * g->seqs * seq_stride;
-    float* vc = g->v_cache + (size_t)l * g->seqs * seq_stride;
+    float *kc, *vc;
+    layer_cache(g, l, &kc, &vc);
 
     LAUNCH_QKV(L->q.dtype, L->v.dtype, attn_in_kernel, grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2), (size_t)H * sizeof(float),
                s, g->x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w, g->q, kc, vc, g->cos_t, g->sin_t, g->rows, seq_stride, H, g->n_heads,
                g->n_kv_heads, hd, L->q_norm ? g->k_raw : (float*)NULL);
     if (L->q_norm) enqueue_qk_norm(g, s, L, g->q, g->k_raw, kc, g->rows, seq_stride, 1);
-    attention_kernel<<<dim3(1, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
-        g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 0);
+    if (n > attention_reach(g)) {
+        launch_attention_long(g, 1, n, g->q, kc, vc, g->att, g->rows, 0);
+    } else {
+        attention_kernel<<<dim3(1, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
+            g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 0, attention_reach(g));
+    }
     LAUNCH(L->o.dtype, matvec_add_kernel, grid_for(g, H), 0, s, L->o.w, g->att, g->x, H, q_dim);
 }
 
@@ -2197,7 +2694,7 @@ static void enqueue_body(const struct vitna_cuda_model* g) {
     LAUNCH(g->embed.dtype, embed_kernel, embed_blocks, 0, s, g->embed.w, g->rows, H, g->x);
     for (int l = 0; l < g->n_layers; l++) {
         const dlayer_t* L = &g->layers[l];
-        enqueue_attention(g, l);
+        enqueue_attention(g, l, 0);
         LAUNCH(L->gate.dtype, mlp_in_kernel, mlp_in_blocks, norm_shared, s, g->x, L->mlp_norm, g->eps, L->gate.w, L->up.w, g->act, H, g->intermediate);
         LAUNCH(L->down.dtype, matvec_add_kernel, out_blocks, 0, s, L->down.w, g->act, g->x, H, g->intermediate);
     }
@@ -2240,7 +2737,7 @@ static void enqueue_multi(const struct vitna_cuda_model* g) {
         LAUNCH_QKV(L->q.dtype, L->v.dtype, attn_in_multi_kernel, attn_in_blocks, rows_shared, s, g->p_x, L->attn_norm, g->eps, L->q.w, L->k.w,
                    L->v.w, g->p_q, kc, vc, g->cos_t, g->sin_t, g->rows, seq_stride, H, g->n_heads, g->n_kv_heads, hd, T, T, (float*)NULL);
         attention_kernel<<<dim3(T, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
-            g->p_q, kc, vc, g->p_att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 1);
+            g->p_q, kc, vc, g->p_att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 1, g->ctx);
         LAUNCH(L->o.dtype, matvec_add_multi_kernel, out_blocks, 0, s, L->o.w, g->p_att, g->p_x, H, q_dim, T, T);
         LAUNCH(L->gate.dtype, mlp_in_multi_kernel, mlp_in_multi_blocks, rows_shared, s, g->p_x, L->mlp_norm, g->eps, L->gate.w, L->up.w, g->p_gate,
                H, g->intermediate, T);
@@ -2434,9 +2931,25 @@ void vitna_cuda_free(struct vitna_cuda_model* g) {
     if (g->host_multi) cudaFreeHost(g->host_multi);
     if (g->stream) cudaStreamDestroy(g->stream);
     if (g->host_logits) cudaFreeHost(g->host_logits);
+    if (g->k_host) cudaFreeHost(g->k_host);
+    if (g->v_host) cudaFreeHost(g->v_host);
     if (g->arena) cudaFree(g->arena);
+    free(g->h_rows);
+    free(g->s_lo);
+    free(g->s_hi);
+    free(g->s_n);
     free(g->layers);
     free(g);
+}
+
+int vitna_cuda_kv_layers(const struct vitna_cuda_model* g) {
+    return g ? g->kv_layers : 0;
+}
+
+void vitna_cuda_test_long_from(struct vitna_cuda_model* g, size_t n) {
+    if (!g || !long_capable(g)) return;
+    if (n < (size_t)g->long_from) g->long_from = (int)n;
+    g->long_run = 1;
 }
 
 const char* vitna_cuda_device_name(const struct vitna_cuda_model* g) {
@@ -2661,6 +3174,18 @@ static bool create_experts(struct vitna_cuda_model* g, const vitna_llama_t* m, s
     return true;
 }
 
+/* The bytes of a slot of the expert cache, as create_experts lays it out:
+ * the largest of any layer's gate, up and down, each padded. */
+static size_t expert_slot_bytes(const vitna_llama_t* m) {
+    size_t slot = 0;
+    for (size_t l = 0; l < m->cfg.n_layers; l++) {
+        const vitna_expert_t* x0 = &m->layers[l].experts[0];
+        const size_t bytes = padded(matrix_bytes(&x0->gate)) + padded(matrix_bytes(&x0->up)) + padded(matrix_bytes(&x0->down));
+        if (bytes > slot) slot = bytes;
+    }
+    return slot;
+}
+
 struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* cos_tab, const float* sin_tab, size_t expert_cache_bytes,
                                            char* err, size_t err_len) {
     const vitna_llama_config_t* c = &m->cfg;
@@ -2673,7 +3198,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     const size_t q_dim = c->n_heads * c->head_dim;
     const size_t kv_dim = c->n_kv_heads * c->head_dim;
     const size_t half = c->head_dim / 2;
-    const size_t cache_floats = c->n_layers * m->seqs * m->ctx * kv_dim;
+    const size_t layer_floats = m->seqs * m->ctx * kv_dim; /* a layer's keys, or its values */
     if (!fits_int(c->vocab) || !fits_int(c->hidden) || !fits_int(c->intermediate) || !fits_int(q_dim) ||
         !fits_int(m->ctx) || !fits_int(c->n_layers) || !fits_int(m->seqs)) {
         fail(err, err_len, "the model's dimensions are too large for the GPU path");
@@ -2706,6 +3231,9 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     g->n_used = (int)c->n_experts_used;
     /* A mixture of experts runs a token at a time, its prompts too. */
     g->prompt = !g->moe && prompt_batches(g);
+    g->long_from = LONG_FROM;
+    g->long_run = LONG_RUN;
+    g->chunks_max = (int)((m->ctx + LONG_CHUNK - 1) / LONG_CHUNK);
 
     cudaError_t e = cudaSetDevice(g->device);
     cudaDeviceProp prop;
@@ -2777,7 +3305,6 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     if (!tied) total += padded(matrix_bytes(&m->lm_head));
     total += padded(c->hidden * sizeof(float));
     total += 2 * padded(m->ctx * half * sizeof(float));
-    total += 2 * padded(cache_floats * sizeof(float));
     /* Attention's slices and counts, for each of up to MULTI_MAX tokens (a step uses the first). */
     const size_t slices = MULTI_MAX * c->n_heads * ATTENTION_SPLITS;
     total += padded(c->hidden * sizeof(float)) + 2 * padded(q_dim * sizeof(float)) + padded(c->intermediate * sizeof(float)) +
@@ -2796,6 +3323,39 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     if (g->prompt) total += 2 * padded(P * c->hidden * sizeof(float)) + 2 * padded(P * q_dim * sizeof(float)) +
              2 * padded(P * c->intermediate * sizeof(float)) + padded((size_t)LOGIT_ROWS * c->vocab * sizeof(float)) +
              padded(m->ctx * sizeof(int32_t));
+    /* A long context's chunks, for each of up to MULTI_MAX rows. */
+    const size_t lslices = (size_t)MULTI_MAX * c->n_heads * g->chunks_max;
+    if (long_capable(g)) total += 2 * padded(lslices * sizeof(float)) + padded(lslices * c->head_dim * sizeof(float));
+
+    /* Gate A10: the key-value cache's layers go on the device while it has
+     * room for them beside the rest and the expert cache's least (or the
+     * expert cache asked for); the others' stay in page-locked host memory,
+     * through a staging copy on the device. Each byte of the cache is read
+     * by every token that attends to it, and an expert's only by the tokens
+     * routed to it, so the cache comes first. --gpu-kv-layers sets the
+     * number instead. */
+    size_t kv_layers = c->n_layers;
+    if (g->moe) {
+        size_t free_b = 0, total_b = 0;
+        e = cudaMemGetInfo(&free_b, &total_b);
+        if (e != cudaSuccess) {
+            fail_cuda(err, err_len, "cannot ask the device what memory it has free", e);
+            vitna_cuda_free(g);
+            return NULL;
+        }
+        const size_t experts = (expert_cache_bytes ? expert_cache_bytes : 2 * c->n_experts_used * expert_slot_bytes(m)) + EXPERT_MARGIN + KV_HEADROOM;
+        const size_t layer = padded(layer_floats * sizeof(float));
+        if (m->gpu_kv_layers >= 0) {
+            kv_layers = (size_t)m->gpu_kv_layers < c->n_layers ? (size_t)m->gpu_kv_layers : c->n_layers;
+        } else {
+            while (kv_layers > 0 && total + 2 * kv_layers * layer + (kv_layers < c->n_layers ? 2 * layer : 0) + experts > free_b) kv_layers--;
+        }
+    }
+    g->kv_layers = (int)kv_layers;
+    const size_t cache_floats = kv_layers * layer_floats;
+    const bool staged = kv_layers < c->n_layers;
+    total += 2 * padded(cache_floats * sizeof(float));
+    if (staged) total += 2 * padded(layer_floats * sizeof(float));
 
     e = cudaMalloc(&g->arena, total);
     if (e != cudaSuccess) {
@@ -2868,6 +3428,15 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     if (ok) {
         g->k_cache = (float*)carve(&cv, cache_floats * sizeof(float));
         g->v_cache = (float*)carve(&cv, cache_floats * sizeof(float));
+        if (staged) {
+            g->k_stage = (float*)carve(&cv, layer_floats * sizeof(float));
+            g->v_stage = (float*)carve(&cv, layer_floats * sizeof(float));
+        }
+        if (long_capable(g)) {
+            g->lpart_m = (float*)carve(&cv, lslices * sizeof(float));
+            g->lpart_l = (float*)carve(&cv, lslices * sizeof(float));
+            g->lpart_o = (float*)carve(&cv, lslices * c->head_dim * sizeof(float));
+        }
         g->x = (float*)carve(&cv, c->hidden * sizeof(float));
         g->q = (float*)carve(&cv, q_dim * sizeof(float));
         g->att = (float*)carve(&cv, q_dim * sizeof(float));
@@ -2920,6 +3489,46 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         fail_cuda(err, err_len, "copying the model to the device failed", e);
         vitna_cuda_free(g);
         return NULL;
+    }
+
+    if (g->moe) {
+        g->h_rows = (row_t*)malloc(MOE_ROWS * sizeof(row_t));
+        g->s_lo = (int*)malloc(m->seqs * sizeof(int));
+        g->s_hi = (int*)malloc(m->seqs * sizeof(int));
+        g->s_n = (int*)malloc(m->seqs * sizeof(int));
+        if (!g->h_rows || !g->s_lo || !g->s_hi || !g->s_n) {
+            fail(err, err_len, "out of memory");
+            vitna_cuda_free(g);
+            return NULL;
+        }
+    }
+    if (staged) {
+        /* The layers the device has no room for, zeroed as the device's are. */
+        const size_t host_bytes = (c->n_layers - kv_layers) * layer_floats * sizeof(float);
+        e = cudaHostAlloc((void**)&g->k_host, host_bytes, cudaHostAllocDefault);
+        if (e == cudaSuccess) e = cudaHostAlloc((void**)&g->v_host, host_bytes, cudaHostAllocDefault);
+        if (e != cudaSuccess) {
+            fail(err, err_len, "the key-value cache of %zu layers the GPU has no room for needs %.0f MiB of page-locked memory, which cannot be had (%s)",
+                 c->n_layers - kv_layers, 2.0 * (double)host_bytes / 1048576.0, cudaGetErrorName(e));
+            vitna_cuda_free(g);
+            return NULL;
+        }
+        memset(g->k_host, 0, host_bytes);
+        memset(g->v_host, 0, host_bytes);
+    }
+    /* attention_long_rows_kernel asks for more shared memory than a block
+     * gets unasked; a device that cannot give it runs those rows a step at a
+     * time, in the same arithmetic. */
+    if (long_capable(g)) {
+        int optin = 0;
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, g->device) != cudaSuccess) optin = 0;
+        const size_t want = LONG_ROWS_SHARED(c->head_dim == 128 ? 128 : 64);
+        if ((size_t)optin >= want) {
+            e = c->head_dim == 128 ? cudaFuncSetAttribute(attention_long_rows_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)want)
+                                   : cudaFuncSetAttribute(attention_long_rows_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)want);
+            g->long_rows = e == cudaSuccess;
+        }
+        cudaGetLastError(); /* a refusal above is not an error of the model's */
     }
 
     /* A mixture of experts runs layer by layer, routed in between, so its
@@ -3182,7 +3791,12 @@ bool vitna_cuda_moe_route(struct vitna_cuda_model* g, size_t seq, int32_t token,
         set_row_kernel<<<1, 1, 0, s>>>(g->rows, token, (int)pos, (int)seq);
         LAUNCH(g->embed.dtype, embed_kernel, blocks_for((size_t)H, THREADS), 0, s, g->embed.w, g->rows, H, g->x);
     }
-    enqueue_attention(g, l);
+    const row_t row = { token, (int32_t)pos, (int32_t)seq };
+    e = stage_kv(g, l, &row, 1, true);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the key-value cache could not be copied to the device", e);
+    enqueue_attention(g, l, (int)pos + 1);
+    e = stage_kv(g, l, &row, 1, false);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the key-value cache could not be copied back from the device", e);
     const dlayer_t* L = &g->layers[l];
     const dlayer_t* N = next ? &g->layers[l + 1] : L;
     LAUNCH(L->router.dtype, router_kernel, dim3(blocks_for((size_t)E, WARPS), next ? 2 : 1), (size_t)H * sizeof(float), s, g->x, L->mlp_norm,
@@ -3704,7 +4318,14 @@ const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, s
     buf[0] = '\0';
     if (!g || !g->moe) return buf;
     const expert_cache_t* c = &g->ec;
-    snprintf(buf, len,
+    size_t lead = 0;
+    if (g->kv_layers < g->n_layers) {
+        const double host = 2.0 * (double)(g->n_layers - g->kv_layers) * g->seqs * g->ctx * g->n_kv_heads * g->head_dim * sizeof(float);
+        lead = (size_t)snprintf(buf, len, "the key-value cache: %d of %d layers on the GPU, %d in page-locked host memory (%.0f MiB). ", g->kv_layers,
+                              g->n_layers, g->n_layers - g->kv_layers, host / 1048576.0);
+        if (lead >= len) return buf;
+    }
+    snprintf(buf + lead, len - lead,
              "experts on the GPU: %d slots, %.0f MiB, copied from %s, %s. %llu acquired: %llu already on the GPU, %llu still being copied "
              "for a guess, %llu copied when asked for. %llu copied for a guess, %llu of those used. %.1f MiB copied in %llu copies",
              c->n_slots, (double)c->n_slots * (double)c->slot_bytes / 1048576.0, c->stream ? "the expert cache in memory" : "the mapped checkpoint",
@@ -3773,20 +4394,50 @@ static void enqueue_rows_attention(const struct vitna_cuda_model* g, int l, int 
     const int G = g->rows_g;
     const size_t seq_stride = (size_t)g->ctx * kv_dim;
     const dlayer_t* L = &g->layers[l];
-    float* kc = g->k_cache + (size_t)l * g->seqs * seq_stride;
-    float* vc = g->v_cache + (size_t)l * g->seqs * seq_stride;
+    float *kc, *vc;
+    layer_cache(g, l, &kc, &vc);
+    const row_t* hr = g->h_rows;
+    const int reach = attention_reach(g);
 
     LAUNCH_QKV(L->q.dtype, L->v.dtype, attn_in_multi_kernel,
                dim3(grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2), blocks_for((size_t)n, (size_t)G)), (size_t)G * H * sizeof(float),
                s, g->r_x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w, g->r_q, kc, vc, g->cos_t, g->sin_t, g->r_rows, seq_stride, H,
                g->n_heads, g->n_kv_heads, hd, G, n, L->q_norm ? g->r_kraw : (float*)NULL);
     if (L->q_norm) enqueue_qk_norm(g, s, L, g->r_q, g->r_kraw, kc, g->r_rows, seq_stride, n);
-    /* Attention keeps its slices for MULTI_MAX rows, so the rows go that many at a time. */
+    /* Attention keeps its slices for MULTI_MAX rows, so the rows go that
+     * many at a time; a row past reach leaves at once, and a group of only
+     * such rows is not launched. */
     for (int r0 = 0; r0 < n; r0 += MULTI_MAX) {
         const int t = n - r0 < MULTI_MAX ? n - r0 : MULTI_MAX;
+        bool any = false;
+        for (int i = r0; i < r0 + t; i++) any = any || hr[i].pos + 1 <= reach;
+        if (!any) continue;
         attention_kernel<<<dim3(t, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
             g->r_q + (size_t)r0 * q_dim, kc, vc, g->r_att + (size_t)r0 * q_dim, g->part_m, g->part_l, g->part_o, g->done, g->r_rows + r0,
-            seq_stride, hd, kv_dim, group, g->scale, 1);
+            seq_stride, hd, kv_dim, group, g->scale, 1, reach);
+    }
+    /* The rows past reach, a long context's, by runs: rows of one sequence,
+     * one position apart. A run of long_run rows or more shares the cache's
+     * tiles (attention_long_rows_kernel); others go MULTI_MAX at a time, each
+     * as its step would. */
+    for (int i = 0; i < n;) {
+        if (hr[i].pos + 1 <= reach) {
+            i++;
+            continue;
+        }
+        int j = i + 1;
+        while (j < n && hr[j].seq == hr[i].seq && hr[j].pos == hr[j - 1].pos + 1) j++;
+        if (g->long_rows && j - i >= g->long_run) {
+            launch_attention_long_rows(g, j - i, hr[i].seq, hr[i].pos, g->r_q + (size_t)i * q_dim, kc, vc, g->r_att + (size_t)i * q_dim, 1);
+        } else {
+            for (int a = i; a < j; a += MULTI_MAX) {
+                const int t = j - a < MULTI_MAX ? j - a : MULTI_MAX;
+                int n_max = 0;
+                for (int b = a; b < a + t; b++) n_max = hr[b].pos + 1 > n_max ? hr[b].pos + 1 : n_max;
+                launch_attention_long(g, t, n_max, g->r_q + (size_t)a * q_dim, kc, vc, g->r_att + (size_t)a * q_dim, g->r_rows + a, 1);
+            }
+        }
+        i = j;
     }
     LAUNCH(L->o.dtype, matvec_add_multi_kernel, dim3(grid_for(g, H), blocks_for((size_t)n, MULTI_MAX)), 0, s, L->o.w, g->r_att, g->r_x, H,
            q_dim, MULTI_MAX, n);
@@ -3804,12 +4455,18 @@ bool vitna_cuda_moe_rows_route(struct vitna_cuda_model* g, const vitna_cuda_row_
     const int H = g->hidden, E = g->n_experts, G = g->rows_g, l = (int)layer, nn = (int)n;
     if (l == 0) {
         g->r_n = nn;
-        /* From pageable memory, so rows may change as soon as this returns. */
+        /* From pageable memory, so rows may change as soon as this returns.
+         * The host keeps them too, to plan each layer's attention. */
+        memcpy(g->h_rows, rows, n * sizeof(row_t));
         e = cudaMemcpyAsync(g->r_rows, rows, n * sizeof(row_t), cudaMemcpyHostToDevice, s);
         if (e != cudaSuccess) return fail_cuda(err, err_len, "the rows could not be given to the device", e);
         LAUNCH(g->embed.dtype, embed_multi_kernel, dim3(blocks_for((size_t)H, THREADS), nn), 0, s, g->embed.w, g->r_rows, H, g->r_x);
     }
+    e = stage_kv(g, l, g->h_rows, nn, true);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the key-value cache could not be copied to the device", e);
     enqueue_rows_attention(g, l, nn);
+    e = stage_kv(g, l, g->h_rows, nn, false);
+    if (e != cudaSuccess) return fail_cuda(err, err_len, "the key-value cache could not be copied back from the device", e);
     const dlayer_t* L = &g->layers[l];
     const dlayer_t* N = next ? &g->layers[l + 1] : L;
     const size_t norm_shared = (size_t)G * H * sizeof(float);

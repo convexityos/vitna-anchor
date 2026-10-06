@@ -85,6 +85,12 @@ bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, s
 /** What the device's expert cache has done so far, in a sentence, for --timing; empty for a dense model. Returns buf. */
 const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len);
 
+/** The layers whose key-value cache the device holds; the others' are in page-locked host memory. */
+int vitna_cuda_kv_layers(const struct vitna_cuda_model* g);
+
+/** For tests: vitna_llama_test_long_from. */
+void vitna_cuda_test_long_from(struct vitna_cuda_model* g, size_t n);
+
 /**
  * From now on, a step of a mixture of experts shares the experts the device
  * lacks between the CPU, on threads threads, and copies to the device, while
