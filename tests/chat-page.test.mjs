@@ -42,7 +42,8 @@ const html = readFileSync(PAGE, "utf8");
 
 /** The page's script, run in Node without a document: its pure parts, as the page defines them. */
 function pageParts() {
-  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  // The page's one script, between its tags, by position: this is the page's own text, not markup to filter.
+  const script = html.slice(html.indexOf("<script>") + "<script>".length, html.lastIndexOf("</script>"));
   const context = vm.createContext({});
   vm.runInContext(script + "\n;({ escapeHtml, renderMarkdown, parseEvents, applyChunk, newReply, statsLine, samplingFor })", context);
   return vm.runInContext("({ escapeHtml, renderMarkdown, parseEvents, applyChunk, newReply, statsLine, samplingFor })", context);
