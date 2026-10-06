@@ -60,7 +60,10 @@ jobs:
 
   windows:
     name: Windows x64, with the CUDA path
-    runs-on: windows-latest
+    # Visual Studio 2022, which CUDA 13.1's toolset integrates with and the
+    # engine is built with by hand. windows-latest now carries Visual Studio
+    # 2026, for which CMake finds no CUDA toolset.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - name: Install the CUDA toolkit's compiler and runtime
@@ -73,7 +76,7 @@ jobs:
       - name: Build the engine and its unit tests
         shell: bash
         run: |
-          cmake -B engine/build -S engine -DVITNA_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES"
+          cmake -B engine/build -S engine -G "Visual Studio 17 2022" -A x64 -DVITNA_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES"
           cmake --build engine/build --config Release --parallel
       - name: The unit tests pass, and with no GPU the engine plans for the CPU
         shell: bash
