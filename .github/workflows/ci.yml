@@ -150,6 +150,21 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/parallel-serve.test.mjs
+      - name: Cache the pinned embedding model's files
+        uses: actions/cache@v6
+        with:
+          path: models/bge-small-en-v1.5
+          key: embed-model-${{ hashFiles('reference/bge-small-en-v1.5/model.json') }}
+      - name: Fetch the embedding model at the pinned revision, checking every file's SHA-256
+        run: node scripts/fetch-model.mjs bge-small-en-v1.5
+      - name: Gate A14, the engine's embeddings against the reference
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/reference-embed.test.mjs
+      - name: Gate A14, embeddings served over the OpenAI-compatible API
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/embeddings-serve.test.mjs
 
   cuda:
     # GitHub's hosted runners have no GPU. This job compiles the CUDA path, so

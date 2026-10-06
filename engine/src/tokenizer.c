@@ -10,6 +10,7 @@
 #include "tokenizer.h"
 #include "json.h"
 #include "unicode.h"
+#include "wordpiece.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,10 @@ struct vitna_tokenizer {
     bool add_prefix_space;
     bool ignore_merges;
     bool nfc;                    /* the normalizer is NFC; without it there is none */
+
+    /* A WordPiece tokenizer.json (a BERT model's), which wordpiece.c runs in
+     * place of everything above. */
+    vitna_wordpiece_t* wordpiece;
 };
 
 /* --- Token lists --- */
@@ -294,6 +299,11 @@ vitna_tokenizer_t* vitna_tokenizer_load(const char* path, char* err, size_t err_
     if (!t) goto done;
 
     const vitna_json_value_t* root = vitna_json_root(doc);
+    if (vitna_wordpiece_wanted(root)) {
+        t->wordpiece = vitna_wordpiece_from_json(root, err, err_len);
+        ok = t->wordpiece != NULL;
+        goto done;
+    }
     const vitna_json_value_t* norm = vitna_json_get(root, "normalizer");
     if (norm && !vitna_json_is_null(norm)) {
         if (!type_of(norm) || strcmp(type_of(norm), "NFC") != 0) { errf(err, err_len, "normalizers other than NFC are not supported", type_of(norm)); goto done; }
@@ -510,6 +520,7 @@ done:
 
 void vitna_tokenizer_free(vitna_tokenizer_t* t) {
     if (!t) return;
+    vitna_wordpiece_free(t->wordpiece);
     if (t->tokens) {
         for (size_t i = 0; i < t->vocab_size; i++) free(t->tokens[i].bytes);
         free(t->tokens);
@@ -528,17 +539,24 @@ void vitna_tokenizer_free(vitna_tokenizer_t* t) {
 }
 
 size_t vitna_tokenizer_vocab_size(const vitna_tokenizer_t* t) {
+    if (t && t->wordpiece) return vitna_wordpiece_vocab_size(t->wordpiece);
     return t ? t->vocab_size : 0;
 }
 
 const unsigned char* vitna_tokenizer_token_bytes(const vitna_tokenizer_t* t, int32_t id, size_t* len) {
+    if (t && t->wordpiece) return vitna_wordpiece_token_bytes(t->wordpiece, id, len);
     if (!t || id < 0 || (size_t)id >= t->vocab_size || !t->tokens[id].bytes) return NULL;
     *len = t->tokens[id].len;
     return t->tokens[id].bytes;
 }
 
 bool vitna_tokenizer_is_special(const vitna_tokenizer_t* t, int32_t id) {
+    if (t && t->wordpiece) return vitna_wordpiece_is_special(t->wordpiece, id);
     return t && id >= 0 && (size_t)id < t->vocab_size && t->is_special[id];
+}
+
+bool vitna_tokenizer_is_wordpiece(const vitna_tokenizer_t* t) {
+    return t && t->wordpiece;
 }
 
 /* --- BPE on one piece --- */
@@ -928,10 +946,12 @@ static bool encode_normalized(const vitna_tokenizer_t* t, const unsigned char* s
  * extract_and_normalize): those not normalized from the text as written;
  * then, in each piece between them, normalized, the normalized ones. */
 bool vitna_tokenizer_encode(const vitna_tokenizer_t* t, const char* text, size_t len, vitna_token_list_t* out) {
+    if (t->wordpiece) return vitna_wordpiece_encode(t->wordpiece, text, len, out);
     return split_added(t, (const unsigned char*)text, len, false, encode_normalized, out);
 }
 
 unsigned char* vitna_tokenizer_normalize(const vitna_tokenizer_t* t, const char* text, size_t len, size_t* out_len) {
+    if (t->wordpiece) return vitna_wordpiece_normalize(t->wordpiece, text, len, out_len);
     if (t->nfc) return vitna_uni_nfc((const unsigned char*)text, len, out_len);
     unsigned char* copy = (unsigned char*)malloc(len ? len : 1);
     if (copy) memcpy(copy, text, len);

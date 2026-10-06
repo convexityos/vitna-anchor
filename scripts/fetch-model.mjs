@@ -97,6 +97,8 @@ export async function fetchModel(name = "smollm2-135m", { dir = modelDir(name), 
   mkdirSync(dir, { recursive: true });
   for (const file of pin.files) {
     const dest = join(dir, file.path);
+    // A sentence-transformers model keeps its pooling config in a folder of its own.
+    mkdirSync(dirname(dest), { recursive: true });
     if (existsSync(dest) && statSync(dest).size === file.size && (await sha256File(dest)) === file.sha256) {
       log(`  ok       ${file.path}`);
       continue;

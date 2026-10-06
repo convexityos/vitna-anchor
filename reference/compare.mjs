@@ -53,10 +53,73 @@
 // either way; 2e-3 leaves 159. The measurements come from
 // reference/routing_sensitivity.py.
 
+//
+// An embedding model adds two more, for gate A14:
+//
+//   Token ids              exactly equal to the tokenizers library's, running
+//                          the model's own tokenizer.json, for every input and
+//                          corpus string (transformers agrees on all of them)
+//   Embeddings             |engine - reference| <= EMBED_ATOL for each value of
+//                          every input's embedding, both as the model pools it
+//                          (the [CLS] position) and as the mean over every
+//                          position, each divided by its L2 norm; and the
+//                          [CLS] state's norm within EMBED_ATOL of the
+//                          reference's, relatively
+//
+// Why 1e-5: arithmetic in float64 moves the reference's embeddings by at most
+// 2.5e-7, which is the scale of float32 rounding, and six defects an
+// implementation could make and still produce plausible vectors move some
+// value by 1.1e-4 to 0.22: GELU in its tanh form (7.0e-4), LayerNorm's
+// epsilon at 1e-5 (1.1e-4), the token-type embedding left out (8.6e-2),
+// attention scores unscaled (0.22), positions counted from 1 (4.8e-2), and
+// mean pooling without [CLS] and [SEP] (0.21); reference/embed_sensitivity.py
+// measures them. The line was first written at 1e-4 in record_embed.py,
+// before the engine could embed a text, and was moved to 1e-5 after the
+// engine's first comparison (largest difference 3.1e-7, a pass either way),
+// because the measurement showed 1e-4 caught the wrong epsilon by only 13%.
+// At 1e-5 that defect is eleven times the line, and rounding a fortieth of it.
+
 import { readFileSync } from "node:fs";
 
 export const LOGIT_ATOL = 1e-2;
 export const ROUTE_ATOL = 1e-3;
+export const EMBED_ATOL = 1e-5;
+
+/**
+ * Compare an embedding model's outputs with its fixture. `engine` holds, for
+ * each of the fixture's inputs in order, { ids, norm, embedding } from the
+ * model's own pooling, and `mean` the mean-pooled embeddings. Returns
+ * { worst, failures }.
+ */
+export function compareEmbeddings(fixture, engine, mean) {
+  const failures = [];
+  const worst = { embedding: 0, mean: 0, norm: 0 };
+  if (engine.length !== fixture.inputs.length || mean.length !== fixture.inputs.length) {
+    return { worst, failures: [`expected ${fixture.inputs.length} embeddings, got ${engine.length} and ${mean.length}`] };
+  }
+  fixture.inputs.forEach((ref, i) => {
+    const got = engine[i];
+    if (JSON.stringify(got.ids) !== JSON.stringify(ref.ids)) failures.push(`${ref.id}: ids ${JSON.stringify(got.ids)} vs ${JSON.stringify(ref.ids)}`);
+    for (const [key, values, want] of [["embedding", got.embedding, ref.embedding], ["mean", mean[i], ref.mean_embedding]]) {
+      if (values.length !== want.length) {
+        failures.push(`${ref.id} ${key}: ${values.length} values, expected ${want.length}`);
+        continue;
+      }
+      for (let k = 0; k < want.length; k++) {
+        const d = Math.abs(values[k] - want[k]);
+        worst[key] = Math.max(worst[key], d);
+        if (!(d <= EMBED_ATOL)) {
+          failures.push(`${ref.id} ${key} value ${k}: ${values[k]} vs ${want[k]}`);
+          break;
+        }
+      }
+    }
+    const dn = Math.abs(got.norm - ref.cls_norm) / ref.cls_norm;
+    worst.norm = Math.max(worst.norm, dn);
+    if (!(dn <= EMBED_ATOL)) failures.push(`${ref.id}: [CLS] norm ${got.norm} vs ${ref.cls_norm}`);
+  });
+  return { worst, failures };
+}
 
 /**
  * Read the fixture and decode each prompt's last row of logits. Logits are

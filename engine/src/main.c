@@ -7,6 +7,7 @@
 #include <string.h>
 #include "compat.h"
 #include "crypto.h"
+#include "encoder.h"
 #include "json.h"
 #include "kernels.h"
 #include "model.h"
@@ -49,8 +50,9 @@ static void print_usage(const char* prog) {
     printf("               [--router-out <file>] [--experts-out <file>] [--experts-in <file>]\n");
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s normalize --model <dir> [--text <text>]\n", prog);
+    printf("  %s embed    --model <dir> [--text <text>] [--pooling cls|mean] [--threads <n>] [--timing]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
-    printf("               [--speculate <k>] [--parallel <n>]\n");
+    printf("               [--speculate <k>] [--parallel <n>] [--threads <n>]\n");
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n", prog);
     printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n", prog);
@@ -90,6 +92,13 @@ static void print_usage(const char* prog) {
     printf("          per line from stdin and prints one array per line\n");
     printf("normalize prints, as a JSON string, the text the tokenizer's normalizer makes of --text (NFC, or\n");
     printf("          the text as it is when there is none); without --text, of each JSON string on a line of stdin\n");
+    printf("embed     with an embedding model (a BERT-architecture sentence-transformers model, such as\n");
+    printf("          BAAI/bge-small-en-v1.5), prints for --text, or for each JSON string on a line of stdin, a\n");
+    printf("          line of JSON: its token ids, the pooled vector's norm, and its embedding, pooled and\n");
+    printf("          normalized as the model's sentence-transformers files say. --pooling mean takes the mean\n");
+    printf("          over every position in place of the model's pooling. --threads n runs on n threads\n");
+    printf("          (default: every processor); the embeddings are the same, bit for bit, on any number.\n");
+    printf("          --timing prints to stderr how long it took, measured on this machine\n");
     printf("serve     serves the model over an OpenAI-compatible HTTP API at /v1, on 127.0.0.1:8765 unless told\n");
     printf("          otherwise, under the model directory's name unless --model-id says another. Without\n");
     printf("          --model its generation endpoints answer 501. --speculate k drafts and checks tokens as\n");
@@ -97,7 +106,9 @@ static void print_usage(const char* prog) {
     printf("          once (default 1, at most %d), each with a key-value cache of its own, their tokens\n", PARALLEL_MAX);
     printf("          together in each pass on a GPU; every response is the one it gets alone. After a GPU\n");
     printf("          error that leaves the device unable to run anything more in the process, it answers\n");
-    printf("          each request open with an error and exits with status %d, to be started again\n", EXIT_DEVICE_LOST);
+    printf("          each request open with an error and exits with status %d, to be started again.\n", EXIT_DEVICE_LOST);
+    printf("          With an embedding model it serves /v1/embeddings instead of generation, on the CPU,\n");
+    printf("          on --threads threads\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
     printf("read-experts reads every expert of a mixture once from the drive, as --expert-cache does (512 MiB unless\n");
@@ -131,6 +142,8 @@ typedef struct {
     bool timing;
     size_t speculate;
     size_t parallel;        /* serve: the requests it runs at once, each with a sequence of its own */
+    size_t threads;         /* an embedding model's threads; 0 for every processor */
+    const char* pooling;    /* embed: cls or mean in place of the model's pooling */
     vitna_sampling_t sampling;
 } args_t;
 
@@ -179,6 +192,11 @@ static bool parse_args(int argc, char** argv, args_t* a) {
                 return false;
             }
         }
+        else if (TAKE("--threads")) {
+            a->threads = (size_t)strtoull(v, NULL, 10);
+            if (a->threads == 0) a->threads = SIZE_MAX; /* refused where it is used, not taken as the default */
+        }
+        else if (TAKE("--pooling")) a->pooling = v;
         else if (TAKE("--iterations")) a->iterations = atoi(v);
         else if (TAKE("--count")) a->count = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
@@ -350,6 +368,159 @@ static int cmd_tokenize(const args_t* a) {
 
 static int cmd_normalize(const args_t* a) {
     return each_text(a, print_normalized);
+}
+
+/* --text, or every line of stdin, each a JSON string, as texts. */
+typedef struct {
+    char** text;
+    size_t* len;
+    size_t n, cap;
+} texts_t;
+
+static bool texts_push(texts_t* t, const char* s, size_t n) {
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 64;
+        char** text = (char**)realloc(t->text, cap * sizeof(char*));
+        if (!text) return false;
+        t->text = text;
+        size_t* len = (size_t*)realloc(t->len, cap * sizeof(size_t));
+        if (!len) return false;
+        t->len = len;
+        t->cap = cap;
+    }
+    char* copy = (char*)malloc(n ? n : 1);
+    if (!copy) return false;
+    memcpy(copy, s, n);
+    t->text[t->n] = copy;
+    t->len[t->n++] = n;
+    return true;
+}
+
+static void texts_free(texts_t* t) {
+    for (size_t i = 0; i < t->n; i++) free(t->text[i]);
+    free(t->text);
+    free(t->len);
+}
+
+static bool read_texts(const args_t* a, texts_t* out) {
+    if (a->text) return texts_push(out, a->text, strlen(a->text));
+    size_t cap = 1 << 16, len = 0;
+    char* buf = (char*)malloc(cap);
+    for (size_t got; buf && (got = fread(buf + len, 1, cap - len, stdin)) > 0;) {
+        len += got;
+        if (len == cap) {
+            char* grown = (char*)realloc(buf, cap *= 2);
+            if (!grown) free(buf);
+            buf = grown;
+        }
+    }
+    if (!buf) { fprintf(stderr, "out of memory\n"); return false; }
+    bool ok = true;
+    for (size_t i = 0, start = 0; i <= len && ok; i++) {
+        if (i < len && buf[i] != '\n') continue;
+        size_t end = i;
+        if (end > start && buf[end - 1] == '\r') end--;
+        if (end > start) {
+            char err[160];
+            vitna_json_doc_t* doc = vitna_json_parse(buf + start, end - start, err, sizeof(err));
+            const vitna_json_value_t* v = doc ? vitna_json_root(doc) : NULL;
+            if (!v || v->type != VITNA_JSON_STRING) {
+                fprintf(stderr, "line is not a JSON string: %s\n", doc ? "wrong type" : err);
+                ok = false;
+            } else if (!texts_push(out, v->u.string.ptr, v->u.string.len)) {
+                fprintf(stderr, "out of memory\n");
+                ok = false;
+            }
+            vitna_json_free(doc);
+        }
+        start = i + 1;
+    }
+    free(buf);
+    return ok;
+}
+
+/* A float32 written with the fewest digits that read back as it: at most 9. */
+static void print_floats(FILE* f, const float* v, size_t n) {
+    fputc('[', f);
+    for (size_t i = 0; i < n; i++) fprintf(f, i ? ",%.9g" : "%.9g", (double)v[i]);
+    fputc(']', f);
+}
+
+static int cmd_embed(const args_t* a) {
+    if (!a->model) { fprintf(stderr, "--model <dir> is required\n"); return 1; }
+    if (a->threads == SIZE_MAX) { fprintf(stderr, "--threads takes a number of threads from 1\n"); return 1; }
+    if (a->pooling && strcmp(a->pooling, "cls") != 0 && strcmp(a->pooling, "mean") != 0) {
+        fprintf(stderr, "--pooling must be cls or mean, not %s\n", a->pooling);
+        return 1;
+    }
+    vitna_tokenizer_t* tok = load_tokenizer(a->model);
+    if (!tok) return 1;
+    if (!vitna_tokenizer_is_wordpiece(tok)) {
+        fprintf(stderr, "embed needs an embedding model: %s has no WordPiece tokenizer\n", a->model);
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
+    vitna_encoder_t e;
+    char err[512];
+    if (!vitna_encoder_load(&e, a->model, a->threads, err, sizeof(err))) {
+        fprintf(stderr, "%s\n", err);
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
+    binary_stdio();
+    texts_t texts = {0};
+    vitna_token_list_t* ids = NULL;
+    const int32_t** rows = NULL;
+    size_t* lens = NULL;
+    float *out = NULL, *norms = NULL;
+    int rc = 1;
+    if (!read_texts(a, &texts)) goto done;
+    ids = (vitna_token_list_t*)calloc(texts.n ? texts.n : 1, sizeof(vitna_token_list_t));
+    rows = (const int32_t**)malloc((texts.n ? texts.n : 1) * sizeof(int32_t*));
+    lens = (size_t*)malloc((texts.n ? texts.n : 1) * sizeof(size_t));
+    out = (float*)malloc((texts.n ? texts.n : 1) * e.cfg.hidden * sizeof(float));
+    norms = (float*)malloc((texts.n ? texts.n : 1) * sizeof(float));
+    if (!ids || !rows || !lens || !out || !norms) { fprintf(stderr, "out of memory\n"); goto done; }
+    size_t tokens = 0;
+    for (size_t i = 0; i < texts.n; i++) {
+        if (!vitna_tokenizer_encode(tok, texts.text[i], texts.len[i], &ids[i])) { fprintf(stderr, "out of memory\n"); goto done; }
+        if (ids[i].count > e.cfg.max_tokens) {
+            fprintf(stderr, "text %zu has %zu tokens, and the model reads at most %zu\n", i + 1, ids[i].count, e.cfg.max_tokens);
+            goto done;
+        }
+        rows[i] = ids[i].ids;
+        lens[i] = ids[i].count;
+        tokens += ids[i].count;
+    }
+    const vitna_pooling_t pooling = a->pooling ? (strcmp(a->pooling, "mean") == 0 ? VITNA_POOL_MEAN : VITNA_POOL_CLS) : e.cfg.pooling;
+    const double t0 = vitna_time_ms();
+    if (!vitna_encoder_embed(&e, rows, lens, texts.n, pooling, e.cfg.normalize, out, norms)) { fprintf(stderr, "out of memory\n"); goto done; }
+    const double ms = vitna_time_ms() - t0;
+    for (size_t i = 0; i < texts.n; i++) {
+        fputs("{\"ids\":", stdout);
+        print_ids(stdout, ids[i].ids, ids[i].count);
+        fprintf(stdout, ",\"norm\":%.9g,\"embedding\":", (double)norms[i]);
+        print_floats(stdout, out + i * e.cfg.hidden, e.cfg.hidden);
+        fputs("}\n", stdout);
+    }
+    fflush(stdout);
+    if (a->timing) {
+        fprintf(stderr, "embedded %zu texts, %zu tokens, in %.1f ms: %.0f tokens a second, on %zu threads (%s)\n", texts.n, tokens, ms,
+                ms > 0 ? tokens / (ms / 1000.0) : 0.0, e.threads, vitna_encoder_path());
+    }
+    rc = 0;
+
+done:
+    for (size_t i = 0; ids && i < texts.n; i++) vitna_token_list_free(&ids[i]);
+    free(ids);
+    free(rows);
+    free(lens);
+    free(out);
+    free(norms);
+    texts_free(&texts);
+    vitna_encoder_free(&e);
+    vitna_tokenizer_free(tok);
+    return rc;
 }
 
 static bool wants_cuda(const args_t* a) {
@@ -906,7 +1077,7 @@ static void print_matrix(bool* first, const char* name, const vitna_matrix_t* w,
     print_digest(first, name, &h);
 }
 
-static void print_floats(bool* first, const char* name, const float* v, size_t n) {
+static void print_digest_floats(bool* first, const char* name, const float* v, size_t n) {
     vitna_sha256_ctx_t h;
     vitna_sha256_init(&h);
     vitna_sha256_update(&h, v, n * sizeof(float));
@@ -935,20 +1106,20 @@ static int cmd_weights_sha256(const args_t* a) {
     char name[256];
     print_matrix(&first, "model.embed_tokens.weight", &m.embed, &x);
     if (m.lm_head.data != m.embed.data) print_matrix(&first, "lm_head.weight", &m.lm_head, &x);
-    print_floats(&first, "model.norm.weight", m.final_norm, c->hidden);
+    print_digest_floats(&first, "model.norm.weight", m.final_norm, c->hidden);
     for (size_t l = 0; l < c->n_layers; l++) {
         const vitna_llama_layer_t* L = &m.layers[l];
 #define NAMED(suffix) (snprintf(name, sizeof(name), "model.layers.%zu.%s", l, suffix), name)
-        print_floats(&first, NAMED("input_layernorm.weight"), L->attn_norm, c->hidden);
-        print_floats(&first, NAMED("post_attention_layernorm.weight"), L->mlp_norm, c->hidden);
+        print_digest_floats(&first, NAMED("input_layernorm.weight"), L->attn_norm, c->hidden);
+        print_digest_floats(&first, NAMED("post_attention_layernorm.weight"), L->mlp_norm, c->hidden);
         print_matrix(&first, NAMED("self_attn.q_proj.weight"), &L->q, &x);
         print_matrix(&first, NAMED("self_attn.k_proj.weight"), &L->k, &x);
         print_matrix(&first, NAMED("self_attn.v_proj.weight"), &L->v, &x);
         print_matrix(&first, NAMED("self_attn.o_proj.weight"), &L->o, &x);
         if (c->qk_norm) {
             /* A head's weights, shared by every head, or all the heads' (model.h). */
-            print_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->qk_norm_per_head ? c->head_dim : c->n_heads * c->head_dim);
-            print_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->qk_norm_per_head ? c->head_dim : c->n_kv_heads * c->head_dim);
+            print_digest_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->qk_norm_per_head ? c->head_dim : c->n_heads * c->head_dim);
+            print_digest_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->qk_norm_per_head ? c->head_dim : c->n_kv_heads * c->head_dim);
         }
         if (c->n_experts) {
             print_matrix(&first, NAMED("mlp.gate.weight"), &L->router, &x);
@@ -1126,6 +1297,58 @@ static void dir_basename(const char* dir, char* out, size_t n) {
     out[len] = '\0';
 }
 
+/* serve with an embedding model: /v1/embeddings, on the CPU. */
+static int serve_encoder(const args_t* a, vitna_server_config_t* cfg) {
+    if (a->threads == SIZE_MAX) { fprintf(stderr, "--threads takes a number of threads from 1\n"); return 1; }
+    if (wants_cuda(a) || a->speculate || a->parallel || a->ctx || a->expert_cache_mib) {
+        fprintf(stderr, "an embedding model runs on the CPU, with none of --device, --speculate, --parallel, --ctx or --expert-cache\n");
+        return 1;
+    }
+    vitna_tokenizer_t* tok = load_tokenizer(a->model);
+    if (!tok) return 1;
+    if (!vitna_tokenizer_is_wordpiece(tok)) {
+        fprintf(stderr, "%s: an embedding model needs a WordPiece tokenizer\n", a->model);
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
+    vitna_encoder_t e;
+    char err[512];
+    if (!vitna_encoder_load(&e, a->model, a->threads, err, sizeof(err))) {
+        fprintf(stderr, "%s\n", err);
+        vitna_tokenizer_free(tok);
+        return 1;
+    }
+    /* One pass before serving reads every weight once, so the first request
+     * is not the one that waits for the checkpoint to come in from the drive. */
+    vitna_token_list_t warm = {0};
+    float* warm_out = (float*)malloc(e.cfg.hidden * sizeof(float));
+    if (warm_out && vitna_tokenizer_encode(tok, "", 0, &warm) && warm.count > 0 && warm.count <= e.cfg.max_tokens) {
+        const int32_t* row = warm.ids;
+        vitna_encoder_embed(&e, &row, &warm.count, 1, e.cfg.pooling, e.cfg.normalize, warm_out, NULL);
+    }
+    vitna_token_list_free(&warm);
+    free(warm_out);
+    char id[128];
+    if (a->model_id) snprintf(id, sizeof(id), "%s", a->model_id);
+    else dir_basename(a->model, id, sizeof(id));
+    vitna_api_t* api = vitna_api_create_encoder(&e, tok, id[0] ? id : "model");
+    int rc = 1;
+    if (!api) {
+        fprintf(stderr, "out of memory\n");
+    } else {
+        printf("Loaded %s: an embedding model, %zu layers, %zu dimensions, %s pooling%s, up to %zu tokens a text, on %zu CPU threads (%s).\n",
+               vitna_api_model_id(api), e.cfg.n_layers, e.cfg.hidden, e.cfg.pooling == VITNA_POOL_CLS ? "[CLS]" : "mean",
+               e.cfg.normalize ? ", normalized" : "", e.cfg.max_tokens, e.threads, vitna_encoder_path());
+        fflush(stdout);
+        cfg->engine_ctx = api;
+        rc = vitna_server_run(cfg);
+        vitna_api_free(api);
+    }
+    vitna_encoder_free(&e);
+    vitna_tokenizer_free(tok);
+    return rc;
+}
+
 static int cmd_serve(const args_t* a) {
     if (a->parallel > PARALLEL_MAX) {
         fprintf(stderr, "--parallel takes a number of requests from 1 to %d\n", PARALLEL_MAX);
@@ -1136,6 +1359,11 @@ static int cmd_serve(const args_t* a) {
     cfg.bind_addr = a->host ? a->host : "127.0.0.1";
     cfg.engine_ctx = NULL;
     if (!a->model) return vitna_server_run(&cfg);
+    if (vitna_encoder_wanted(a->model)) return serve_encoder(a, &cfg);
+    if (a->threads) {
+        fprintf(stderr, "--threads is for an embedding model; a model that generates runs on the CPU's one thread or the GPU\n");
+        return 1;
+    }
 
     vitna_tokenizer_t* tok = load_tokenizer(a->model);
     if (!tok) return 1;
@@ -1226,6 +1454,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "logits") == 0) return cmd_logits(&a);
     if (strcmp(cmd, "tokenize") == 0) return cmd_tokenize(&a);
     if (strcmp(cmd, "normalize") == 0) return cmd_normalize(&a);
+    if (strcmp(cmd, "embed") == 0) return cmd_embed(&a);
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
     if (strcmp(cmd, "read-experts") == 0) return cmd_read_experts(&a);
