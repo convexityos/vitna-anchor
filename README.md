@@ -5,7 +5,7 @@
 
 An inference engine in C, with a Node.js command line, being built one gate at a time.
 
-**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. Told to, it reads that model's experts from the drive as the layers want them, with direct I/O, into a cache in memory of a size it is given, and the logits are then the same, bit for bit; how fast that runs was measured on one machine ([below](#speed-with-the-experts-read-from-a-drive)). Built with its CUDA path, it runs that model on an NVIDIA GPU too, which keeps as many of the experts as its memory holds and has the others copied in as the layers want them, from the mapped checkpoint or from that cache in memory. The same comparison passed there, checked by hand, and how fast it runs was measured on one GPU ([below](#speed-on-a-gpu)). Given one of the GGUF files OLMoE's authors publish, quantized to 8 or mostly 4 bits, it runs that instead (`--weights`), on the CPU and on the GPU, and matches a reference recorded on the same quantized weights, checked by hand ([below](#quantized-weights-from-a-gguf-file)); with every expert then fitting on that GPU, it decodes 3.5 times as fast as the BF16 model ([below](#speed-with-quantized-weights)). It also runs a text embedding model, [bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), on a CPU in float32, and serves its embeddings at `/v1/embeddings`. Its token ids equal the model's own tokenizer's on every code point, and its embeddings are within 1e-5 of the model's pinned reference, the largest difference 3.05e-7; CI checks both on Linux, macOS and Windows. Nothing has been published to npm, so there is no install command: build from source.
+**What runs today.** The engine runs one small dense model, [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), on a CPU in float32. Its token ids, logits and greedy output match a pinned reference implementation, and CI checks that on Linux, macOS and Windows. Built with its CUDA path, it runs the same forward pass on an NVIDIA GPU, also in float32, and the same comparison passed there on one GPU, checked by hand ([below](#how-gate-a4-was-checked)). CI compiles the CUDA path but has no GPU to run it on. It serves the model over an OpenAI-compatible HTTP API, `/v1/chat/completions` and `/v1/completions`, streamed or not, with usage counted from the tokens it reads and produces. A request reuses the key-value cache for the prefix it shares with the one before it. JSON mode masks, at every step, the logits of each token that could not continue a JSON object. It also runs a mixture of experts, [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0924), on a CPU in float32, and matches that model's own pinned reference: the same tolerance on logits, the same experts chosen at every layer, and the same greedy output, checked by hand ([below](#how-gate-a5s-forward-pass-was-checked)) because its 13.8 GB of weights are more than CI holds. Told to, it reads that model's experts from the drive as the layers want them, with direct I/O, into a cache in memory of a size it is given, and the logits are then the same, bit for bit; how fast that runs was measured on one machine ([below](#speed-with-the-experts-read-from-a-drive)). Built with its CUDA path, it runs that model on an NVIDIA GPU too, which keeps as many of the experts as its memory holds and has the others copied in as the layers want them, from the mapped checkpoint or from that cache in memory. The same comparison passed there, checked by hand, and how fast it runs was measured on one GPU ([below](#speed-on-a-gpu)). Given one of the GGUF files OLMoE's authors publish, quantized to 8 or mostly 4 bits, it runs that instead (`--weights`), on the CPU and on the GPU, and matches a reference recorded on the same quantized weights, checked by hand ([below](#quantized-weights-from-a-gguf-file)); with every expert then fitting on that GPU, it decodes 3.5 times as fast as the BF16 model ([below](#speed-with-quantized-weights)). It runs Qwen3-30B-A3B, the model parity with Strata is measured on, from BF16 and from Qwen's own Q8_0 and Q4_K_M files, on the CPU and on that GPU, which holds under a third of its experts, and matches a reference recorded a layer at a time, checked by hand ([below](#how-gate-a9-was-checked)); on that GPU it decodes 1.6 to 2.8 times as fast as llama.cpp at its best setting for the same files, and reads a prompt 0.68 to 1.03 times as fast ([below](#speed-beside-llamacpp)). It also runs a text embedding model, [bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), on a CPU in float32, and serves its embeddings at `/v1/embeddings`. Its token ids equal the model's own tokenizer's on every code point, and its embeddings are within 1e-5 of the model's pinned reference, the largest difference 3.05e-7; CI checks both on Linux, macOS and Windows. Nothing has been published to npm, so there is no install command: build from source.
 
 Earlier versions of this README described an engine that streams experts from NVMe at a stated line rate, drafts tokens speculatively for a speedup, answers from a prefix cache in under a millisecond, guarantees schema-valid JSON, certifies an air gap, and routes to the cheapest cloud provider for a stated saving. None of that was measured, and most of it had not been built. The v0.1.0 release binaries are that earlier simulator.
 
@@ -156,6 +156,19 @@ node scripts/fetch-model.mjs olmoe-1b-7b-gguf          # OLMoE's own Q8_0 and Q4
 
 `weights-sha256` prints the SHA-256 of every tensor as the engine widens it, which [`reference/record_gguf.py`](reference/README.md#quantized-weights-gate-a7) records for gguf-py's widening; `tests/reference-gguf.test.mjs` requires them equal.
 
+### Qwen3-30B-A3B
+
+Gate A9's model, [Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B): 128 experts in each of 48 layers, 8 a token, a QK-norm over each head alone, the 8 experts' weights renormalized to sum to one, and Qwen's own tokenizer split. It is 61.1 GB in BF16, and Qwen publishes it as GGUF too:
+
+```bash
+node scripts/fetch-model.mjs qwen3-30b-a3b        # 61.1 GB in BF16, with its config and tokenizer
+node scripts/fetch-model.mjs qwen3-30b-a3b-gguf   # Qwen's own Q8_0 and Q4_K_M files, 51.0 GB
+./engine/vitna-anchor run --model models/qwen3-30b-a3b --weights models/qwen3-30b-a3b-gguf/Qwen3-30B-A3B-Q4_K_M.gguf --prompt "The capital of France is" --device cuda
+./engine/vitna-anchor run --model models/qwen3-30b-a3b --prompt "The capital of France is" --device cuda --expert-cache 16384
+```
+
+On a GPU the experts are copied from memory the device has locked. A GGUF file is locked as it is, but the whole 61.1 GB of BF16 is more than a machine with 64 GB can lock, so from BF16 the experts come through a cache in memory read from the drive (`--expert-cache <MiB>`).
+
 | Command | What it does |
 |---|---|
 | `run --model <dir> --prompt <text>` | Prints the prompt's continuation as it is generated |
@@ -170,7 +183,7 @@ node scripts/fetch-model.mjs olmoe-1b-7b-gguf          # OLMoE's own Q8_0 and Q4
 | `weights-sha256 --model <dir> [--weights <file.gguf>]` | Prints, as JSON, the SHA-256 of every tensor's values widened to float32, under its Hugging Face name, each layer's experts together under the name of their stack |
 | `expert-check --model <dir> --device cuda [--weights <file.gguf>] [--count <n>]` | Runs n experts of a mixture (64 by default, spread over the layers; layers times experts takes every one) on the GPU and on the CPU in the GPU's arithmetic, for residuals it makes up, and prints, as JSON, how many gave the same activations and outputs, byte for byte; exits 1 if any differs |
 
-`run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, or expert weights renormalized over those a token uses.
+`run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. The engine runs Llama (`llama`), OLMoE (`olmoe`) and Qwen3's mixture of experts (`qwen3_moe`). A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, a sliding window, or dense layers among a mixture's.
 
 When a step cannot run, `run`, `generate` and `logits` stop with status 1 and say why, as far as the engine knows: a token outside the model's vocabulary, which `--ids` can give; a key-value cache already full, which `--ctx` can make larger, up to the model's maximum; or else the forward pass failing at a position, after the engine's own line saying what failed there, a CUDA error or an expert the drive did not give. After a CUDA error that leaves the GPU unable to run anything more in the process, the line says that too, and which error it was.
 
@@ -256,6 +269,8 @@ A test that talks to servers, when it fails, adds to its error what each server 
 
 With `VITNA_DEVICE=cuda`, the last four run the model on the GPU, in an engine built with the CUDA path; nothing else about them changes, the fixture and the tolerance included. `tests/device.test.mjs` checks that an engine refuses a device it cannot use. CI's CUDA job runs it against an engine built without the CUDA path and one built with it, on a runner with no GPU.
 
+`tests/reference-qwen3.test.mjs` and `tests/reference-qwen3-gguf.test.mjs` do the same for Qwen3-30B-A3B and its two GGUF files: the fixtures are checked with nothing but the repository, CI fetches the tokenizer alone and requires it to match (`VITNA_REQUIRE_QWEN3_TOKENIZER=1`), and the model's comparisons, which need its 61.1 GB or the GGUF files, run by hand with `VITNA_REQUIRE_QWEN3=1` or `VITNA_REQUIRE_QWEN3_GGUF=1` ([below](#how-gate-a9-was-checked)).
+
 ## How gate A4 was checked
 
 By hand, on one machine, on 2026-09-29. CI does not run it again: GitHub's hosted runners have no GPU. What CI does is compile the CUDA path, with Make and with CMake, in NVIDIA's CUDA 13.1.1 development container, and check the refusals above.
@@ -324,6 +339,31 @@ All fifteen tests passed, in 463 s with the engines run one at a time, against t
 Checked again at the merge of [#35](https://github.com/convexityos/vitna-anchor/pull/35), which followed [#33](https://github.com/convexityos/vitna-anchor/pull/33)'s change to how a failed step on the GPU is handled, on a tree identical to main's after it (tree `59cc9ed`), on the same machine, with both engines built as above and `VITNA_REQUIRE_REFERENCE=1` added: the whole suite on the CPU passed 77 of its 81 tests, the other 4 needing a GPU; on the GPU, `tests/reference-moe.test.mjs` alone passed 15 of 15 with the figures above, and the whole suite 71 of 81, the other 10 skipped: the OLMoE file's 8 that need a model on the device, which on a GPU run only when `VITNA_REQUIRE_MOE=1` asks for them, and 2 that need an engine without the CUDA path or a machine without a GPU.
 
 Checked again on 2026-10-05, on the same machine, after gate A8 changed how the GPU computes the experts' activation. CUDA's `expf` ends in a hardware approximation no CPU reproduces, so the experts' SiLU on the GPU now takes `exp` in operations both devices round alike (`engine/src/exact.c`, within 3 ulp of the true value), which the CPU can then repeat bit for bit (see [below](#speed-with-the-cpu-beside-the-gpu)). The dense path and the CPU path keep the library's `expf`. `tests/reference-moe.test.mjs` passed 17 of 17 on the GPU, its seventeenth A8's. With the experts pinned, the largest logit difference was 6.29e-5, and 3.67e-5 for logsumexp; the router logits differed by at most 3.15e-5, and the router chose the reference's experts in all 3,872 decisions at the prompts' positions. Greedy decoding with the experts pinned gave 192 of 192 tokens equal, the top logits at each step within 2.29e-5, and unpinned the routing was the reference's throughout and it decoded the same 192 tokens.
+
+## How gate A9 was checked
+
+Gate A9's reference is recorded a layer at a time, since the model is twice this machine's memory in float32 ([reference/README.md](reference/README.md#qwen3-30b-a3b-gate-a9)): BF16, and Qwen's own Q8_0 and Q4_K_M files, each against the same 6 prompts, 239 prompt positions, 192 greedy tokens and 20,400 routing decisions. Checked on 2026-10-05 and 06 on the same machine as A4 and A5 (AMD Ryzen 7 3700X, 64 GB, RTX 3070 with 8 GB), the engine built with the CUDA path:
+
+```powershell
+$env:VITNA_REQUIRE_QWEN3 = "1"; $env:VITNA_REQUIRE_QWEN3_GGUF = "1"
+node --test --test-reporter=spec tests/reference-qwen3.test.mjs tests/reference-qwen3-gguf.test.mjs
+$env:VITNA_DEVICE = "cuda"   # and again on the GPU, a file at a time
+```
+
+Every comparison passed, on the CPU and on the GPU, from all three:
+
+| Weights, device | Largest logit difference, experts pinned | Router logits | Greedy tokens, pinned and unpinned |
+|---|---|---|---|
+| BF16, CPU | 7.25e-5 | 9.30e-6 | 192 of 192, and 192 |
+| BF16, GPU | 8.11e-5 | 2.72e-5 | 192 of 192, and 192 |
+| Q8_0, CPU | 7.44e-5 | 5.26e-5 | 192 of 192, and 192 |
+| Q8_0, GPU | 1.37e-4 | 7.64e-5 | 192 of 192, and 192 |
+| Q4_K_M, CPU | 5.34e-5 | 2.77e-5 | 192 of 192, and 192 |
+| Q4_K_M, GPU | 7.34e-5 | 3.55e-5 | 192 of 192, and 192 |
+
+The tolerances are 1e-2 for logits and 1e-3 for router logits, A1's and A5's. Everywhere the engine's router chose the reference's experts in all 11,472 decisions at the prompts' positions, and unpinned its routing was the reference's throughout, so it decoded the same 192 tokens. The engine's tokenizer gave tokenizer.json's ids for all 86 strings. From each GGUF file, every one of the 579 tensors widened to gguf-py's bits, on the CPU and on the GPU, by digest. On the GPU the BF16 experts came through a cache of 16 GiB in memory, read from the drive.
+
+Gate A8 on this model: through 1 GiB of the GPU with `--cpu-experts 4`, from both GGUF files, every position's logits and 16 greedy tokens with theirs were the GPU alone's, byte for byte; and `expert-check` ran all 6,144 experts on both devices, with the same activations and outputs byte for byte, in BF16, Q8_0 and Q4_K_M.
 
 ## Speed with the experts read from a drive
 
@@ -452,6 +492,43 @@ The same 64 greedy tokens after "The capital of France is", the median of the 63
 | Q4_K_M | 1,023 MiB | 9.9 | 10.1 (0%) | 10.0 (0%) |
 
 The CPU helps where copies are most of a token: BF16 with a cache of 1 to 2 GiB on the GPU decodes 4% to 11% faster, and Q8_0 at 2 GiB 9% to 12%. At Q4_K_M it does nothing, and the scheduler knows it: it gives the CPU an expert only to measure it again. On this machine an expert costs the CPU more than a copy does. The engine measured a GiB of BF16 experts at 65 to 96 ms on the CPU against 42 to 47 ms over the bus, and a GiB of Q4_K_M experts at 157 to 249 ms against 44 or 45, since the CPU widens each block before it multiplies. So the CPU can only take a share of a layer's misses while the bus carries the rest, and both draw on the same memory, of which the copies alone read 23 to 26 GB/s. Strata's premise, that a missing expert costs less as a read from memory than as a copy over the bus, needs memory that reads well beyond what the bus carries, and this machine's reads little more. On one whose memory does, the same scheduler would give the CPU more, since it follows the costs it measures. The rows a prompt runs together copy in what they lack, with or without the CPU.
+
+## Speed beside llama.cpp
+
+Gate A9 measures the engine beside llama.cpp on the same machine, the same GPU and the same files: Qwen's own Q8_0 and Q4_K_M of Qwen3-30B-A3B, 30.5 GB and 18.6 GB, on an RTX 3070 with 8 GB, of which the desktop held 775 MiB. Neither file fits, so both programs keep some experts in the computer's memory: llama.cpp keeps every expert of its first n layers there and computes them on the CPU (`-ncmoe n`), and the engine keeps as many experts on the GPU as fit, whichever are used most, and copies in what a layer lacks. Measured on 2026-10-06, the CPU 3% busy beforehand, with llama.cpp's own Windows CUDA 12.4 build of release b11433 (the CUDA 13.1 installed here has no cuBLAS to build it against) and the engine at this commit:
+
+```powershell
+llama-bench -m Qwen3-30B-A3B-<file>.gguf -ngl 99 -ncmoe <n> -p 512 -n 128 -r 3 -fa on -t 8
+node scripts/bench-experts.mjs --device cuda --model models/qwen3-30b-a3b --weights <file> --tokens 129 --runs 3 --gpu-caches default --cpu-experts 0,4 [--prompt <text>]
+node scripts/bench-prefill.mjs --device cuda --model models/qwen3-30b-a3b --weights <file> --prompt-tokens 512 --runs 3
+```
+
+llama.cpp, swept over `-ncmoe` until a setting no longer helped. At the lowest settings its prompt speed fell by half, which is what the Windows driver spilling the device's memory into the computer's when the device is full would cause; that was not checked:
+
+| File | `-ncmoe` | Prompt, 512 tokens | Decoding, 128 tokens |
+|---|---|---|---|
+| Q4_K_M | 48 (every expert on the CPU) | 372 tokens a second | 19.9 |
+| Q4_K_M | 33 | 505 | 27.8 |
+| Q4_K_M | 30 | 224 | 29.2 |
+| Q4_K_M | 22 | 242 | 24.0 |
+| Q8_0 | 48 | 234 | 12.1 |
+| Q8_0 | 40 | 273 | 14.0 |
+| Q8_0 | 32 | 142 | 15.8 |
+
+Its best on each, set against the engine with the GPU's cache as large as the device allowed (1,862 of the 6,144 experts from Q4_K_M, 1,001 from Q8_0), decoding 128 tokens after three of the reference's prompts (`capital`, `code` and `long`):
+
+| File | | llama.cpp's best | The engine | With `--cpu-experts 4` |
+|---|---|---|---|---|
+| Q4_K_M | Prompt, 512 tokens | 505 tokens a second | 345 | |
+| Q4_K_M | Decoding after "The capital of France is" | 29.2 | 76.7 | 73.6 |
+| Q4_K_M | Decoding after the Fibonacci code | 29.2 | 47.2 | 46.3 |
+| Q4_K_M | Decoding after the lighthouse story | 29.2 | 81.7 | 77.6 |
+| Q8_0 | Prompt, 512 tokens | 273 | 282 | |
+| Q8_0 | Decoding after "The capital of France is" | 15.8 | 34.3 | 35.6 |
+| Q8_0 | Decoding after the Fibonacci code | 15.8 | 26.3 | 27.3 |
+| Q8_0 | Decoding after the lighthouse story | 15.8 | 40.3 | 41.8 |
+
+The engine decodes 1.6 to 2.8 times as fast as llama.cpp's best here, and reads a prompt 0.68 times as fast from Q4_K_M and about as fast from Q8_0. Its decoding depends on the text, which llama.cpp's does not: a token's experts that the GPU holds already cost nothing to fetch, and the share it held ran from 76% (the code, Q8_0) to 98% (the story); llama.cpp computes the same layers on the CPU whatever the token. llama-bench times generation with no prompt, so its figure is one number for all three. A prompt runs as rows on the GPU, which copies in every expert a chunk wants, most of a layer's for 512 tokens, and that copying is where the engine's prompt time goes. The engine's figures are its timing lines; llama-bench's are its own, the mean of 3 runs.
 
 ## Measurements
 

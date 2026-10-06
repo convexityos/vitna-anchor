@@ -35,10 +35,10 @@
 
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
-        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or a mixture of experts (OLMoE's, Qwen3's), on the CPU\n");
         printf("or, with --device cuda, on an NVIDIA GPU.\n\n");
     } else {
-        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU.\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or a mixture of experts (OLMoE's, Qwen3's), on the CPU.\n");
         printf("This build has no CUDA path.\n\n");
     }
     printf("Usage:\n");
@@ -1117,8 +1117,9 @@ static int cmd_weights_sha256(const args_t* a) {
         print_matrix(&first, NAMED("self_attn.v_proj.weight"), &L->v, &x);
         print_matrix(&first, NAMED("self_attn.o_proj.weight"), &L->o, &x);
         if (c->qk_norm) {
-            print_digest_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->n_heads * c->head_dim);
-            print_digest_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->n_kv_heads * c->head_dim);
+            /* A head's weights, shared by every head, or all the heads' (model.h). */
+            print_digest_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->qk_norm_per_head ? c->head_dim : c->n_heads * c->head_dim);
+            print_digest_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->qk_norm_per_head ? c->head_dim : c->n_kv_heads * c->head_dim);
         }
         if (c->n_experts) {
             print_matrix(&first, NAMED("mlp.gate.weight"), &L->router, &x);

@@ -104,6 +104,19 @@ jobs:
         env:
           VITNA_REQUIRE_MOE_TOKENIZER: "1"
         run: node --test --test-reporter=spec tests/reference-moe.test.mjs
+      # Gate A9's model is 61.1 GB; its tokenizer.json is 11 MB, and the
+      # engine's tokenizer, Qwen's split pattern and all, is compared with it.
+      - name: Cache Qwen3's tokenizer
+        uses: actions/cache@v6
+        with:
+          path: models/qwen3-30b-a3b
+          key: qwen3-tokenizer-${{ hashFiles('reference/qwen3-30b-a3b/model.json') }}
+      - name: Fetch Qwen3's tokenizer.json at the pinned revision, checking its SHA-256
+        run: node scripts/fetch-model.mjs qwen3-30b-a3b --only tokenizer.json
+      - name: Gate A9, the engine's tokenizer against Qwen3's reference
+        env:
+          VITNA_REQUIRE_QWEN3_TOKENIZER: "1"
+        run: node --test --test-reporter=spec tests/reference-qwen3.test.mjs
       # Gate A7's GGUF files are 4 to 7 GB each, more than CI fetches, so only
       # the fixtures are checked here: each the one its pins and recorders
       # describe. The engine is compared with them by hand (README).

@@ -1,0 +1,19 @@
+{
+  "name": "qwen3-30b-a3b-gguf",
+  "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+  "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+  "license": "apache-2.0",
+  "why": "Qwen3-30B-A3B as GGUF, from the model's own authors, for gate A9: the same model as reference/qwen3-30b-a3b, quantized by llama.cpp, at Q8_0 and Q4_K_M. config.json and the tokenizer still come from that pin.",
+  "files": [
+    {
+      "path": "Qwen3-30B-A3B-Q8_0.gguf",
+      "size": 32483931648,
+      "sha256": "4ad960d180b16f56024f5b704697e5dd5b0837167c2e515ef0569abfc599743c"
+    },
+    {
+      "path": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "size": 18556685824,
+      "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5"
+    }
+  ]
+}

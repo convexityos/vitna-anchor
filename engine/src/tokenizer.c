@@ -48,6 +48,7 @@ struct vitna_tokenizer {
     size_t n_added;
 
     int digits;                  /* 0: no Digits step; 1: each digit alone; 2: runs of digits */
+    bool qwen2_split;            /* a Split step with Qwen2's pattern, then ByteLevel without its own */
     bool add_prefix_space;
     bool ignore_merges;
     bool nfc;                    /* the normalizer is NFC; without it there is none */
@@ -202,6 +203,22 @@ static bool is_false_or_missing(const vitna_json_value_t* v) {
     return !v || vitna_json_is_null(v) || (vitna_json_as_bool(v, &b) && !b);
 }
 
+/* The split pattern of Qwen2's tokenizer, which Qwen3 keeps: GPT-2's, but
+ * with contractions in any case, letters after any one character that is
+ * not a line break, letter or number, each number character alone, and line
+ * breaks kept with what they end. Matched by hand in split_qwen2. */
+static const char QWEN2_PATTERN[] =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+/* A Split step this tokenizer can do: Qwen2's pattern, each match a piece of its own. */
+static bool is_qwen2_split(const vitna_json_value_t* step) {
+    const vitna_json_value_t* pattern = vitna_json_get(step, "pattern");
+    const char* regex = pattern ? vitna_json_as_string(vitna_json_get(pattern, "Regex")) : NULL;
+    const char* behavior = vitna_json_as_string(vitna_json_get(step, "behavior"));
+    return regex && strcmp(regex, QWEN2_PATTERN) == 0 && behavior && strcmp(behavior, "Isolated") == 0 &&
+           is_false_or_missing(vitna_json_get(step, "invert"));
+}
+
 static bool configure_pretokenizer(vitna_tokenizer_t* t, const vitna_json_value_t* pre, char* err, size_t err_len) {
     const vitna_json_value_t* byte_level = NULL;
     const char* type = type_of(pre);
@@ -214,10 +231,12 @@ static bool configure_pretokenizer(vitna_tokenizer_t* t, const vitna_json_value_
         for (size_t i = 0; i < list->u.array.count; i++) {
             const vitna_json_value_t* step = list->u.array.items[i];
             const char* st = type_of(step);
-            if (st && strcmp(st, "Digits") == 0 && i + 1 < list->u.array.count && !t->digits) {
+            if (st && strcmp(st, "Digits") == 0 && i + 1 < list->u.array.count && !t->digits && !t->qwen2_split) {
                 bool individual = false;
                 vitna_json_as_bool(vitna_json_get(step, "individual_digits"), &individual);
                 t->digits = individual ? 1 : 2;
+            } else if (st && strcmp(st, "Split") == 0 && i == 0 && list->u.array.count == 2 && is_qwen2_split(step)) {
+                t->qwen2_split = true;
             } else if (st && strcmp(st, "ByteLevel") == 0 && i + 1 == list->u.array.count) {
                 byte_level = step;
             } else {
@@ -230,8 +249,14 @@ static bool configure_pretokenizer(vitna_tokenizer_t* t, const vitna_json_value_
     if (!byte_level) return errf(err, err_len, "the pre_tokenizer has no ByteLevel step", NULL);
     bool use_regex = true;
     vitna_json_as_bool(vitna_json_get(byte_level, "use_regex"), &use_regex);
-    if (!use_regex) return errf(err, err_len, "ByteLevel without its regex is not supported", NULL);
+    /* ByteLevel splits with GPT-2's pattern itself, unless a Split step has
+     * split already, and then it only maps bytes. */
+    if (use_regex == t->qwen2_split) {
+        return errf(err, err_len, t->qwen2_split ? "a ByteLevel step that splits again after a Split is not supported"
+                                                 : "ByteLevel without its regex is not supported", NULL);
+    }
     vitna_json_as_bool(vitna_json_get(byte_level, "add_prefix_space"), &t->add_prefix_space);
+    if (t->qwen2_split && t->add_prefix_space) return errf(err, err_len, "add_prefix_space after a Split is not supported", NULL);
     return true;
 }
 
@@ -312,7 +337,12 @@ vitna_tokenizer_t* vitna_tokenizer_load(const char* path, char* err, size_t err_
     const vitna_json_value_t* unk = vitna_json_get(model, "unk_token");
     const vitna_json_value_t* cont = vitna_json_get(model, "continuing_subword_prefix");
     const vitna_json_value_t* eow = vitna_json_get(model, "end_of_word_suffix");
-    if ((unk && !vitna_json_is_null(unk)) || (cont && !vitna_json_is_null(cont)) || (eow && !vitna_json_is_null(eow))) {
+    /* A prefix or suffix that is empty adds nothing, as none does: Qwen's file writes them so. */
+    const char* cont_s = cont ? vitna_json_as_string(cont) : NULL;
+    const char* eow_s = eow ? vitna_json_as_string(eow) : NULL;
+    const bool no_cont = !cont || vitna_json_is_null(cont) || (cont_s && !cont_s[0]);
+    const bool no_eow = !eow || vitna_json_is_null(eow) || (eow_s && !eow_s[0]);
+    if ((unk && !vitna_json_is_null(unk)) || !no_cont || !no_eow) {
         errf(err, err_len, "unk_token, continuing_subword_prefix and end_of_word_suffix are not supported", NULL);
         goto done;
     }
@@ -703,10 +733,133 @@ static bool split_gpt2(const vitna_tokenizer_t* t, const unsigned char* s, size_
     return true;
 }
 
+/* --- Qwen2's split pattern on one piece ---
+ *
+ * QWEN2_PATTERN, as the tokenizers library's regex engine matches it: at
+ * each position the first alternative that matches, each part greedy and
+ * given back only as far as the rest needs. */
+
+static bool is_line_break(uint32_t cp) {
+    return cp == '\r' || cp == '\n';
+}
+
+/* Neither whitespace, a letter nor a number: [^\s\p{L}\p{N}]. */
+static bool is_other(uint32_t cp) {
+    return classify(cp) == CLS_OTHER;
+}
+
+/* The end of the run of code points from i for which keep is true. */
+static size_t run_while(const unsigned char* s, size_t i, size_t e, bool (*keep)(uint32_t)) {
+    while (i < e) {
+        uint32_t cp;
+        size_t l = vitna_utf8_decode(s + i, e - i, &cp);
+        if (!keep(cp)) break;
+        i += l;
+    }
+    return i;
+}
+
+static bool is_letter(uint32_t cp) {
+    return vitna_uni_is_letter(cp);
+}
+
+/* A code point as (?i) compares it with the ASCII letters of the
+ * contractions: lower-cased, and the long s, which folds to s. */
+static uint32_t fold(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    if (cp == 0x17F) return 's';
+    return cp;
+}
+
+static bool split_qwen2(const vitna_tokenizer_t* t, const unsigned char* s, size_t e, vitna_token_list_t* out) {
+    size_t i = 0;
+    while (i < e) {
+        uint32_t cp;
+        const size_t l = vitna_utf8_decode(s + i, e - i, &cp);
+        size_t end = 0;
+
+        /* (?i:'s|'t|'re|'ve|'m|'ll|'d) */
+        if (cp == '\'' && i + l < e) {
+            uint32_t c1, c2 = 0;
+            const size_t l1 = vitna_utf8_decode(s + i + l, e - i - l, &c1);
+            if (i + l + l1 < e) vitna_utf8_decode(s + i + l + l1, e - i - l - l1, &c2);
+            c1 = fold(c1);
+            c2 = fold(c2);
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                end = i + l + l1;
+            } else if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                end = i + l + l1 + 1; /* c2 is ASCII */
+            }
+        }
+
+        /* [^\r\n\p{L}\p{N}]?\p{L}+: one character that is not a line break,
+         * letter or number, if letters follow it, then the letters */
+        if (!end) {
+            size_t start = i;
+            if (!is_line_break(cp) && classify(cp) != CLS_LETTER && classify(cp) != CLS_NUMBER && i + l < e) {
+                uint32_t next;
+                vitna_utf8_decode(s + i + l, e - i - l, &next);
+                if (vitna_uni_is_letter(next)) start = i + l;
+            }
+            if (start != i || vitna_uni_is_letter(cp)) end = run_while(s, start, e, is_letter);
+        }
+
+        /* \p{N}: one number character */
+        if (!end && classify(cp) == CLS_NUMBER) end = i + l;
+
+        /*  ?[^\s\p{L}\p{N}]+[\r\n]*: an optional space, a run of the rest,
+         * and the line breaks after it */
+        if (!end) {
+            size_t start = i;
+            if (cp == ' ' && i + l < e) {
+                uint32_t next;
+                vitna_utf8_decode(s + i + l, e - i - l, &next);
+                if (is_other(next)) start = i + l;
+            }
+            uint32_t first;
+            vitna_utf8_decode(s + start, e - start, &first);
+            if (is_other(first)) end = run_while(s, run_while(s, start, e, is_other), e, is_line_break);
+        }
+
+        /* \s*[\r\n]+: whitespace up to and with its last line break */
+        if (!end && classify(cp) == CLS_SPACE) {
+            size_t r = i, after_break = 0;
+            while (r < e) {
+                uint32_t c;
+                const size_t cl = vitna_utf8_decode(s + r, e - r, &c);
+                if (!vitna_uni_is_space(c)) break;
+                r += cl;
+                if (is_line_break(c)) after_break = r;
+            }
+            end = after_break;
+        }
+
+        /* \s+(?!\S) then \s+: a run of whitespace, less its last character
+         * when a non-space follows and the run is longer than one */
+        if (!end) {
+            size_t r = i, last = i;
+            while (r < e) {
+                uint32_t c;
+                const size_t cl = vitna_utf8_decode(s + r, e - r, &c);
+                if (!vitna_uni_is_space(c)) break;
+                last = r;
+                r += cl;
+            }
+            end = (r < e && last > i) ? last : r;
+        }
+
+        if (end <= i) end = i + l; /* not reached; a guard against looping */
+        if (!bpe_piece(t, s + i, end - i, out)) return false;
+        i = end;
+    }
+    return true;
+}
+
 /* A piece after the Digits step: the ByteLevel pre-tokenizer adds a leading
- * space when asked to, then splits. */
+ * space when asked to, then splits; after Qwen2's Split, the split is that. */
 static bool encode_piece(const vitna_tokenizer_t* t, const unsigned char* s, size_t n, vitna_token_list_t* out) {
     if (n == 0) return true;
+    if (t->qwen2_split) return split_qwen2(t, s, n, out);
     if (t->add_prefix_space && s[0] != ' ') {
         unsigned char* buf = (unsigned char*)malloc(n + 1);
         if (!buf) return false;

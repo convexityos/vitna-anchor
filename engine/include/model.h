@@ -55,9 +55,12 @@ typedef struct {
     float rms_eps;
     float rope_theta;
     bool tied_embeddings;
-    bool qk_norm;             /* RMSNorm over the query and key projections (OLMoE) */
+    bool qk_norm;             /* RMSNorm over the query and key projections (OLMoE, Qwen3) */
+    bool qk_norm_per_head;    /* each head's head_dim values alone, every head with the same head_dim weights (Qwen3);
+                                 else all the heads' values at once (OLMoE) */
     size_t n_experts;         /* experts in each layer's MLP; 0 for a dense model */
     size_t n_experts_used;    /* experts each token goes through */
+    bool renormalize;         /* the experts' weights divided by their sum (norm_topk_prob: Qwen3's) */
 } vitna_llama_config_t;
 
 typedef struct {
@@ -79,8 +82,8 @@ typedef struct {
     float* attn_norm;
     float* mlp_norm;
     vitna_matrix_t q, k, v, o, gate, up, down;  /* gate, up and down for a dense model */
-    float* q_norm;            /* qk_norm: over all n_heads * head_dim values of q */
-    float* k_norm;            /* and all n_kv_heads * head_dim of k */
+    float* q_norm;            /* qk_norm: over all n_heads * head_dim values of q, or head_dim with qk_norm_per_head */
+    float* k_norm;            /* and all n_kv_heads * head_dim of k, or head_dim */
     vitna_matrix_t router;    /* a mixture of experts: n_experts x hidden */
     vitna_expert_t* experts;  /* [n_experts] */
 } vitna_llama_layer_t;
