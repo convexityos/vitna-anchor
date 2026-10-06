@@ -122,6 +122,21 @@ jobs:
       # describe. The engine is compared with them by hand (README).
       - name: Gate A7, the quantized fixtures as recorded
         run: node --test --test-reporter=spec tests/reference-gguf.test.mjs
+      # Gate A11: the engine writes a conversation, tools and tool calls
+      # included, in Qwen3's own chat template, byte for byte as transformers
+      # renders it. No model is needed, only the engine.
+      - name: Gate A11, conversations in the model's own chat template
+        env:
+          VITNA_REQUIRE_ENGINE: "1"
+        run: node --test --test-reporter=spec tests/chat-template.test.mjs
+      # And the three APIs over it: OpenAI's chat and Responses and
+      # Anthropic's Messages, each written as one conversation and answered
+      # in its own shape, whole and streamed, tool calls and reasoning
+      # included, driven through the pinned model by test hooks.
+      - name: Gate A11, OpenAI's and Anthropic's APIs over one conversation
+        env:
+          VITNA_REQUIRE_REFERENCE: "1"
+        run: node --test --test-reporter=spec tests/api-surface.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"

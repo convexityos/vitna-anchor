@@ -47,6 +47,10 @@ struct vitna_json_value {
         struct { vitna_json_value_t** items; size_t count; } array;
         struct { vitna_json_member_t* members; size_t count; } object;
     } u;
+    /* A number's text as the document wrote it, NUL-terminated: what tells 1
+     * from 1.0, which a double cannot (chat.c writes JSON as Python does). */
+    const char* lit;
+    size_t lit_len;
 };
 
 typedef struct vitna_json_doc vitna_json_doc_t;

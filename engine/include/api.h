@@ -6,8 +6,13 @@
  * driven from a test. server.c does the network half.
  *
  * Served: GET /v1/models, GET /v1/health (and /health), POST
- * /v1/chat/completions and POST /v1/completions, each streamed as
- * server-sent events when asked. Usage is counted from tokens: prompt_tokens
+ * /v1/chat/completions and POST /v1/completions, OpenAI's POST /v1/responses,
+ * and Anthropic's POST /v1/messages and POST /v1/messages/count_tokens, each
+ * streamed as server-sent events when asked, in its own API's events. The
+ * three conversation APIs are one conversation underneath (convert.h),
+ * written in the model's chat template; with Qwen3's, a reply is read back
+ * into its reasoning, its text and its tool calls (chat.h), and each API
+ * returns them in its own shape. Usage is counted from tokens: prompt_tokens
  * is the number of tokens the model read, after the chat format is applied,
  * and completion_tokens the number it generated, counting the end-of-text or
  * other special token it stopped on. Parameters this API does not implement
@@ -130,6 +135,24 @@ void vitna_api_set_mask_cache(vitna_api_t* api, bool on);
  * too small to move a token.
  */
 void vitna_api_set_test_logits(vitna_api_t* api, bool on);
+
+/**
+ * For tests: whether a request's own vitna_test_reply, a string, is taken as
+ * its reply in place of the model's choices (off by default): its tokens one
+ * at a time, then its end, as the model's end-of-text token would end it.
+ * Everything after the choice runs as it would for the model's: stop
+ * sequences, the reply read back, the stream and the response. It lets tests
+ * drive tool calls and reasoning through a model too small to write them.
+ */
+void vitna_api_set_test_reply(vitna_api_t* api, bool on);
+
+/**
+ * Whether conversations are written in Qwen3's chat template (chat.h), their
+ * replies read back into reasoning, text and tool calls, or in ChatML, which
+ * has no tools. On for a Qwen3 model and off for any other; tests turn it on
+ * for a small ChatML model, whose tokenizer writes Qwen3's tags in pieces.
+ */
+void vitna_api_set_qwen3_template(vitna_api_t* api, bool on);
 
 /**
  * Drafts for speculative decoding, by prompt lookup: the tokens that followed

@@ -16,6 +16,8 @@
 #include <string.h>
 
 #include "api.h"
+#include "chat.h"
+#include "convert.h"
 #include "crypto.h"
 #include "exact.h"
 #include "expert_stream.h"
@@ -66,6 +68,298 @@ static bool write_file(const char* path, const void* data, size_t n) {
     bool ok = fwrite(data, 1, n, f) == n;
     fclose(f);
     return ok;
+}
+
+/* --- JSON as Python writes it (chat.h, gate A11) --- */
+
+static void test_py_json(void) {
+    /* Each as Python's repr printed it, which reads back to the same double,
+     * which the engine must print the same: the shortest round trip, fixed
+     * from 1e-4 to below 1e16 with a ".0" when whole, exponents of two digits
+     * or more otherwise. */
+    static const char* const reprs[] = {
+        "0.1", "0.3333333333333333", "0.6666666666666666", "1e+16", "1000000000000000.0", "123456789.123", "5e-324",
+        "1.7976931348623157e+308", "9007199254740992.0", "9007199254740994.0", "0.0001", "1e-05", "-1.5e-07", "1e+22", "1e+21",
+        "1.2345678901234567e+19", "3.14159", "100.0", "-0.0", "1e+100", "1.5e-300", "0.30000000000000004", "12345678000000.0",
+        "4.35", "2.675", "1e-07", "1.23e-18", "0.0",
+    };
+    char buf[48];
+    for (size_t i = 0; i < sizeof(reprs) / sizeof(reprs[0]); i++) {
+        vitna_py_float_repr(strtod(reprs[i], NULL), buf, sizeof(buf));
+        CHECK(strcmp(buf, reprs[i]) == 0, "repr of %s: %s", reprs[i], buf);
+    }
+
+    /* Numbers keep what the document wrote: 1 an int, 1.0 a float. */
+    const char* doc_text = "{\"a\": [1, 1.0, -0, -0.0, 1e2, 1E-7, 12345678901234567890, 2.50], \"s\": \"q\\\"b\\\\n\\n\\t\\u0001\\u007f\\u00e9\", "
+                           "\"d\": 1, \"d\": 2, \"e\": {}}";
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(doc_text, strlen(doc_text), err, sizeof(err));
+    CHECK(doc != NULL, "parses: %s", err);
+    if (doc) {
+        vitna_strbuf_t sb;
+        vitna_sb_init(&sb);
+        vitna_json_write_py(&sb, vitna_json_root(doc));
+        /* What json.dumps(json.loads(doc_text), ensure_ascii=False) gives,
+         * a repeated key where it first came with its last value. */
+        const char* want = "{\"a\": [1, 1.0, 0, -0.0, 100.0, 1e-07, 12345678901234567890, 2.5], \"s\": \"q\\\"b\\\\n\\n\\t\\u0001\x7f\xc3\xa9\", "
+                           "\"d\": 2, \"e\": {}}";
+        CHECK(sb.ok && strcmp(sb.data, want) == 0, "written as Python writes it: %s", sb.data);
+        vitna_sb_free(&sb);
+        vitna_json_free(doc);
+    }
+}
+
+/* --- A reply in Qwen3's format, read back (chat.h) --- */
+
+typedef struct {
+    char reasoning[512], text[512], calls[1024];
+    size_t r, t, c;
+} reply_seen_t;
+
+static void reply_collect(void* ctx, const vitna_reply_part_t* part) {
+    reply_seen_t* s = (reply_seen_t*)ctx;
+    if (part->kind == VITNA_REPLY_REASONING) {
+        s->r += (size_t)snprintf(s->reasoning + s->r, sizeof(s->reasoning) - s->r, "%.*s", (int)part->len, part->data);
+    } else if (part->kind == VITNA_REPLY_TEXT) {
+        s->t += (size_t)snprintf(s->text + s->t, sizeof(s->text) - s->t, "%.*s", (int)part->len, part->data);
+    } else {
+        s->c += (size_t)snprintf(s->calls + s->c, sizeof(s->calls) - s->c, "%.*s(%.*s);", (int)part->len, part->data, (int)part->args_len,
+                                 part->args);
+    }
+}
+
+static void check_reply(const char* name, bool think, bool tools, const char* reply, const char* reasoning, const char* text, const char* calls) {
+    /* Whole, and a byte at a time as a stream would feed it: the same parts. */
+    for (int bytewise = 0; bytewise < 2; bytewise++) {
+        reply_seen_t s;
+        memset(&s, 0, sizeof(s));
+        vitna_reply_parser_t rp;
+        vitna_reply_init(&rp, think, tools);
+        const size_t n = strlen(reply);
+        if (bytewise) {
+            for (size_t k = 1; k <= n; k++) vitna_reply_feed(&rp, reply, k, false, reply_collect, &s);
+        }
+        vitna_reply_feed(&rp, reply, n, true, reply_collect, &s);
+        CHECK(strcmp(s.reasoning, reasoning) == 0, "%s (%s): reasoning [%s]", name, bytewise ? "bytewise" : "whole", s.reasoning);
+        CHECK(strcmp(s.text, text) == 0, "%s (%s): text [%s]", name, bytewise ? "bytewise" : "whole", s.text);
+        CHECK(strcmp(s.calls, calls) == 0, "%s (%s): calls [%s]", name, bytewise ? "bytewise" : "whole", s.calls);
+    }
+}
+
+static void test_reply_parser(void) {
+    check_reply("think and text", true, false, "<think>\nLet me think.\n\nTwice.\n</think>\n\nThe answer is 42.", "Let me think.\n\nTwice.",
+                "The answer is 42.", "");
+    check_reply("no think in the reply", true, false, "Just text.", "", "Just text.", "");
+    check_reply("think off reads tags as text", false, false, "<think>x</think>y", "", "<think>x</think>y", "");
+    check_reply("a call after reasoning", true, true,
+                "<think>\nNeed the weather.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>",
+                "Need the weather.", "", "get_weather({\"location\": \"Paris\"});");
+    check_reply("text, then two calls", false, true,
+                "Let me check.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {\"x\": 1.0}}\n</tool_call>\n<tool_call>\n{\"name\": \"b\", \"arguments\": "
+                "\"{\\\"y\\\": [1, 2]}\"}\n</tool_call>",
+                "", "Let me check.", "a({\"x\": 1.0});b({\"y\": [1, 2]});");
+    check_reply("a call never closed is text", false, true, "Hi\n<tool_call>\n{\"name\": \"x\"", "", "Hi<tool_call>\n{\"name\": \"x\"", "");
+    check_reply("a call that is not JSON is text", false, true, "<tool_call>\nnot json\n</tool_call>", "", "<tool_call>\nnot json\n</tool_call>", "");
+    check_reply("without tools a call is text", false, false, "<tool_call>\n{\"name\": \"a\"}\n</tool_call>", "",
+                "<tool_call>\n{\"name\": \"a\"}\n</tool_call>", "");
+    check_reply("newlines inside and at the end of text stay", false, true, "a\n\nb\n", "", "a\n\nb\n", "");
+    check_reply("missing arguments are {}", false, true, "<tool_call>{\"name\": \"now\"}</tool_call>", "", "", "now({});");
+    check_reply("text after the calls", false, true, "<tool_call>{\"name\": \"a\", \"arguments\": {}}</tool_call>\nDone.", "", "Done.", "a({});");
+    check_reply("a lone < is text", true, true, "<b>bold</b> <", "", "<b>bold</b> <", "");
+}
+
+/* --- Requests of three shapes as one (convert.h) --- */
+
+typedef bool (*convert_fn)(const vitna_json_value_t* req, vitna_chat_request_t* cr);
+
+/* A request converted: its messages and tools as the template will read them, worked by hand. */
+static void check_convert(const char* name, convert_fn fn, const char* req, const char* messages, const char* tools, vitna_tool_choice_t choice,
+                          int thinking, bool cont) {
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(req, strlen(req), err, sizeof(err));
+    CHECK(doc != NULL, "%s: the request parses: %s", name, err);
+    if (!doc) return;
+    vitna_chat_request_t cr;
+    vitna_chat_request_init(&cr);
+    const bool ok = fn(vitna_json_root(doc), &cr);
+    CHECK(ok, "%s: converts, not refused at %s: %s", name, cr.param, cr.message);
+    if (ok) {
+        CHECK(strcmp(cr.messages.data, messages) == 0, "%s: messages\n  got  %s\n  want %s", name, cr.messages.data, messages);
+        CHECK(strcmp(cr.tools.data ? cr.tools.data : "", tools) == 0, "%s: tools\n  got  %s\n  want %s", name, cr.tools.data ? cr.tools.data : "", tools);
+        CHECK(cr.tool_choice == choice, "%s: tool_choice %d", name, (int)cr.tool_choice);
+        CHECK(cr.enable_thinking == thinking, "%s: enable_thinking %d", name, cr.enable_thinking);
+        CHECK(cr.continue_final == cont, "%s: continue_final %d", name, (int)cr.continue_final);
+        /* What it gives, the template renders. */
+        vitna_json_doc_t* md = vitna_json_parse(cr.messages.data, cr.messages.len, err, sizeof(err));
+        vitna_json_doc_t* td = cr.tools.len ? vitna_json_parse(cr.tools.data, cr.tools.len, err, sizeof(err)) : NULL;
+        vitna_strbuf_t prompt;
+        vitna_sb_init(&prompt);
+        CHECK(md && (td || !cr.tools.len) &&
+                  vitna_chat_qwen3(&prompt, vitna_json_root(md), td ? vitna_json_root(td) : NULL, cr.enable_thinking, !cr.continue_final, err, sizeof(err)),
+              "%s: the template renders it", name);
+        vitna_sb_free(&prompt);
+        vitna_json_free(md);
+        vitna_json_free(td);
+    }
+    vitna_chat_request_free(&cr);
+    vitna_json_free(doc);
+}
+
+static void check_refused(const char* name, convert_fn fn, const char* req, const char* param, bool unsupported) {
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(req, strlen(req), err, sizeof(err));
+    CHECK(doc != NULL, "%s: the request parses: %s", name, err);
+    if (!doc) return;
+    vitna_chat_request_t cr;
+    vitna_chat_request_init(&cr);
+    const bool ok = fn(vitna_json_root(doc), &cr);
+    CHECK(!ok, "%s: refused", name);
+    CHECK(strcmp(cr.param, param) == 0, "%s: refused at %s, not %s (%s)", name, cr.param, param, cr.message);
+    CHECK(cr.unsupported == unsupported, "%s: refused as %s: %s", name, cr.unsupported ? "unsupported" : "malformed", cr.message);
+    CHECK(cr.message[0] != '\0', "%s: says why", name);
+    vitna_chat_request_free(&cr);
+    vitna_json_free(doc);
+}
+
+static void test_convert(void) {
+    /* OpenAI's chat: parts joined, developer as system, a call's string of
+     * JSON read as its object, the tool rewritten in the order the model
+     * was trained on, and vLLM's switch for thinking. */
+    check_convert("chat", vitna_convert_chat,
+                  "{\"messages\": [{\"role\": \"developer\", \"content\": [{\"type\": \"text\", \"text\": \"Be brief.\"}, {\"type\": \"text\", \"text\": "
+                  "\"Use tools.\"}]}, {\"role\": \"user\", \"content\": \"Weather?\"}, {\"role\": \"assistant\", \"content\": null, \"reasoning_content\": "
+                  "\"Need it.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"w\", \"arguments\": "
+                  "\"{\\\"city\\\":\\\"Paris\\\",\\\"n\\\":1.0}\"}}]}, {\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"Sunny\"}], "
+                  "\"tools\": [{\"type\": \"function\", \"function\": {\"parameters\": {\"type\": \"object\"}, \"name\": \"w\", \"strict\": true, "
+                  "\"description\": \"Weather\"}}], \"tool_choice\": \"auto\", \"chat_template_kwargs\": {\"enable_thinking\": false}}",
+                  "[{\"role\": \"system\", \"content\": \"Be brief.\\nUse tools.\"}, {\"role\": \"user\", \"content\": \"Weather?\"}, {\"role\": "
+                  "\"assistant\", \"content\": \"\", \"reasoning_content\": \"Need it.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", "
+                  "\"function\": {\"name\": \"w\", \"arguments\": {\"city\": \"Paris\", \"n\": 1.0}}}]}, {\"role\": \"tool\", \"content\": \"Sunny\", "
+                  "\"tool_call_id\": \"c1\"}]",
+                  "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"description\": \"Weather\", \"parameters\": {\"type\": \"object\"}}}]",
+                  VITNA_TOOLS_AUTO, 0, false);
+    check_convert("chat, a string of arguments that is not an object stays a string", vitna_convert_chat,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"tool_calls\": [{\"function\": {\"name\": \"f\", "
+                  "\"arguments\": \"not json\"}}, {\"function\": {\"name\": \"g\", \"arguments\": \"\"}}]}], \"reasoning_effort\": \"high\"}",
+                  "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"\", \"type\": "
+                  "\"function\", \"function\": {\"name\": \"f\", \"arguments\": \"not json\"}}, {\"id\": \"\", \"type\": \"function\", \"function\": "
+                  "{\"name\": \"g\", \"arguments\": {}}}]}]",
+                  "", VITNA_TOOLS_AUTO, 1, false);
+
+    /* Anthropic's Messages: system blocks joined, consecutive user messages
+     * one turn, thinking as reasoning, a tool use's input as its arguments,
+     * tool results before the text that follows them, a turn of results
+     * alone with no user message after it. */
+    check_convert("messages", vitna_convert_messages,
+                  "{\"system\": [{\"type\": \"text\", \"text\": \"You are X.\"}, {\"type\": \"text\", \"text\": \"Be careful.\", \"cache_control\": "
+                  "{\"type\": \"ephemeral\"}}], \"messages\": [{\"role\": \"user\", \"content\": \"Hi\"}, {\"role\": \"user\", \"content\": [{\"type\": "
+                  "\"text\", \"text\": \"List files.\"}]}, {\"role\": \"assistant\", \"content\": [{\"type\": \"thinking\", \"thinking\": \"Use ls.\", "
+                  "\"signature\": \"s\"}, {\"type\": \"text\", \"text\": \"Listing.\"}, {\"type\": \"tool_use\", \"id\": \"toolu_1\", \"name\": \"bash\", "
+                  "\"input\": {\"cmd\": \"ls\", \"n\": 2}}]}, {\"role\": \"user\", \"content\": [{\"type\": \"tool_result\", \"tool_use_id\": \"toolu_1\", "
+                  "\"content\": [{\"type\": \"text\", \"text\": \"a.txt\"}, {\"type\": \"text\", \"text\": \"b.txt\"}]}, {\"type\": \"text\", \"text\": "
+                  "\"Now?\"}]}, {\"role\": \"assistant\", \"content\": [{\"type\": \"tool_use\", \"id\": \"toolu_2\", \"name\": \"bash\", \"input\": "
+                  "{\"cmd\": \"pwd\"}}]}, {\"role\": \"user\", \"content\": [{\"type\": \"tool_result\", \"tool_use_id\": \"toolu_2\", \"content\": "
+                  "\"/home\", \"is_error\": false}]}], \"tools\": [{\"name\": \"bash\", \"description\": \"Run\", \"input_schema\": {\"type\": \"object\", "
+                  "\"properties\": {\"cmd\": {\"type\": \"string\"}}}, \"cache_control\": {\"type\": \"ephemeral\"}}], \"tool_choice\": {\"type\": "
+                  "\"any\"}, \"thinking\": {\"type\": \"enabled\", \"budget_tokens\": 1024}, \"max_tokens\": 100}",
+                  "[{\"role\": \"system\", \"content\": \"You are X.\\nBe careful.\"}, {\"role\": \"user\", \"content\": \"Hi\\nList files.\"}, {\"role\": "
+                  "\"assistant\", \"content\": \"Listing.\", \"reasoning_content\": \"Use ls.\", \"tool_calls\": [{\"id\": \"toolu_1\", \"type\": "
+                  "\"function\", \"function\": {\"name\": \"bash\", \"arguments\": {\"cmd\": \"ls\", \"n\": 2}}}]}, {\"role\": \"tool\", \"content\": "
+                  "\"a.txt\\nb.txt\", \"tool_call_id\": \"toolu_1\"}, {\"role\": \"user\", \"content\": \"Now?\"}, {\"role\": \"assistant\", \"content\": "
+                  "\"\", \"tool_calls\": [{\"id\": \"toolu_2\", \"type\": \"function\", \"function\": {\"name\": \"bash\", \"arguments\": {\"cmd\": "
+                  "\"pwd\"}}}]}, {\"role\": \"tool\", \"content\": \"/home\", \"tool_call_id\": \"toolu_2\"}]",
+                  "[{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Run\", \"parameters\": {\"type\": \"object\", "
+                  "\"properties\": {\"cmd\": {\"type\": \"string\"}}}}}]",
+                  VITNA_TOOLS_REQUIRED, 1, false);
+    check_convert("messages, a prefill to continue and no thinking unless asked", vitna_convert_messages,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": \"Say hi.\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": "
+                  "\"Hi\"}]}], \"tool_choice\": {\"type\": \"none\"}}",
+                  "[{\"role\": \"user\", \"content\": \"Say hi.\"}, {\"role\": \"assistant\", \"content\": \"Hi\"}]", "", VITNA_TOOLS_NONE, 0, true);
+
+    /* OpenAI's Responses: instructions first, developer as system, a
+     * reasoning item with the call after it, the call's output, an
+     * assistant message, and an effort that turns thinking on. */
+    check_convert("responses", vitna_convert_responses,
+                  "{\"instructions\": \"Be terse.\", \"input\": [{\"role\": \"developer\", \"content\": \"Rules.\"}, {\"type\": \"message\", \"role\": "
+                  "\"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"Run ls\"}]}, {\"type\": \"reasoning\", \"id\": \"rs_1\", \"summary\": [], "
+                  "\"content\": [{\"type\": \"reasoning_text\", \"text\": \"Call shell.\"}]}, {\"type\": \"function_call\", \"id\": \"fc_1\", \"call_id\": "
+                  "\"call_1\", \"name\": \"shell\", \"arguments\": \"{\\\"command\\\":[\\\"ls\\\"]}\"}, {\"type\": \"function_call_output\", \"call_id\": "
+                  "\"call_1\", \"output\": \"a.txt\"}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": "
+                  "\"One file.\"}]}, {\"role\": \"user\", \"content\": \"Thanks\"}], \"tools\": [{\"type\": \"function\", \"name\": \"shell\", "
+                  "\"description\": \"Run a command\", \"strict\": false, \"parameters\": {\"type\": \"object\"}}], \"tool_choice\": {\"type\": "
+                  "\"function\", \"name\": \"shell\"}, \"reasoning\": {\"effort\": \"low\"}}",
+                  "[{\"role\": \"system\", \"content\": \"Be terse.\"}, {\"role\": \"system\", \"content\": \"Rules.\"}, {\"role\": \"user\", \"content\": "
+                  "\"Run ls\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"Call shell.\", \"tool_calls\": [{\"id\": \"call_1\", "
+                  "\"type\": \"function\", \"function\": {\"name\": \"shell\", \"arguments\": {\"command\": [\"ls\"]}}}]}, {\"role\": \"tool\", "
+                  "\"content\": \"a.txt\", \"tool_call_id\": \"call_1\"}, {\"role\": \"assistant\", \"content\": \"One file.\"}, {\"role\": \"user\", "
+                  "\"content\": \"Thanks\"}]",
+                  "[{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a command\", \"parameters\": {\"type\": "
+                  "\"object\"}}}]",
+                  VITNA_TOOLS_NAMED, 1, false);
+    check_convert("responses, a string of input", vitna_convert_responses, "{\"input\": \"Hello\", \"reasoning\": {\"effort\": \"minimal\"}}",
+                  "[{\"role\": \"user\", \"content\": \"Hello\"}]", "", VITNA_TOOLS_AUTO, 0, false);
+    /* Codex's tools: a namespace's functions offered as functions, and the
+     * hosted web search left out and named. */
+    {
+        const char* req = "{\"input\": \"x\", \"tools\": [{\"type\": \"function\", \"name\": \"exec_command\", \"parameters\": {}}, {\"type\": \"namespace\", "
+                          "\"name\": \"multi_agent_v1\", \"description\": \"Agents.\", \"tools\": [{\"type\": \"function\", \"name\": \"spawn_agent\", "
+                          "\"parameters\": {}}]}, {\"type\": \"web_search\", \"external_web_access\": false}], \"tool_choice\": {\"type\": \"function\", "
+                          "\"name\": \"spawn_agent\"}}";
+        check_convert("responses, a namespace and a hosted tool", vitna_convert_responses, req, "[{\"role\": \"user\", \"content\": \"x\"}]",
+                      "[{\"type\": \"function\", \"function\": {\"name\": \"exec_command\", \"parameters\": {}}}, {\"type\": \"function\", \"function\": "
+                      "{\"name\": \"spawn_agent\", \"parameters\": {}}}]",
+                      VITNA_TOOLS_NAMED, -1, false);
+        char err[160];
+        vitna_json_doc_t* doc = vitna_json_parse(req, strlen(req), err, sizeof(err));
+        vitna_chat_request_t cr;
+        vitna_chat_request_init(&cr);
+        CHECK(doc && vitna_convert_responses(vitna_json_root(doc), &cr) && strcmp(cr.ignored, "tools.2.web_search") == 0, "the hosted tool is named: %s",
+              cr.ignored);
+        const vitna_json_value_t* tools = doc ? vitna_json_get(vitna_json_root(doc), "tools") : NULL;
+        const vitna_json_value_t* ns = vitna_responses_namespace(tools, "spawn_agent", 11);
+        CHECK(ns && strcmp(ns->u.string.ptr, "multi_agent_v1") == 0, "a namespace's function is found in it");
+        CHECK(vitna_responses_namespace(tools, "exec_command", 12) == NULL, "a function at the top has no namespace");
+        vitna_chat_request_free(&cr);
+        vitna_json_free(doc);
+    }
+
+    /* Refused: what the model cannot read, or the request does not say. */
+    check_refused("chat, an image", vitna_convert_chat,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"x\"}}]}]}", "messages[0]", true);
+    check_refused("chat, a name", vitna_convert_chat, "{\"messages\": [{\"role\": \"user\", \"name\": \"ann\", \"content\": \"x\"}]}", "messages[0]",
+                  true);
+    check_refused("chat, a named tool not among the tools", vitna_convert_chat,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"a\"}}], "
+                  "\"tool_choice\": {\"type\": \"function\", \"function\": {\"name\": \"b\"}}}",
+                  "tool_choice", false);
+    check_refused("chat, required without tools", vitna_convert_chat, "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"tool_choice\": \"required\"}",
+                  "tool_choice", false);
+    check_refused("chat, functions", vitna_convert_chat, "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"functions\": [{\"name\": \"f\"}]}",
+                  "functions", true);
+    check_refused("messages, an image", vitna_convert_messages,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"image\", \"source\": {\"type\": \"base64\"}}]}]}", "messages.0.content.0",
+                  true);
+    check_refused("messages, Anthropic's own tool", vitna_convert_messages,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"tools\": [{\"type\": \"web_search_20250305\", \"name\": \"web_search\"}]}",
+                  "tools.0", true);
+    check_refused("messages, a prefill after a tool use", vitna_convert_messages,
+                  "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"tool_use\", \"id\": \"t\", "
+                  "\"name\": \"f\", \"input\": {}}]}], \"tools\": [{\"name\": \"f\", \"input_schema\": {}}]}",
+                  "messages", false);
+    check_refused("messages, a role of developer", vitna_convert_messages, "{\"messages\": [{\"role\": \"developer\", \"content\": \"x\"}]}", "messages.0",
+                  false);
+    /* Claude Code's mid-conversation system message: where it stands, ending the user turn before it. */
+    check_convert("messages, a system message among them", vitna_convert_messages,
+                  "{\"system\": \"S\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"a\"}]}, {\"role\": \"system\", "
+                  "\"content\": [{\"type\": \"text\", \"text\": \"Reminder.\", \"cache_control\": {\"type\": \"ephemeral\"}}]}, {\"role\": \"user\", "
+                  "\"content\": \"b\"}], \"thinking\": {\"type\": \"adaptive\", \"display\": \"omitted\"}}",
+                  "[{\"role\": \"system\", \"content\": \"S\"}, {\"role\": \"user\", \"content\": \"a\"}, {\"role\": \"system\", \"content\": \"Reminder.\"}, "
+                  "{\"role\": \"user\", \"content\": \"b\"}]",
+                  "", VITNA_TOOLS_AUTO, 1, false);
+    check_refused("responses, an item reference", vitna_convert_responses, "{\"input\": [{\"type\": \"item_reference\", \"id\": \"msg_1\"}]}", "input[0]", true);
+    check_refused("responses, a tool the client runs through items of its own", vitna_convert_responses,
+                  "{\"input\": \"x\", \"tools\": [{\"type\": \"local_shell\"}]}", "tools[0]", true);
+    check_refused("responses, no input", vitna_convert_responses, "{\"instructions\": \"x\"}", "input", false);
 }
 
 /* --- JSON --- */
@@ -1659,6 +1953,9 @@ int main(void) {
     test_api_helpers();
     test_jsonpfx();
     test_json();
+    test_py_json();
+    test_reply_parser();
+    test_convert();
     test_safetensors();
     test_unicode();
     test_nfc();

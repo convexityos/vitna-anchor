@@ -1,0 +1,4216 @@
+{
+  "format": "vitna-anchor recorded API shapes, version 1",
+  "client": "claude-code",
+  "version": "2.1.283",
+  "recorded": "2026-10-06",
+  "how": "Recorded with scripts/record-api-requests.mjs between claude-code 2.1.283 and this server, and made into this file by scripts/api-shapes.mjs: strings longer than 32 characters are replaced by their length, and metadata, client_metadata and prompt_cache_key are dropped.",
+  "requests": [
+    {
+      "method": "HEAD",
+      "path": "/api/hello",
+      "headers": {
+        "user-agent": "Bun/1.4.3",
+        "accept": "*/*"
+      },
+      "body": null
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<52 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<7715 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<52 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<7715 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<1394 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_a8144370f110d54a",
+                "name": "Read",
+                "input": {
+                  "file_path": "<195 chars>"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_a8144370f110d54a",
+                "type": "tool_result",
+                "content": "<78 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<49 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    },
+    {
+      "method": "HEAD",
+      "path": "/api/hello",
+      "headers": {
+        "user-agent": "Bun/1.4.3",
+        "accept": "*/*"
+      },
+      "body": null
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<90 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<7715 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Edit",
+            "description": "<360 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "old_string": {
+                  "description": "The text to replace",
+                  "type": "string"
+                },
+                "new_string": {
+                  "description": "<63 chars>",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "<53 chars>",
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "file_path",
+                "old_string",
+                "new_string"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<90 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<7715 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<1460 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_9ac444f07556df69",
+                "name": "Grep",
+                "input": {
+                  "pattern": "def greet",
+                  "path": ".",
+                  "output_mode": "files_with_matches"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_9ac444f07556df69",
+                "type": "tool_result",
+                "content": "Found 1 file\nhello.py"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<49 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Edit",
+            "description": "<360 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "old_string": {
+                  "description": "The text to replace",
+                  "type": "string"
+                },
+                "new_string": {
+                  "description": "<63 chars>",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "<53 chars>",
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "file_path",
+                "old_string",
+                "new_string"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<90 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<7715 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<1460 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_9ac444f07556df69",
+                "name": "Grep",
+                "input": {
+                  "pattern": "def greet",
+                  "path": ".",
+                  "output_mode": "files_with_matches"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_9ac444f07556df69",
+                "type": "tool_result",
+                "content": "Found 1 file\nhello.py"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<49 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<606 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_526c08bf0a3628b8",
+                "name": "Read",
+                "input": {
+                  "file_path": "hello.py",
+                  "limit": 200
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_526c08bf0a3628b8",
+                "type": "tool_result",
+                "content": "<78 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<49 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Edit",
+            "description": "<360 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "old_string": {
+                  "description": "The text to replace",
+                  "type": "string"
+                },
+                "new_string": {
+                  "description": "<63 chars>",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "<53 chars>",
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "file_path",
+                "old_string",
+                "new_string"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.283 (external, sdk-cli)",
+        "x-stainless-arch": "x64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "Windows",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<559 chars>"
+              },
+              {
+                "type": "text",
+                "text": "<90 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<7715 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<1460 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_9ac444f07556df69",
+                "name": "Grep",
+                "input": {
+                  "pattern": "def greet",
+                  "path": ".",
+                  "output_mode": "files_with_matches"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_9ac444f07556df69",
+                "type": "tool_result",
+                "content": "Found 1 file\nhello.py"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<49 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<606 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_526c08bf0a3628b8",
+                "name": "Read",
+                "input": {
+                  "file_path": "hello.py",
+                  "limit": 200
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_526c08bf0a3628b8",
+                "type": "tool_result",
+                "content": "<78 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<49 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "<1032 chars>",
+                "signature": ""
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_9bac1cb1cd37e88f",
+                "name": "Edit",
+                "input": {
+                  "replace_all": false,
+                  "file_path": "hello.py",
+                  "old_string": "def greet(name):",
+                  "new_string": "<53 chars>"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_9bac1cb1cd37e88f",
+                "type": "tool_result",
+                "content": "<114 chars>"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "<49 chars>",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "<74 chars>"
+          },
+          {
+            "type": "text",
+            "text": "<62 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": "<5970 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "Agent",
+            "description": "<1668 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "description": {
+                  "description": "<42 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<33 chars>",
+                  "type": "string"
+                },
+                "subagent_type": {
+                  "description": "<50 chars>",
+                  "type": "string"
+                },
+                "model": {
+                  "description": "<358 chars>",
+                  "type": "string",
+                  "enum": [
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable"
+                  ]
+                },
+                "run_in_background": {
+                  "description": "<286 chars>",
+                  "type": "boolean"
+                },
+                "isolation": {
+                  "description": "<221 chars>",
+                  "type": "string",
+                  "enum": [
+                    "worktree",
+                    "remote"
+                  ]
+                }
+              },
+              "required": [
+                "description",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronCreate",
+            "description": "<2924 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "cron": {
+                  "description": "<151 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<40 chars>",
+                  "type": "string"
+                },
+                "recurring": {
+                  "description": "<224 chars>",
+                  "type": "boolean"
+                },
+                "durable": {
+                  "description": "<208 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cron",
+                "prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronDelete",
+            "description": "<167 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Job ID returned by CronCreate.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "CronList",
+            "description": "<106 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Edit",
+            "description": "<360 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "old_string": {
+                  "description": "The text to replace",
+                  "type": "string"
+                },
+                "new_string": {
+                  "description": "<63 chars>",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "<53 chars>",
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "file_path",
+                "old_string",
+                "new_string"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "EnterWorktree",
+            "description": "<3220 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "<221 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<262 chars>",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ExitWorktree",
+            "description": "<1923 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "action": {
+                  "description": "<69 chars>",
+                  "type": "string",
+                  "enum": [
+                    "keep",
+                    "remove"
+                  ]
+                },
+                "discard_changes": {
+                  "description": "<143 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Glob",
+            "description": "<140 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<39 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<268 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Grep",
+            "description": "<477 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "pattern": {
+                  "description": "<61 chars>",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "<80 chars>",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "<76 chars>",
+                  "type": "string"
+                },
+                "output_mode": {
+                  "description": "<246 chars>",
+                  "type": "string",
+                  "enum": [
+                    "content",
+                    "files_with_matches",
+                    "count"
+                  ]
+                },
+                "-B": {
+                  "description": "<102 chars>",
+                  "type": "number"
+                },
+                "-A": {
+                  "description": "<101 chars>",
+                  "type": "number"
+                },
+                "-C": {
+                  "description": "Alias for context.",
+                  "type": "number"
+                },
+                "context": {
+                  "description": "<112 chars>",
+                  "type": "number"
+                },
+                "-n": {
+                  "description": "<106 chars>",
+                  "type": "boolean"
+                },
+                "-i": {
+                  "description": "Case insensitive search (rg -i)",
+                  "type": "boolean"
+                },
+                "-o": {
+                  "description": "<187 chars>",
+                  "type": "boolean"
+                },
+                "type": {
+                  "description": "<128 chars>",
+                  "type": "string"
+                },
+                "head_limit": {
+                  "description": "<303 chars>",
+                  "type": "number"
+                },
+                "offset": {
+                  "description": "<140 chars>",
+                  "type": "number"
+                },
+                "multiline": {
+                  "description": "<118 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "pattern"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ListAgents",
+            "description": "<777 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "q": {
+                  "description": "<41 chars>",
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Read",
+            "description": "<790 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "file_path": {
+                  "description": "<37 chars>",
+                  "type": "string"
+                },
+                "offset": {
+                  "description": "<92 chars>",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "limit": {
+                  "description": "<83 chars>",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pages": {
+                  "description": "<113 chars>",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file_path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ReportFindings",
+            "description": "<574 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "description": "Effort level the review ran at",
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                "findings": {
+                  "description": "<60 chars>",
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "file": {
+                        "description": "<48 chars>",
+                        "type": "string"
+                      },
+                      "line": {
+                        "description": "<37 chars>",
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "summary": {
+                        "description": "<36 chars>",
+                        "type": "string"
+                      },
+                      "short_summary": {
+                        "description": "<96 chars>",
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "failure_scenario": {
+                        "description": "<42 chars>",
+                        "type": "string"
+                      },
+                      "category": {
+                        "description": "<110 chars>",
+                        "type": "string",
+                        "maxLength": 40
+                      },
+                      "verdict": {
+                        "description": "<57 chars>",
+                        "type": "string",
+                        "enum": [
+                          "CONFIRMED",
+                          "PLAUSIBLE"
+                        ]
+                      },
+                      "outcome": {
+                        "description": "<78 chars>",
+                        "type": "string",
+                        "enum": [
+                          "fixed",
+                          "skipped",
+                          "no_change_needed"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "summary",
+                      "failure_scenario"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "findings"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "ScheduleWakeup",
+            "description": "<3396 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "delaySeconds": {
+                  "description": "<98 chars>",
+                  "type": "number"
+                },
+                "reason": {
+                  "description": "<136 chars>",
+                  "type": "string"
+                },
+                "prompt": {
+                  "description": "<355 chars>",
+                  "type": "string"
+                },
+                "stop": {
+                  "description": "<154 chars>",
+                  "type": "boolean"
+                },
+                "noop": {
+                  "description": "<307 chars>",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "SendMessage",
+            "description": "<4259 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "to": {
+                  "description": "<155 chars>",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[^\\n\\r]*$"
+                    },
+                    {
+                      "pattern": "^[\\s\\S]{0,300}$"
+                    }
+                  ]
+                },
+                "summary": {
+                  "description": "<167 chars>",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "message": {
+                  "default": "",
+                  "description": "<247 chars>",
+                  "type": "string"
+                },
+                "notify_when_idle": {
+                  "description": "<289 chars>",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "to",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Skill",
+            "description": "<1417 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "skill": {
+                  "description": "<71 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "Optional arguments for the skill",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "TaskStop",
+            "description": "<378 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "task_id": {
+                  "description": "<126 chars>",
+                  "type": "string"
+                },
+                "shell_id": {
+                  "description": "Deprecated: use task_id instead",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "name": "Workflow",
+            "description": "<3480 chars>",
+            "input_schema": {
+              "$schema": "<44 chars>",
+              "type": "object",
+              "properties": {
+                "script": {
+                  "description": "<207 chars>",
+                  "type": "string",
+                  "maxLength": 524288
+                },
+                "name": {
+                  "description": "<105 chars>",
+                  "type": "string"
+                },
+                "description": {
+                  "description": "<68 chars>",
+                  "type": "string"
+                },
+                "title": {
+                  "description": "<62 chars>",
+                  "type": "string"
+                },
+                "args": {
+                  "description": "<280 chars>"
+                },
+                "scriptPath": {
+                  "description": "<329 chars>",
+                  "type": "string"
+                },
+                "resumeFromRunId": {
+                  "description": "<251 chars>",
+                  "type": "string",
+                  "pattern": "^wf_[a-z0-9-]{6,}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        ],
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive",
+          "display": "omitted"
+        },
+        "context_management": {
+          "edits": [
+            {
+              "type": "clear_thinking_20251015",
+              "keep": "all"
+            }
+          ]
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true
+      }
+    }
+  ]
+}
