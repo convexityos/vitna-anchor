@@ -199,10 +199,10 @@ test("the machine as the engine sees it", ENGINE, () => {
 test("the installer scripts are templates a release fills in, in plain ASCII, and parse", () => {
   const sh = readFileSync(here("../install/install.sh"), "utf8");
   const ps1 = readFileSync(here("../install/install.ps1"), "utf8");
-  for (const [name, text] of [["install.sh", sh], ["install.ps1", ps1]]) {
-    assert.equal(/[^\x09\x0a\x20-\x7e]/.test(text), false, `${name} is printable ASCII with LF line endings`);
-    assert.ok(text.includes("@VERSION@"), name);
-  }
+  // Printable ASCII; LF line endings for the shell, and for PowerShell the CRLF .gitattributes checks it out with.
+  assert.equal(/[^\x09\x0a\x20-\x7e]/.test(sh), false, "install.sh is printable ASCII with LF line endings");
+  assert.equal(/[^\x09\x0a\x0d\x20-\x7e]/.test(ps1), false, "install.ps1 is printable ASCII");
+  for (const [name, text] of [["install.sh", sh], ["install.ps1", ps1]]) assert.ok(text.includes("@VERSION@"), name);
   assert.ok(sh.includes("@SHA256_LINUX_X86_64@"));
   assert.ok(ps1.includes("@SHA256_WINDOWS_X64@"));
   // Everything in install.sh runs from main, at the end, so a script cut short in its download runs nothing.
