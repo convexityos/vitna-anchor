@@ -11,12 +11,11 @@
 //
 // They need the engine, gate A9's model directory (for config.json and the
 // tokenizer) and the GGUF files (node scripts/fetch-model.mjs
-// qwen3-30b-a3b-gguf). Without them they are skipped, with the reason,
-// unless VITNA_REQUIRE_QWEN3_GGUF=1, where they fail. They run on the CPU,
-// or with VITNA_DEVICE=cuda on the GPU, where the digests are of the GPU's
-// widening; on a GPU only with VITNA_REQUIRE_QWEN3_GGUF=1 and this file
-// alone. The prompts run one after another: the model takes most of the
-// machine's memory.
+// qwen3-30b-a3b-gguf), and run only with VITNA_REQUIRE_QWEN3_GGUF=1,
+// where a missing file fails them, since a file takes much of a machine's
+// memory and they most of an hour. They run on the CPU, or with
+// VITNA_DEVICE=cuda on the GPU, where the digests are of the GPU's
+// widening. The prompts run one after another.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -122,11 +121,7 @@ for (const { file, quant, path } of FIXTURES) {
   const onDevice = DEVICE ? ["--device", DEVICE] : [];
   const needs = !recorded ? `reference/qwen3-30b-a3b-gguf/fixture-${quant}.json is not recorded yet`
     : process.env.VITNA_REQUIRE_QWEN3_GGUF === "1" ? false
-    : GPU ? "on a GPU these run only with VITNA_REQUIRE_QWEN3_GGUF=1, and this file alone"
-    : !engine ? "no built engine found"
-    : !existsSync(join(modelDir, "config.json")) ? `no config.json in ${modelDir}; run node scripts/fetch-model.mjs qwen3-30b-a3b --only config.json --only tokenizer.json`
-    : !existsSync(ggufPath) ? `no ${ggufPath}; run node scripts/fetch-model.mjs qwen3-30b-a3b-gguf`
-    : false;
+    : "these run only with VITNA_REQUIRE_QWEN3_GGUF=1: a file takes much of a machine's memory, and they most of an hour";
   const ENGINE = { skip: needs };
   const ON_GPU = { skip: needs || (!GPU && "VITNA_DEVICE is not cuda") };
   const WEIGHTS = ["--model", modelDir, "--weights", ggufPath];

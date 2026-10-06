@@ -204,3 +204,61 @@ Against A5's fixture of the BF16 model, on the same prompts. The KL divergence i
 - The experts read from the drive into a cache of 128 MiB, giving the mapped run's logits and tokens byte for byte.
 
 With `VITNA_DEVICE=cuda` the same tests run on the GPU, where the digests are of the GPU's own widening, read every way its kernels read weights. Three more run only there, as A5's do: an expert cache of any size on the device, fed from the mapped file or a cache in memory, gives the same logits byte for byte; tokens run together as rows, a prompt's and drafted ones, give a token at a time's logits byte for byte; and with `--cpu-experts` (gate A8), the experts the device lacks shared between the CPU and copies to it, which widens the blocks as the GPU does and sums in its order, gives the GPU alone's logits byte for byte.
+
+## Qwen3-30B-A3B (gate A9)
+
+Gate A9 is the target model of parity with Strata: Qwen3-30B-A3B, a mixture of 128 experts in each of 48 layers, 8 a token, about 3.3B of its 30.5B parameters used a token. What it adds to OLMoE is a QK-norm over each head alone, the 8 experts' weights renormalized to sum to one, grouped-query attention whose queries are twice the hidden size (32 heads of 128 against a hidden size of 2,048), and Qwen's own tokenizer split.
+
+### The files
+
+[`qwen3-30b-a3b/model.json`](qwen3-30b-a3b/model.json) pins `Qwen/Qwen3-30B-A3B` at revision `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`: its 16 shards of bfloat16, 61.1 GB, and its config and tokenizer, by size and SHA-256. [`qwen3-30b-a3b-gguf/model.json`](qwen3-30b-a3b-gguf/model.json) pins two of Qwen's own GGUF files of the same model, `Qwen/Qwen3-30B-A3B-GGUF` at revision `e4d4bafdfb96a411a163846265362aceb0b9c63a`:
+
+| File | Size | Its matrices |
+|---|---|---|
+| `Qwen3-30B-A3B-Q8_0.gguf` | 32.5 GB | 338 in Q8_0 |
+| `Qwen3-30B-A3B-Q4_K_M.gguf` | 18.6 GB | 289 in Q4_K and 49 in Q6_K |
+
+In both, the norms and the router, 241 tensors, are float32. All three are Apache-2.0.
+
+```bash
+node scripts/fetch-model.mjs qwen3-30b-a3b        # 61.1 GB
+node scripts/fetch-model.mjs qwen3-30b-a3b-gguf   # 51.0 GB
+```
+
+### The recording
+
+The model is 61 GB in bfloat16 and 122 GB in float32, and the machine that recorded it has 64 GB, so [`record_qwen3.py`](record_qwen3.py) never holds it whole. Each layer is built alone as transformers' own `Qwen3MoeDecoderLayer`, given its weights from the checkpoint, run over every prompt and dropped before the next is built, about 2.4 GB of weights at a time. The embedding, the rotary embedding, the causal mask, the final norm and the output layer are the model's own, in its order. Each prompt runs as one pass over all its positions, its greedy tokens included. That this computes what the model computes is checked, not argued: `--self-check 2` runs transformers' whole `Qwen3MoeForCausalLM`, cut to its first 2 layers so that it fits, against the streamed run of the same 2 layers, and requires the same logits. They were the same, bit for bit, on all three prompts tried.
+
+Greedy decoding would need every layer once a token, 48 passes over the checkpoint for each of 192 tokens. Instead the greedy tokens are proposed and confirmed: the engine proposes them (`--engine`), the pass over each prompt and its proposed tokens gives the reference's logits at every one of those positions, and each proposed token must be the reference's own choice there, the largest logit, the lowest id first between equals, as `record_moe.py`'s step loop chooses. At the first that is not, the reference's choice replaces it, the engine proposes again from there, and that prompt runs again. So the tokens recorded are the reference's, whoever proposed them, and the fixture says how many passes and replacements it took. For all three fixtures: one pass, and no proposed token replaced.
+
+The software, the settings and the fields are `record_moe.py`'s (A5's, above): float32, eager attention, eager experts, one thread, deterministic algorithms; the routing at every layer of every position as the 8 experts chosen and the runner-up, their router logits and the logsumexp of all 128. With `--file <file.gguf>` it records from a GGUF file instead, every weight the file's widened to float32 by gguf-py, and keeps each widened tensor's SHA-256, as `record_gguf.py` does for A7. The inputs, [`qwen3-30b-a3b/prompts.json`](qwen3-30b-a3b/prompts.json), are A5's prompts and corpus, and 26 cases more for this tokenizer: contractions in upper case, numbers (each number character is split alone), letters after a tab or a punctuation mark, line breaks, spaces of other kinds, and its chat and reasoning markers.
+
+```bash
+python reference/record_qwen3.py --engine "engine/build/Release/vitna-anchor.exe"                          # the BF16 fixture
+python reference/record_qwen3.py --file Qwen3-30B-A3B-Q8_0.gguf --engine "<engine with CUDA> --device cuda"  # a GGUF fixture
+python reference/record_qwen3.py --check [--file <file>]       # record into memory, the committed tokens proposed, and compare
+python reference/record_qwen3.py --self-check 2                # transformers' own model against the streamed run
+```
+
+All three were recorded on 2026-10-05 on an AMD Ryzen 7 3700X (Windows 11, x86-64) with Python 3.12.10: the BF16 fixture in 241 s, the Q8_0 one in 440 s and the Q4_K_M one in 621 s, the engine's proposals not counted. Each is 8.9 MB.
+
+### Routing near-ties
+
+The BF16 fixture holds 20,400 routing decisions. In 2,298 the 8th and 9th router logits are within 1e-2 of each other, in 256 within 1e-3, in 29 within 1e-4 and in 5 within 1e-5; one is an exact tie (`numbers`, position 29, layer 36), where the reference chose between equal logits. The routing rule (A5's, above) lets a decision within twice the band go either way, so the engine may take the other expert there and is then compared only up to it.
+
+### The tolerance
+
+A5's, unchanged: A1's table for logits, the routing rule for router logits, and for a GGUF file the widened weights bit for bit, by digest.
+
+### What quantizing cost
+
+Against the BF16 fixture, on the same prompts, measured as for A7. The KL divergence is at each prompt's last position, where every fixture keeps all 151,936 logits; the top token is compared at all 239 prompt positions; greedy decoding up to the first token that differs.
+
+| File | KL at the last position, mean of 6 | Top token agrees | Greedy tokens equal before the first difference |
+|---|---|---|---|
+| Q8_0 | 1.4e-3 | 232 of 239 | 136 of 192: three prompts depart, at steps 4, 14 and 22, three never |
+| Q4_K_M | 5.7e-2 | 205 of 239 | 92 of 192: four prompts depart, at steps 2, 4, 5 and 17, two never |
+
+### The engine against it
+
+[`tests/reference-qwen3.test.mjs`](../tests/reference-qwen3.test.mjs) checks the BF16 fixture against its pin, its inputs and its recorders, that its routing is complete, that each greedy token is the largest logit at its step, and that the comparison accepts the fixture's own logits and rejects wrong ones. Then it runs the engine and compares it with the fixture as A5's tests do: its tokenizer on all 86 strings, its logits and routing with the experts pinned, and greedy decoding pinned and unpinned. [`tests/reference-qwen3-gguf.test.mjs`](../tests/reference-qwen3-gguf.test.mjs) does the same for each GGUF fixture with `--weights`, every tensor's widening by digest first, and on a GPU gate A8 on this model: through 1 GiB of the device, with `--cpu-experts`, the logits are the GPU alone's, byte for byte. The model's comparisons run only with `VITNA_REQUIRE_QWEN3=1` or `VITNA_REQUIRE_QWEN3_GGUF=1`, since they take most of an hour and of the machine's memory; CI fetches the tokenizer alone and requires it to match (`VITNA_REQUIRE_QWEN3_TOKENIZER=1`).

@@ -34,10 +34,10 @@
 
 static void print_usage(const char* prog) {
     if (vitna_llama_cuda_built()) {
-        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or a mixture of experts (OLMoE's, Qwen3's), on the CPU\n");
         printf("or, with --device cuda, on an NVIDIA GPU.\n\n");
     } else {
-        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or OLMoE's mixture of experts, on the CPU.\n");
+        printf("vitna-anchor engine: a Llama-architecture model in float32, dense or a mixture of experts (OLMoE's, Qwen3's), on the CPU.\n");
         printf("This build has no CUDA path.\n\n");
     }
     printf("Usage:\n");

@@ -12,8 +12,9 @@
 // tokenizer.json (node scripts/fetch-model.mjs qwen3-30b-a3b --only
 // tokenizer.json, as CI fetches it); the others need the 61.1 GB of weights.
 // Without them these are skipped, with the reason, unless
-// VITNA_REQUIRE_QWEN3=1, or for the tokenizer VITNA_REQUIRE_QWEN3_TOKENIZER=1
-// (as in CI), where they fail. They run on the CPU, or with
+// VITNA_REQUIRE_QWEN3_TOKENIZER=1 (as in CI), where it fails; the model's
+// comparisons run only with VITNA_REQUIRE_QWEN3=1, since they take most of
+// an hour and of the machine's memory. They run on the CPU, or with
 // VITNA_DEVICE=cuda on the GPU.
 
 import assert from "node:assert/strict";
@@ -209,12 +210,13 @@ const TOKENIZER = {
   skip: (required("VITNA_REQUIRE_QWEN3") || required("VITNA_REQUIRE_QWEN3_TOKENIZER")) && recorded ? false
     : missing(["tokenizer.json"], "node scripts/fetch-model.mjs qwen3-30b-a3b --only tokenizer.json"),
 };
-// The model takes most of the machine's memory, so these run one engine at
-// a time, and on a GPU only when asked for, with this file alone.
+// The model takes most of the machine's memory and these most of an hour,
+// so they run one engine at a time, and only when asked for, with
+// VITNA_REQUIRE_QWEN3=1, where a missing file fails them.
 const MODEL = {
-  skip: required("VITNA_REQUIRE_QWEN3") && recorded ? false
-    : GPU ? "on a GPU these run only with VITNA_REQUIRE_QWEN3=1, and this file alone"
-    : missing(pin.files.map((f) => f.path), "node scripts/fetch-model.mjs qwen3-30b-a3b"),
+  skip: !recorded ? "reference/qwen3-30b-a3b/fixture.json is not recorded yet"
+    : required("VITNA_REQUIRE_QWEN3") ? false
+    : "these run only with VITNA_REQUIRE_QWEN3=1: the model takes most of a machine's memory, and they most of an hour",
 };
 
 function runEngine(args, input = "") {
