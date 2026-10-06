@@ -2,8 +2,11 @@
 // Time the engine's prompt (prefill), for one or more engine builds taking
 // turns, and print the machine and the command with the result.
 //
-//   node scripts/bench-prefill.mjs [--device cpu|cuda] [--engine <path> ...] [--model <dir>]
+//   node scripts/bench-prefill.mjs [--device cpu|cuda] [--engine <path> ...] [--model <dir>] [--weights <file.gguf>]
 //                                  [--prompt-tokens <n,n,...>] [--runs <n>]
+//
+// --weights reads the weights from a GGUF file, as the engine's own --weights
+// does; --model still gives config.json and the tokenizer.
 //
 // Each run is one `generate --greedy --timing --max-new 2` over the first n
 // tokens of README.md, and the engine's own timing line gives the prompt's
@@ -42,6 +45,7 @@ function options(name) {
 
 const device = option("--device", "cpu");
 const model = resolve(option("--model", join(ROOT, "models", "smollm2-135m")));
+const weights = option("--weights", "") ? resolve(option("--weights", "")) : "";
 const lengths = option("--prompt-tokens", "8,100,500,2000").split(",").map(Number);
 const runs = Number(option("--runs", "5"));
 const fallback = [
@@ -68,7 +72,8 @@ for (const n of lengths) {
 }
 
 function once(engine, n) {
-  const args = ["generate", "--model", model, "--ids", readme.slice(0, n).join(","), "--max-new", "2", "--greedy", "--timing", "--device", device];
+  const args = ["generate", "--model", model, ...(weights ? ["--weights", weights] : []), "--ids", readme.slice(0, n).join(","), "--max-new", "2",
+    "--greedy", "--timing", "--device", device];
   const r = spawnSync(engine, args, { encoding: "utf8", maxBuffer: 1 << 26 });
   if (r.status !== 0) throw new Error(`${engine} exited ${r.status}: ${r.stderr}`);
   const m = r.stderr.match(/timing: (\d+) prompt tokens in ([\d.]+) ms/);
@@ -83,7 +88,7 @@ if (device === "cuda") {
   const q = spawnSync("nvidia-smi", ["--query-gpu=name,driver_version", "--format=csv,noheader"], { encoding: "utf8" });
   gpu = q.status === 0 ? q.stdout.trim().split("\n")[0] : "nvidia-smi not available";
 }
-console.log(`command: <engine> generate --model ${model} --ids <the first n tokens of README.md> --max-new 2 --greedy --timing --device ${device}`);
+console.log(`command: <engine> generate --model ${model}${weights ? ` --weights ${weights}` : ""} --ids <the first n tokens of README.md> --max-new 2 --greedy --timing --device ${device}`);
 console.log(`machine: ${cpus()[0].model.trim()}, ${type()} ${release()}${gpu ? `; GPU ${gpu}` : ""}`);
 engines.forEach((e, i) => console.log(`engine ${i + 1}: ${e}`));
 
