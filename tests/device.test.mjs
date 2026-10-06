@@ -91,6 +91,39 @@ test("--cpu-experts is refused without --device cuda, and with no threads, befor
   }
 });
 
+test("--gpu-kv-layers is refused without --device cuda, and when it is not a count, before anything is loaded", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
+  try {
+    const base = ["logits", "--model", join(dir, "no-model"), "--ids", "1", "--out", join(dir, "logits.f32")];
+    let r = run([...base, "--gpu-kv-layers", "8"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--gpu-kv-layers needs --device cuda/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+    for (const bad of ["-1", "eight", "8x", ""]) {
+      r = run([...base, "--device", "cuda", "--gpu-kv-layers", bad]);
+      assert.notEqual(r.status, 0, `--gpu-kv-layers ${JSON.stringify(bad)}`);
+      assert.match(r.stderr, /--gpu-kv-layers takes the layers whose key-value cache the GPU holds, 0 or more/);
+      assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--ids-file and --prompt-file naming no file are refused, before anything is loaded", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
+  try {
+    for (const flag of ["--ids-file", "--prompt-file"]) {
+      const r = run(["logits", "--model", join(dir, "no-model"), flag, join(dir, "absent.txt"), "--out", join(dir, "logits.f32")]);
+      assert.notEqual(r.status, 0, flag);
+      assert.match(r.stderr, /cannot open .*absent\.txt/, flag);
+      assert.doesNotMatch(r.stderr, /config\.json/, "refused before loading anything");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("--device cpu is accepted, and the engine goes on to load the model", { skip }, () => {
   const r = logitsOn("cpu");
   assert.notEqual(r.status, 0, "there is no model to load");

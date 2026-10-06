@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -222,6 +222,26 @@ test("the engine's greedy decoding matches the reference token for token", A2, (
     rmSync(dir, { recursive: true, force: true });
   }
   t.diagnostic(`on ${DEVICE || "cpu"}, ${tokens} of ${tokens} greedy tokens equal; largest step logit difference ${worst.toExponential(2)}`);
+});
+
+// A prompt longer than a command line holds (32K ids are more than Windows
+// takes) comes from a file: --ids-file and --prompt-file must give what
+// --ids and --prompt give.
+test("--ids-file and --prompt-file give what --ids and --prompt give", A2, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-files-"));
+  try {
+    const p = fixture.prompts[0];
+    writeFileSync(join(dir, "ids.txt"), p.ids.join(","));
+    writeFileSync(join(dir, "prompt.txt"), p.text);
+    runEngine(["logits", "--model", modelDir, "--ids", p.ids.join(","), "--out", join(dir, "a.f32"), ...onDevice]);
+    runEngine(["logits", "--model", modelDir, "--ids-file", join(dir, "ids.txt"), "--out", join(dir, "b.f32"), ...onDevice]);
+    const a = readFileSync(join(dir, "a.f32"));
+    assert.ok(a.length > 0 && a.equals(readFileSync(join(dir, "b.f32"))), "--ids-file gave other logits than --ids");
+    const gen = (src) => JSON.parse(runEngine(["generate", "--model", modelDir, ...src, "--max-new", "8", "--greedy", ...onDevice]));
+    assert.deepEqual(gen(["--prompt-file", join(dir, "prompt.txt")]), gen(["--prompt", p.text]));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // The logits command gives the model a prompt 256 tokens at a time, and every

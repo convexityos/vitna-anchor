@@ -75,7 +75,12 @@ static void print_usage(const char* prog) {
     printf("--cpu-experts <threads>, with --device cuda, shares a step's experts that the GPU lacks between that many CPU\n");
     printf("threads and copies to the GPU, as many to the CPU as let a layer finish soonest by what each has cost\n");
     printf("lately, and none when copying is sooner, while the GPU runs those it holds. The CPU computes in the GPU's\n");
-    printf("order, so the logits are the same, bit for bit.\n\n");
+    printf("order, so the logits are the same, bit for bit.\n");
+    printf("--gpu-kv-layers <n>, with --device cuda, keeps the key-value cache of a mixture of experts' first n layers on\n");
+    printf("the GPU and the others' in page-locked host memory (default: as many on the GPU as it has room for beside\n");
+    printf("the rest of the model and the least expert cache); the logits are the same, bit for bit, whatever n is.\n");
+    printf("--ids-file <file> and --prompt-file <file> read --ids or --prompt from a file, for a prompt longer than\n");
+    printf("a command line holds.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
@@ -134,6 +139,7 @@ typedef struct {
     size_t expert_cache_mib; /* read a mixture of experts' experts from the drive into a cache this large */
     size_t gpu_expert_cache_mib; /* --device cuda: the GPU memory that holds a mixture of experts' experts */
     size_t cpu_experts;  /* --device cuda: CPU threads that run the experts the GPU lacks; 0, they are copied in */
+    int gpu_kv_layers;   /* --device cuda: the layers whose key-value cache the GPU holds; -1 for as many as fit */
     int iterations;
     size_t count;        /* --count: experts expert-check runs */
     uint16_t port;
@@ -147,8 +153,42 @@ typedef struct {
     vitna_sampling_t sampling;
 } args_t;
 
+/* A file's bytes, NUL-terminated, for --ids-file and --prompt-file; NULL, said on stderr, if it cannot be read. */
+static char* read_whole_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s\n", path);
+        return NULL;
+    }
+    size_t len = 0, cap = 1 << 16;
+    char* buf = (char*)malloc(cap);
+    for (size_t got; buf && (got = fread(buf + len, 1, cap - 1 - len, f)) > 0;) {
+        len += got;
+        if (len + 1 == cap) {
+            char* grown = (char*)realloc(buf, cap * 2);
+            if (!grown) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+    }
+    const bool failed = !buf || ferror(f);
+    fclose(f);
+    if (failed) {
+        free(buf);
+        fprintf(stderr, "cannot read %s\n", path);
+        return NULL;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
 static bool parse_args(int argc, char** argv, args_t* a) {
     memset(a, 0, sizeof(*a));
+    a->gpu_kv_layers = -1;
     a->max_new = 64;
     a->iterations = 100;
     a->port = 8765;
@@ -161,6 +201,21 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (TAKE("--weights")) a->weights = v;
         else if (TAKE("--prompt")) a->prompt = v;
         else if (TAKE("--ids")) a->ids = v;
+        else if (TAKE("--ids-file")) {
+            if (!(a->ids = read_whole_file(v))) return false;
+        }
+        else if (TAKE("--prompt-file")) {
+            if (!(a->prompt = read_whole_file(v))) return false;
+        }
+        else if (TAKE("--gpu-kv-layers")) {
+            char* end = NULL;
+            const long n = strtol(v, &end, 10);
+            if (!*v || *end || n < 0 || n > 1000000) {
+                fprintf(stderr, "--gpu-kv-layers takes the layers whose key-value cache the GPU holds, 0 or more\n");
+                return false;
+            }
+            a->gpu_kv_layers = (int)n;
+        }
         else if (TAKE("--out")) a->out = v;
         else if (TAKE("--logits-out")) a->logits_out = v;
         else if (TAKE("--text")) a->text = v;
@@ -572,12 +627,24 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
         vitna_llama_free(m);
         return false;
     }
+    if (a->gpu_kv_layers >= 0) {
+        if (!m->cfg.n_experts) {
+            fprintf(stderr, "--gpu-kv-layers: this model has no experts, and its key-value cache stays on the GPU\n");
+            vitna_llama_free(m);
+            return false;
+        }
+        m->gpu_kv_layers = a->gpu_kv_layers;
+    }
     /* Asked for the GPU, the model runs there or not at all. A mixture of
      * experts copies its experts there from the cache above, if there is one. */
     if (wants_cuda(a) && !vitna_llama_use_cuda(m, a->gpu_expert_cache_mib << 20, err, sizeof(err))) {
         fprintf(stderr, "--device cuda: %s\n", err);
         vitna_llama_free(m);
         return false;
+    }
+    if (wants_cuda(a) && m->cfg.n_experts && a->gpu_kv_layers < 0 && vitna_llama_gpu_kv_layers(m) < m->cfg.n_layers) {
+        fprintf(stderr, "The GPU has room for the key-value cache of %zu of the model's %zu layers at --ctx %zu; the others' is in page-locked "
+                "host memory.\n", vitna_llama_gpu_kv_layers(m), m->cfg.n_layers, m->ctx);
     }
     if (a->cpu_experts && !vitna_llama_cpu_experts(m, a->cpu_experts, err, sizeof(err))) {
         fprintf(stderr, "--cpu-experts: %s\n", err);
@@ -592,6 +659,15 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
     if (no_rows && strcmp(no_rows, "1") == 0) {
         vitna_llama_no_rows(m);
         fprintf(stderr, "VITNA_TEST_NO_ROWS is set, for a test: a mixture of experts on the GPU runs every token alone.\n");
+    }
+    /* For tests only: VITNA_TEST_LONG_FROM=n gives rows attending to more
+     * than n positions a long context's attention (gate A10), so that short
+     * prompts can check it against the reference, and rows against steps. */
+    const char* long_from = getenv("VITNA_TEST_LONG_FROM");
+    if (long_from && *long_from && wants_cuda(a) && m->cfg.n_experts) {
+        vitna_llama_test_long_from(m, (size_t)strtoull(long_from, NULL, 10));
+        fprintf(stderr, "VITNA_TEST_LONG_FROM is set, for a test: rows attending to more than %s positions take a long context's attention.\n",
+                long_from);
     }
     if (!arm_test_failure(m)) {
         vitna_llama_free(m);
@@ -1435,6 +1511,10 @@ int main(int argc, char** argv) {
     }
     if (a.cpu_experts && !wants_cuda(&a)) {
         fprintf(stderr, "--cpu-experts runs experts on the CPU beside the GPU, and needs --device cuda\n");
+        return 1;
+    }
+    if (a.gpu_kv_layers >= 0 && !wants_cuda(&a)) {
+        fprintf(stderr, "--gpu-kv-layers needs --device cuda\n");
         return 1;
     }
     if (a.device && strcmp(a.device, "cpu") != 0) {
