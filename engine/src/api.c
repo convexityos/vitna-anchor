@@ -608,7 +608,7 @@ static void forced_opening(vitna_strbuf_t* out, const vitna_chat_request_t* cr) 
  * <tool_call> token while the tools stay in the prompt, so its start is the
  * same whatever the choice and a cached prefix serves either. */
 static bool chat_build(const vitna_api_t* api, const vitna_json_value_t* root, params_t* p, vitna_strbuf_t* prompt, vitna_strbuf_t* prefill,
-                       api_error_t* e) {
+                       vitna_strbuf_t* ignored, api_error_t* e) {
     vitna_chat_request_t cr;
     vitna_chat_request_init(&cr);
     vitna_json_doc_t* md = NULL;
@@ -621,6 +621,12 @@ static bool chat_build(const vitna_api_t* api, const vitna_json_value_t* root, p
         else if (cr.unsupported) unsupported(e, e->param_buf, cr.message);
         else set_error(e, 400, "invalid_request_error", "invalid_value", e->param_buf, "%s", cr.message);
         goto done;
+    }
+    /* What the request asked for that the server left out, such as a tool
+     * its API runs on its own side, is named as an ignored field is. */
+    if (ignored && cr.ignored[0] && ignored->len < 400) {
+        if (ignored->len) vitna_sb_puts(ignored, ", ");
+        vitna_sb_puts(ignored, cr.ignored);
     }
     if (!api->qwen3) {
         ok = chatml_prompt(&cr, p->kind, prompt, e);
@@ -742,6 +748,7 @@ typedef struct {
     size_t seq;             /* Responses: the events sent, so the next one's sequence_number */
     int stop;               /* the stop sequence that ended the reply, or -1 */
     size_t forced_at;       /* for tests: the forced tokens taken */
+    bool window;            /* Anthropic's: the context's room, less than max_tokens, bounds the reply */
     bool think_closed;      /* </think> has been generated */
     size_t reasoning_tokens;/* the tokens up to and including the one that closed the reasoning */
 } gen_t;
@@ -901,7 +908,7 @@ static void anthropic_usage(vitna_strbuf_t* b, const vitna_api_result_t* r, bool
 }
 
 static const char* anthropic_stop_reason(const gen_t* g, const char* finish) {
-    if (strcmp(finish, "length") == 0) return "max_tokens";
+    if (strcmp(finish, "length") == 0) return g->window ? "model_context_window_exceeded" : "max_tokens";
     if (g->stop >= 0) return "stop_sequence";
     return g->n_calls ? "tool_use" : "end_turn";
 }
@@ -957,6 +964,13 @@ static void responses_item(const gen_t* g, size_t i, vitna_strbuf_t* b, bool don
         call_id(g, q, call, sizeof(call));
         vitna_sb_printf(b, "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":", id, call);
         put_string(b, q->data.data, q->data.len);
+        /* A function of a namespace in the request is called by its own
+         * name, with the namespace beside it, as OpenAI's API returns one. */
+        const vitna_json_value_t* ns = vitna_responses_namespace(vitna_json_get(g->p->root, "tools"), q->data.data, q->data.len);
+        if (ns) {
+            vitna_sb_puts(b, ",\"namespace\":");
+            put_string(b, ns->u.string.ptr, ns->u.string.len);
+        }
         vitna_sb_puts(b, ",\"arguments\":");
         put_string(b, done ? q->args.data : "", done ? q->args.len : 0);
         vitna_sb_printf(b, ",\"status\":\"%s\"}", done ? "completed" : "in_progress");
@@ -1625,6 +1639,7 @@ static void job_begin(vitna_api_t* api, job_t* j) {
     vitna_sb_init(&g->text);
     if (p->prefill_len) vitna_sb_append(&g->text, p->prefill, p->prefill_len);
     g->stop = -1;
+    g->window = p->kind == API_MESSAGES && p->has_max_tokens && j->max_new < p->max_tokens;
     vitna_reply_init(&g->rp, p->think, p->tools);
 
     const uint64_t seed = p->has_seed ? p->seed : fresh_u64(api);
@@ -2229,6 +2244,18 @@ static vitna_api_result_t run_job(vitna_api_t* api, vitna_sink_t* sink, const pa
     }
     size_t room = ids->count < m->ctx ? m->ctx - ids->count : 0;
     size_t max_new = p->has_max_tokens ? p->max_tokens : (p->chat ? room : 16);
+    /* Anthropic's API, from Claude Sonnet 4.5 on, takes a max_tokens larger
+     * than the context has room for and stops when the context is full, with
+     * stop_reason model_context_window_exceeded; its clients send the most
+     * output they will take, whatever the prompt. OpenAI's refuses. */
+    if (p->kind == API_MESSAGES && room > 0 && max_new > room) max_new = room;
+    if (room == 0 && p->kind == API_MESSAGES) {
+        /* Anthropic's own words, which its clients look for. */
+        set_error(&e, 400, "invalid_request_error", "context_length_exceeded", conversation, "prompt is too long: %zu tokens > %zu maximum", ids->count,
+                  m->ctx - 1);
+        r.status = respond_error_as(sink, &e, p->kind);
+        return r;
+    }
     if (room == 0 || max_new > room) {
         set_error(&e, 400, "invalid_request_error", "context_length_exceeded", p->has_max_tokens ? max_param : conversation,
                   "This model's context holds %zu tokens. The prompt is %zu tokens, which leaves room for %zu, and %zu were asked for.",
@@ -2724,7 +2751,7 @@ static vitna_api_result_t generate_route(vitna_api_t* api, api_kind_t kind, cons
     if (kind == API_COMPLETIONS) {
         if (!completion_prompt(api, vitna_json_get(root, "prompt"), &ids, &e)) goto fail;
     } else {
-        if (!chat_build(api, root, &p, &prompt, &prefill, &e)) goto fail;
+        if (!chat_build(api, root, &p, &prompt, &prefill, &ignored, &e)) goto fail;
         if (!vitna_tokenizer_encode(api->tok, prompt.data, prompt.len, &ids)) {
             set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
             goto fail;
@@ -2764,43 +2791,51 @@ done:
     return r;
 }
 
-/* POST /v1/messages/count_tokens: the tokens a Messages request's prompt
- * holds as the model reads it, its template and any prefill included, in
- * Anthropic's response. Nothing runs. */
-static vitna_api_result_t count_tokens_route(vitna_api_t* api, const char* body, size_t body_len, vitna_sink_t* sink) {
+/* POST /v1/messages/count_tokens, Anthropic's, and POST
+ * /v1/responses/input_tokens, OpenAI's: the tokens a request's prompt holds
+ * as the model reads it, its template and any prefill included, in that
+ * API's response. Nothing runs. A Messages count takes no max_tokens, so its
+ * parameters are not read; a Responses count reads them, since JSON mode
+ * changes the prompt. */
+static vitna_api_result_t count_tokens_route(vitna_api_t* api, api_kind_t kind, const char* body, size_t body_len, vitna_sink_t* sink) {
     vitna_api_result_t r = { 200, 0, 0, 0 };
     api_error_t e;
     char jerr[160];
     vitna_json_doc_t* doc = vitna_json_parse(body ? body : "", body_len, jerr, sizeof(jerr));
     params_t p;
     memset(&p, 0, sizeof(p));
-    p.kind = API_MESSAGES;
+    p.kind = kind;
     p.chat = true;
     p.ban = -1;
-    vitna_strbuf_t prompt, prefill, out;
+    vitna_strbuf_t prompt, prefill, out, ignored;
     vitna_token_list_t ids = {0};
     vitna_sb_init(&prompt);
     vitna_sb_init(&prefill);
     vitna_sb_init(&out);
+    vitna_sb_init(&ignored);
 
     const vitna_json_value_t* root = request_root(api, doc, jerr, &e);
-    if (!root || !chat_build(api, root, &p, &prompt, &prefill, &e)) goto fail;
+    if (!root || (kind == API_RESPONSES && !parse_params(api, root, kind, &p, &e, &ignored))) goto fail;
+    p.root = root;
+    if (!chat_build(api, root, &p, &prompt, &prefill, NULL, &e)) goto fail;
     if (!vitna_tokenizer_encode(api->tok, prompt.data, prompt.len, &ids)) {
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
         goto fail;
     }
-    vitna_sb_printf(&out, "{\"input_tokens\":%zu}", ids.count);
+    if (kind == API_RESPONSES) vitna_sb_printf(&out, "{\"object\":\"response.input_tokens\",\"input_tokens\":%zu}", ids.count);
+    else vitna_sb_printf(&out, "{\"input_tokens\":%zu}", ids.count);
     respond(sink, 200, NULL, out.data, out.len);
     r.prompt_tokens = ids.count;
     goto done;
 
 fail:
-    r.status = respond_error_as(sink, &e, API_MESSAGES);
+    r.status = respond_error_as(sink, &e, kind);
 done:
     vitna_token_list_free(&ids);
     vitna_sb_free(&prompt);
     vitna_sb_free(&prefill);
     vitna_sb_free(&out);
+    vitna_sb_free(&ignored);
     vitna_json_free(doc);
     return r;
 }
@@ -2822,9 +2857,10 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
     bool messages = strcmp(route, "/v1/messages") == 0;
     bool count = strcmp(route, "/v1/messages/count_tokens") == 0;
     bool responses = strcmp(route, "/v1/responses") == 0;
-    const bool generates = chat || completions || messages || count || responses;
+    bool input_tokens = strcmp(route, "/v1/responses/input_tokens") == 0;
+    const bool generates = chat || completions || messages || count || responses || input_tokens;
     /* Errors answer in the shape of the API asked: Anthropic's for its routes, OpenAI's for the rest. */
-    const api_kind_t kind = messages || count ? API_MESSAGES : responses ? API_RESPONSES : completions ? API_COMPLETIONS : API_CHAT;
+    const api_kind_t kind = messages || count ? API_MESSAGES : responses || input_tokens ? API_RESPONSES : completions ? API_COMPLETIONS : API_CHAT;
 
     if (get && (strcmp(route, "/health") == 0 || strcmp(route, "/v1/health") == 0)) {
         vitna_strbuf_t b;
@@ -2889,7 +2925,7 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
             return r;
         }
         if (embeddings) return embeddings_route(api, body, body_len, sink);
-        if (count) return count_tokens_route(api, body, body_len, sink);
+        if (count || input_tokens) return count_tokens_route(api, kind, body, body_len, sink);
         return generate_route(api, kind, body, body_len, sink);
     }
     set_error(&e, 404, "invalid_request_error", "not_found", NULL, "Not found: %s %s", method, route);

@@ -34,6 +34,7 @@ typedef struct {
     vitna_tool_choice_t tool_choice;
     char tool_name[128];      /* VITNA_TOOLS_NAMED: the tool */
     bool continue_final;      /* the conversation ends with the assistant's reply, to be continued (Anthropic's prefill) */
+    char ignored[256];        /* what was left out, named for x-vitna-ignored: a tool its API runs on its own side */
     /* Why a request was refused: the parameter, and what is wrong with it. */
     char param[64];
     char message[384];
@@ -49,8 +50,16 @@ bool vitna_convert_chat(const vitna_json_value_t* req, vitna_chat_request_t* cr)
 /** Anthropic's Messages: system, messages of content blocks, tools, tool_choice and thinking. */
 bool vitna_convert_messages(const vitna_json_value_t* req, vitna_chat_request_t* cr);
 
-/** OpenAI's Responses: instructions, input items, tools, tool_choice and reasoning. */
+/**
+ * OpenAI's Responses: instructions, input items, tools, tool_choice and
+ * reasoning. A namespace's functions are offered as functions; a tool OpenAI
+ * runs on its own side (web search, file search and the like) is left out
+ * and named in cr->ignored.
+ */
 bool vitna_convert_responses(const vitna_json_value_t* req, vitna_chat_request_t* cr);
+
+/** The name of the namespace in a Responses request's tools that holds the function called name, or NULL. */
+const vitna_json_value_t* vitna_responses_namespace(const vitna_json_value_t* tools, const char* name, size_t len);
 
 #ifdef __cplusplus
 }

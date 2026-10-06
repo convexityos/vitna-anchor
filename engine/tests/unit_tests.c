@@ -298,6 +298,30 @@ static void test_convert(void) {
                   VITNA_TOOLS_NAMED, 1, false);
     check_convert("responses, a string of input", vitna_convert_responses, "{\"input\": \"Hello\", \"reasoning\": {\"effort\": \"minimal\"}}",
                   "[{\"role\": \"user\", \"content\": \"Hello\"}]", "", VITNA_TOOLS_AUTO, 0, false);
+    /* Codex's tools: a namespace's functions offered as functions, and the
+     * hosted web search left out and named. */
+    {
+        const char* req = "{\"input\": \"x\", \"tools\": [{\"type\": \"function\", \"name\": \"exec_command\", \"parameters\": {}}, {\"type\": \"namespace\", "
+                          "\"name\": \"multi_agent_v1\", \"description\": \"Agents.\", \"tools\": [{\"type\": \"function\", \"name\": \"spawn_agent\", "
+                          "\"parameters\": {}}]}, {\"type\": \"web_search\", \"external_web_access\": false}], \"tool_choice\": {\"type\": \"function\", "
+                          "\"name\": \"spawn_agent\"}}";
+        check_convert("responses, a namespace and a hosted tool", vitna_convert_responses, req, "[{\"role\": \"user\", \"content\": \"x\"}]",
+                      "[{\"type\": \"function\", \"function\": {\"name\": \"exec_command\", \"parameters\": {}}}, {\"type\": \"function\", \"function\": "
+                      "{\"name\": \"spawn_agent\", \"parameters\": {}}}]",
+                      VITNA_TOOLS_NAMED, -1, false);
+        char err[160];
+        vitna_json_doc_t* doc = vitna_json_parse(req, strlen(req), err, sizeof(err));
+        vitna_chat_request_t cr;
+        vitna_chat_request_init(&cr);
+        CHECK(doc && vitna_convert_responses(vitna_json_root(doc), &cr) && strcmp(cr.ignored, "tools.2.web_search") == 0, "the hosted tool is named: %s",
+              cr.ignored);
+        const vitna_json_value_t* tools = doc ? vitna_json_get(vitna_json_root(doc), "tools") : NULL;
+        const vitna_json_value_t* ns = vitna_responses_namespace(tools, "spawn_agent", 11);
+        CHECK(ns && strcmp(ns->u.string.ptr, "multi_agent_v1") == 0, "a namespace's function is found in it");
+        CHECK(vitna_responses_namespace(tools, "exec_command", 12) == NULL, "a function at the top has no namespace");
+        vitna_chat_request_free(&cr);
+        vitna_json_free(doc);
+    }
 
     /* Refused: what the model cannot read, or the request does not say. */
     check_refused("chat, an image", vitna_convert_chat,
@@ -322,9 +346,19 @@ static void test_convert(void) {
                   "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"tool_use\", \"id\": \"t\", "
                   "\"name\": \"f\", \"input\": {}}]}], \"tools\": [{\"name\": \"f\", \"input_schema\": {}}]}",
                   "messages", false);
-    check_refused("messages, a role of system", vitna_convert_messages, "{\"messages\": [{\"role\": \"system\", \"content\": \"x\"}]}", "messages.0", false);
+    check_refused("messages, a role of developer", vitna_convert_messages, "{\"messages\": [{\"role\": \"developer\", \"content\": \"x\"}]}", "messages.0",
+                  false);
+    /* Claude Code's mid-conversation system message: where it stands, ending the user turn before it. */
+    check_convert("messages, a system message among them", vitna_convert_messages,
+                  "{\"system\": \"S\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"a\"}]}, {\"role\": \"system\", "
+                  "\"content\": [{\"type\": \"text\", \"text\": \"Reminder.\", \"cache_control\": {\"type\": \"ephemeral\"}}]}, {\"role\": \"user\", "
+                  "\"content\": \"b\"}], \"thinking\": {\"type\": \"adaptive\", \"display\": \"omitted\"}}",
+                  "[{\"role\": \"system\", \"content\": \"S\"}, {\"role\": \"user\", \"content\": \"a\"}, {\"role\": \"system\", \"content\": \"Reminder.\"}, "
+                  "{\"role\": \"user\", \"content\": \"b\"}]",
+                  "", VITNA_TOOLS_AUTO, 1, false);
     check_refused("responses, an item reference", vitna_convert_responses, "{\"input\": [{\"type\": \"item_reference\", \"id\": \"msg_1\"}]}", "input[0]", true);
-    check_refused("responses, a hosted tool", vitna_convert_responses, "{\"input\": \"x\", \"tools\": [{\"type\": \"web_search\"}]}", "tools[0]", true);
+    check_refused("responses, a tool the client runs through items of its own", vitna_convert_responses,
+                  "{\"input\": \"x\", \"tools\": [{\"type\": \"local_shell\"}]}", "tools[0]", true);
     check_refused("responses, no input", vitna_convert_responses, "{\"instructions\": \"x\"}", "input", false);
 }
 

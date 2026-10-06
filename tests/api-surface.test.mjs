@@ -22,7 +22,8 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -81,6 +82,10 @@ before(async () => {
   assert.ok(!missing, missing ?? "");
   servers.qwen = await start(["--ctx", "2048"], { VITNA_TEST_TEMPLATE: "qwen3", VITNA_TEST_REPLY: "1" });
   servers.chatml = await start(["--ctx", "1024"]);
+  // The recorded requests are long: SmolLM2's whole context. And a context of
+  // 64 positions, which a test reply fills in a moment.
+  servers.shapes = await start(["--ctx", "8192"], { VITNA_TEST_TEMPLATE: "qwen3", VITNA_TEST_REPLY: "1" });
+  servers.tiny = await start(["--ctx", "64"], { VITNA_TEST_TEMPLATE: "qwen3", VITNA_TEST_REPLY: "1" });
 });
 
 after(() => {
@@ -95,6 +100,19 @@ async function post(server, path, body) {
   });
   const text = await res.text();
   return { status: res.status, headers: res.headers, text, json: res.headers.get("content-type")?.includes("json") ? JSON.parse(text) : null };
+}
+
+/** A HEAD request through Node's own HTTP parser, which fails on a body after the headers. */
+function head(server, path) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(servers[server].base + path);
+    const req = httpRequest({ hostname: url.hostname, port: url.port, path: url.pathname + url.search, method: "HEAD" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 /** OpenAI's chat stream: each event's data, [DONE] included. */
@@ -213,6 +231,9 @@ test("the three APIs are one conversation: each is written as the conversation c
   const counted = await post("qwen", "/v1/messages/count_tokens", asMessages);
   assert.equal(counted.status, 200, counted.text);
   assert.deepEqual(counted.json, { input_tokens: n });
+  const input = await post("qwen", "/v1/responses/input_tokens", asResponses);
+  assert.equal(input.status, 200, input.text);
+  assert.deepEqual(input.json, { object: "response.input_tokens", input_tokens: n });
   // Anthropic's API thinks only when asked: without thinking, the template's empty reasoning opens the reply.
   const off = await post("qwen", "/v1/messages", { ...asMessages, thinking: undefined, ...reply });
   assert.equal(off.headers.get("x-vitna-test-prompt"), fnv(rendered({ messages: CONVERSATION, tools: TOOLS, enable_thinking: false })));
@@ -474,9 +495,10 @@ test("refusals and errors come in each API's own shape", A11, async () => {
   assert.equal(stored.status, 400);
   assert.equal(stored.json.error.param, "previous_response_id");
   assert.equal(stored.json.error.code, "unsupported_parameter");
-  const hosted = await post("qwen", "/v1/responses", { input: "hi", tools: [{ type: "web_search" }] });
-  assert.equal(hosted.status, 400);
-  assert.equal(hosted.json.error.param, "tools[0]");
+  const shell = await post("qwen", "/v1/responses", { input: "hi", tools: [{ type: "local_shell" }] });
+  assert.equal(shell.status, 400);
+  assert.equal(shell.json.error.param, "tools[0]");
+  assert.equal(shell.json.error.code, "unsupported_parameter");
   const missingTool = await post("qwen", "/v1/chat/completions", { messages: ask, tools: CHAT_TOOLS, tool_choice: { type: "function", function: { name: "nope" } } });
   assert.equal(missingTool.status, 400);
   assert.equal(missingTool.json.error.param, "tool_choice");
@@ -504,4 +526,105 @@ test("a ChatML model answers one conversation the same through all three APIs, a
   assert.match(tools.json.error.message, /tool/);
   const health = await (await fetch(servers.chatml.base + "/v1/health")).json();
   assert.equal(health.chat_template, "chatml");
+});
+
+test("a HEAD request is answered as GET is, without a body, as Claude Code's first request needs", A11, async () => {
+  // Claude Code's first request is HEAD /api/hello, to see the server is there.
+  const hello = await head("qwen", "/api/hello");
+  assert.equal(hello.status, 404);
+  const models = await head("qwen", "/v1/models");
+  assert.equal(models.status, 200);
+  assert.ok(Number(models.headers["content-length"]) > 0, "the length a GET's body would have");
+});
+
+test("Anthropic's max_tokens beyond the context's room runs until the context is full, as its API does; OpenAI's is refused", A11, async () => {
+  const ask = [{ role: "user", content: "Count." }];
+  const long = Array.from({ length: 80 }, (_, i) => `n${i}`).join(" ");
+  const full = await post("tiny", "/v1/messages", { messages: ask, max_tokens: 32000, vitna_test_reply: long });
+  assert.equal(full.status, 200, full.text);
+  assert.equal(full.json.stop_reason, "model_context_window_exceeded");
+  assert.equal(anthropicInput(full.json.usage) + full.json.usage.output_tokens, 64, "the prompt and the reply fill the context");
+  const capped = await post("tiny", "/v1/messages", { messages: ask, max_tokens: 3, vitna_test_reply: long });
+  assert.equal(capped.json.stop_reason, "max_tokens");
+  assert.equal(capped.json.usage.output_tokens, 3);
+  const chat = await post("tiny", "/v1/chat/completions", { messages: ask, max_tokens: 32000 });
+  assert.equal(chat.status, 400);
+  assert.equal(chat.json.error.code, "context_length_exceeded");
+  // A prompt the context cannot hold, in the words of Anthropic's API, which its clients look for.
+  const tooLong = await post("tiny", "/v1/messages", { messages: [{ role: "user", content: long }], max_tokens: 8 });
+  assert.equal(tooLong.status, 400);
+  assert.equal(tooLong.json.error.type, "invalid_request_error");
+  assert.match(tooLong.json.error.message, /^prompt is too long: \d+ tokens > 63 maximum$/);
+});
+
+test("Codex's tools: a namespace's functions are offered, a call to one comes back with its namespace, and a hosted tool is left out and named", A11, async () => {
+  const exec = { type: "function", name: "exec_command", description: "Run a command.", parameters: { type: "object", properties: { cmd: { type: "string" } } } };
+  const spawnAgent = { type: "function", name: "spawn_agent", description: "Start an agent.", parameters: { type: "object", properties: { message: { type: "string" } } } };
+  const tools = [exec, { type: "namespace", name: "multi_agent_v1", description: "Agents.", tools: [spawnAgent] }, { type: "web_search", external_web_access: false }];
+  const input = "Start an agent.";
+  const offered = [exec, spawnAgent].map(({ type, ...f }) => ({ type, function: f }));
+  const r = await post("qwen", "/v1/responses", { input, tools, vitna_test_reply: '<tool_call>\n{"name": "spawn_agent", "arguments": {"message": "go"}}\n</tool_call>' });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.headers.get("x-vitna-test-prompt"), fnv(rendered({ messages: [{ role: "user", content: input }], tools: offered })), "both functions offered, the search left out");
+  assert.equal(r.headers.get("x-vitna-ignored"), "tools.2.web_search");
+  const call = r.json.output.find((o) => o.type === "function_call");
+  assert.equal(call.name, "spawn_agent");
+  assert.equal(call.namespace, "multi_agent_v1");
+  const top = await post("qwen", "/v1/responses", { input, tools, vitna_test_reply: '<tool_call>\n{"name": "exec_command", "arguments": {"cmd": "ls"}}\n</tool_call>' });
+  const topCall = top.json.output.find((o) => o.type === "function_call");
+  assert.equal(topCall.name, "exec_command");
+  assert.equal("namespace" in topCall, false, "a function at the top has no namespace");
+});
+
+// What Claude Code and Codex sent, recorded (reference/api-shapes/). Every
+// request goes through the APIs' own token counters, which convert it and
+// write it in the template as a reply would, without running the model.
+const SHAPES = ["claude-code-2.1.283", "codex-0.160.0"].map((name) => ({ name, ...JSON.parse(readFileSync(here(`../reference/api-shapes/${name}.json`), "utf8")) }));
+
+test("every request Claude Code and Codex sent, as recorded, is read and written in the template", A11, async () => {
+  for (const fixture of SHAPES) {
+    assert.ok(fixture.requests.length > 0, fixture.name);
+    for (const [i, r] of fixture.requests.entries()) {
+      const label = `${fixture.name}, request ${i}: ${r.method} ${r.path}`;
+      if (r.method === "HEAD") {
+        assert.equal((await head("shapes", r.path)).status, 404, label);
+        continue;
+      }
+      const messages = r.path.startsWith("/v1/messages");
+      const counted = await post("shapes", messages ? "/v1/messages/count_tokens" : "/v1/responses/input_tokens", { ...r.body, model: MODEL });
+      assert.equal(counted.status, 200, `${label}: ${counted.text.slice(0, 400)}`);
+      assert.ok(counted.json.input_tokens > 1000, `${label}: ${counted.json.input_tokens} tokens`);
+      if (!messages) assert.equal(counted.json.object, "response.input_tokens", label);
+    }
+  }
+});
+
+// And every one answered through the model, as its client would be answered:
+// SmolLM2 reads about 20,000 prompt tokens for them a token at a time on one
+// CPU thread, about six minutes, so this is run by hand, with
+// VITNA_REPLAY_SHAPES=1.
+const REPLAY = process.env.VITNA_REPLAY_SHAPES === "1" ? A11 : { skip: "set VITNA_REPLAY_SHAPES=1 to answer every recorded request through the model, about six minutes" };
+
+test("the requests Claude Code and Codex sent, as recorded, are each answered in their API's own shape", REPLAY, async () => {
+  for (const fixture of SHAPES) {
+    for (const [i, r] of fixture.requests.entries()) {
+      if (r.method === "HEAD") continue;
+      const label = `${fixture.name}, request ${i}: ${r.method} ${r.path}`;
+      // Each answered with a call to the first of its own tools, which its client would then run.
+      const messages = r.path.startsWith("/v1/messages");
+      const tool = messages ? r.body.tools[0].name : r.body.tools.find((t) => t.type === "function").name;
+      const res = await post("shapes", r.path, { ...r.body, model: MODEL, vitna_test_reply: `<tool_call>\n{"name": "${tool}", "arguments": {}}\n</tool_call>` });
+      assert.equal(res.status, 200, `${label}: ${res.text.slice(0, 400)}`);
+      const ev = namedEvents(res.text);
+      if (messages) {
+        assert.deepEqual(ev.slice(-2).map((e) => e.event), ["message_delta", "message_stop"], label);
+        assert.equal(ev.at(-2).data.delta.stop_reason, "tool_use", label);
+        assert.ok(ev.some((e) => e.event === "content_block_start" && e.data.content_block.type === "tool_use" && e.data.content_block.name === tool), label);
+      } else {
+        assert.equal(ev.at(-1).event, "response.completed", label);
+        assert.ok(ev.at(-1).data.response.output.some((o) => o.type === "function_call" && o.name === tool), label);
+        assert.match(res.headers.get("x-vitna-ignored") ?? "", /tools\.\d+\.web_search/, label);
+      }
+    }
+  }
 });

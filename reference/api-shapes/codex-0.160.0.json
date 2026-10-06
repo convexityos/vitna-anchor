@@ -1,0 +1,1592 @@
+{
+  "format": "vitna-anchor recorded API shapes, version 1",
+  "client": "codex",
+  "version": "0.160.0",
+  "recorded": "2026-10-06",
+  "how": "Recorded with scripts/record-api-requests.mjs between codex 0.160.0 and this server, and made into this file by scripts/api-shapes.mjs: strings longer than 32 characters are replaced by their length, and metadata, client_metadata and prompt_cache_key are dropped.",
+  "requests": [
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "headers": {
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+        "originator": "codex_exec",
+        "user-agent": "codex_exec/0.160.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.160.0)"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "instructions": "<17174 chars>",
+        "input": [
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<2124 chars>"
+              },
+              {
+                "type": "input_text",
+                "text": "<342 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<770 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<52 chars>"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "exec_command",
+            "description": "<986 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "cmd": {
+                  "type": "string",
+                  "description": "Shell command to execute."
+                },
+                "justification": {
+                  "type": "string",
+                  "description": "<70 chars>"
+                },
+                "login": {
+                  "type": "boolean",
+                  "description": "<80 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "prefix_rule": {
+                  "type": "array",
+                  "description": "<118 chars>",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "sandbox_permissions": {
+                  "type": "string",
+                  "description": "<107 chars>",
+                  "enum": [
+                    "use_default",
+                    "require_escalated"
+                  ]
+                },
+                "shell": {
+                  "type": "string",
+                  "description": "<61 chars>"
+                },
+                "tty": {
+                  "type": "boolean",
+                  "description": "<72 chars>"
+                },
+                "workdir": {
+                  "type": "string",
+                  "description": "<60 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<245 chars>"
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "write_stdin",
+            "description": "<80 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "chars": {
+                  "type": "string",
+                  "description": "<72 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "session_id": {
+                  "type": "number",
+                  "description": "<47 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<128 chars>"
+                }
+              },
+              "required": [
+                "session_id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "request_user_input",
+            "description": "<120 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "questions": {
+                  "type": "array",
+                  "description": "<56 chars>",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "header": {
+                        "type": "string",
+                        "description": "<55 chars>"
+                      },
+                      "id": {
+                        "type": "string",
+                        "description": "<51 chars>"
+                      },
+                      "options": {
+                        "type": "array",
+                        "description": "<224 chars>",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "description": {
+                              "type": "string",
+                              "description": "<58 chars>"
+                            },
+                            "label": {
+                              "type": "string",
+                              "description": "User-facing label (1-5 words)."
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "description"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "question": {
+                        "type": "string",
+                        "description": "<41 chars>"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "header",
+                      "question",
+                      "options"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "questions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "view_image",
+            "description": "<124 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "<39 chars>"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "<43 chars>",
+            "tools": [
+              {
+                "type": "function",
+                "name": "close_agent",
+                "description": "<298 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string",
+                      "description": "<37 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "resume_agent",
+                "description": "<89 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Agent id to resume."
+                    }
+                  },
+                  "required": [
+                    "id"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "send_input",
+                "description": "<215 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "interrupt": {
+                      "type": "boolean",
+                      "description": "<98 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<76 chars>"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "<39 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "<5033 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "fork_context": {
+                      "type": "boolean",
+                      "description": "<111 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<71 chars>"
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "<77 chars>"
+                    },
+                    "reasoning_effort": {
+                      "type": "string",
+                      "description": "<79 chars>"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "<252 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "targets": {
+                      "type": "array",
+                      "description": "<77 chars>",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "timeout_ms": {
+                      "type": "number",
+                      "description": "<120 chars>"
+                    }
+                  },
+                  "required": [
+                    "targets"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
+          {
+            "type": "function",
+            "name": "get_goal",
+            "description": "<122 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "create_goal",
+            "description": "<265 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "objective": {
+                  "type": "string",
+                  "description": "<151 chars>"
+                },
+                "token_budget": {
+                  "type": "integer",
+                  "description": "<73 chars>"
+                }
+              },
+              "required": [
+                "objective"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "update_goal",
+            "description": "<1541 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "description": "<370 chars>",
+                  "enum": [
+                    "complete",
+                    "blocked",
+                    "paused"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "web_search",
+            "external_web_access": false
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "headers": {
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+        "originator": "codex_exec",
+        "user-agent": "codex_exec/0.160.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.160.0)"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "instructions": "<17174 chars>",
+        "input": [
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<2124 chars>"
+              },
+              {
+                "type": "input_text",
+                "text": "<342 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<770 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<52 chars>"
+              }
+            ]
+          },
+          {
+            "type": "reasoning",
+            "id": "rs_7e22ed4895cad325",
+            "summary": [],
+            "content": [
+              {
+                "type": "reasoning_text",
+                "text": "<1518 chars>"
+              }
+            ],
+            "encrypted_content": null
+          },
+          {
+            "type": "function_call",
+            "id": "fc_7ebdee2fc2ce484e",
+            "name": "exec_command",
+            "arguments": "{\"cmd\": \"Get-Content hello.py\"}",
+            "call_id": "call_4796eddefb37f08c"
+          },
+          {
+            "type": "function_call_output",
+            "id": "<40 chars>",
+            "call_id": "call_4796eddefb37f08c",
+            "output": "<226 chars>"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "exec_command",
+            "description": "<986 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "cmd": {
+                  "type": "string",
+                  "description": "Shell command to execute."
+                },
+                "justification": {
+                  "type": "string",
+                  "description": "<70 chars>"
+                },
+                "login": {
+                  "type": "boolean",
+                  "description": "<80 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "prefix_rule": {
+                  "type": "array",
+                  "description": "<118 chars>",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "sandbox_permissions": {
+                  "type": "string",
+                  "description": "<107 chars>",
+                  "enum": [
+                    "use_default",
+                    "require_escalated"
+                  ]
+                },
+                "shell": {
+                  "type": "string",
+                  "description": "<61 chars>"
+                },
+                "tty": {
+                  "type": "boolean",
+                  "description": "<72 chars>"
+                },
+                "workdir": {
+                  "type": "string",
+                  "description": "<60 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<245 chars>"
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "write_stdin",
+            "description": "<80 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "chars": {
+                  "type": "string",
+                  "description": "<72 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "session_id": {
+                  "type": "number",
+                  "description": "<47 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<128 chars>"
+                }
+              },
+              "required": [
+                "session_id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "request_user_input",
+            "description": "<120 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "questions": {
+                  "type": "array",
+                  "description": "<56 chars>",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "header": {
+                        "type": "string",
+                        "description": "<55 chars>"
+                      },
+                      "id": {
+                        "type": "string",
+                        "description": "<51 chars>"
+                      },
+                      "options": {
+                        "type": "array",
+                        "description": "<224 chars>",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "description": {
+                              "type": "string",
+                              "description": "<58 chars>"
+                            },
+                            "label": {
+                              "type": "string",
+                              "description": "User-facing label (1-5 words)."
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "description"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "question": {
+                        "type": "string",
+                        "description": "<41 chars>"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "header",
+                      "question",
+                      "options"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "questions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "view_image",
+            "description": "<124 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "<39 chars>"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "<43 chars>",
+            "tools": [
+              {
+                "type": "function",
+                "name": "close_agent",
+                "description": "<298 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string",
+                      "description": "<37 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "resume_agent",
+                "description": "<89 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Agent id to resume."
+                    }
+                  },
+                  "required": [
+                    "id"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "send_input",
+                "description": "<215 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "interrupt": {
+                      "type": "boolean",
+                      "description": "<98 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<76 chars>"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "<39 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "<5033 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "fork_context": {
+                      "type": "boolean",
+                      "description": "<111 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<71 chars>"
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "<77 chars>"
+                    },
+                    "reasoning_effort": {
+                      "type": "string",
+                      "description": "<79 chars>"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "<252 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "targets": {
+                      "type": "array",
+                      "description": "<77 chars>",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "timeout_ms": {
+                      "type": "number",
+                      "description": "<120 chars>"
+                    }
+                  },
+                  "required": [
+                    "targets"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
+          {
+            "type": "function",
+            "name": "get_goal",
+            "description": "<122 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "create_goal",
+            "description": "<265 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "objective": {
+                  "type": "string",
+                  "description": "<151 chars>"
+                },
+                "token_budget": {
+                  "type": "integer",
+                  "description": "<73 chars>"
+                }
+              },
+              "required": [
+                "objective"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "update_goal",
+            "description": "<1541 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "description": "<370 chars>",
+                  "enum": [
+                    "complete",
+                    "blocked",
+                    "paused"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "web_search",
+            "external_web_access": false
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "headers": {
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+        "originator": "codex_exec",
+        "user-agent": "codex_exec/0.160.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.160.0)"
+      },
+      "body": {
+        "model": "qwen3-30b-a3b",
+        "instructions": "<17174 chars>",
+        "input": [
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<2124 chars>"
+              },
+              {
+                "type": "input_text",
+                "text": "<342 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<770 chars>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "id": "<40 chars>",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<52 chars>"
+              }
+            ]
+          },
+          {
+            "type": "reasoning",
+            "id": "rs_7e22ed4895cad325",
+            "summary": [],
+            "content": [
+              {
+                "type": "reasoning_text",
+                "text": "<1518 chars>"
+              }
+            ],
+            "encrypted_content": null
+          },
+          {
+            "type": "function_call",
+            "id": "fc_7ebdee2fc2ce484e",
+            "name": "exec_command",
+            "arguments": "{\"cmd\": \"Get-Content hello.py\"}",
+            "call_id": "call_4796eddefb37f08c"
+          },
+          {
+            "type": "function_call_output",
+            "id": "<40 chars>",
+            "call_id": "call_4796eddefb37f08c",
+            "output": "<226 chars>"
+          },
+          {
+            "type": "reasoning",
+            "id": "rs_d850a350475fd74c",
+            "summary": [],
+            "content": [
+              {
+                "type": "reasoning_text",
+                "text": "<1181 chars>"
+              }
+            ],
+            "encrypted_content": null
+          },
+          {
+            "type": "message",
+            "id": "msg_b38a6a58a418b77b",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "<118 chars>"
+              }
+            ]
+          },
+          {
+            "type": "function_call",
+            "id": "fc_dd1b8e669d7e7c12",
+            "name": "exec_command",
+            "arguments": "{\"cmd\": \"Test-Path hello.py\"}",
+            "call_id": "call_fe92a83b99756e1f"
+          },
+          {
+            "type": "function_call_output",
+            "id": "<40 chars>",
+            "call_id": "call_fe92a83b99756e1f",
+            "output": "<224 chars>"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "exec_command",
+            "description": "<986 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "cmd": {
+                  "type": "string",
+                  "description": "Shell command to execute."
+                },
+                "justification": {
+                  "type": "string",
+                  "description": "<70 chars>"
+                },
+                "login": {
+                  "type": "boolean",
+                  "description": "<80 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "prefix_rule": {
+                  "type": "array",
+                  "description": "<118 chars>",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "sandbox_permissions": {
+                  "type": "string",
+                  "description": "<107 chars>",
+                  "enum": [
+                    "use_default",
+                    "require_escalated"
+                  ]
+                },
+                "shell": {
+                  "type": "string",
+                  "description": "<61 chars>"
+                },
+                "tty": {
+                  "type": "boolean",
+                  "description": "<72 chars>"
+                },
+                "workdir": {
+                  "type": "string",
+                  "description": "<60 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<245 chars>"
+                }
+              },
+              "required": [
+                "cmd"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "write_stdin",
+            "description": "<80 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "chars": {
+                  "type": "string",
+                  "description": "<72 chars>"
+                },
+                "max_output_tokens": {
+                  "type": "number",
+                  "description": "<87 chars>"
+                },
+                "session_id": {
+                  "type": "number",
+                  "description": "<47 chars>"
+                },
+                "yield_time_ms": {
+                  "type": "number",
+                  "description": "<128 chars>"
+                }
+              },
+              "required": [
+                "session_id"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "request_user_input",
+            "description": "<120 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "questions": {
+                  "type": "array",
+                  "description": "<56 chars>",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "header": {
+                        "type": "string",
+                        "description": "<55 chars>"
+                      },
+                      "id": {
+                        "type": "string",
+                        "description": "<51 chars>"
+                      },
+                      "options": {
+                        "type": "array",
+                        "description": "<224 chars>",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "description": {
+                              "type": "string",
+                              "description": "<58 chars>"
+                            },
+                            "label": {
+                              "type": "string",
+                              "description": "User-facing label (1-5 words)."
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "description"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "question": {
+                        "type": "string",
+                        "description": "<41 chars>"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "header",
+                      "question",
+                      "options"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "questions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "view_image",
+            "description": "<124 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "<39 chars>"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "<43 chars>",
+            "tools": [
+              {
+                "type": "function",
+                "name": "close_agent",
+                "description": "<298 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string",
+                      "description": "<37 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "resume_agent",
+                "description": "<89 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Agent id to resume."
+                    }
+                  },
+                  "required": [
+                    "id"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "send_input",
+                "description": "<215 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "interrupt": {
+                      "type": "boolean",
+                      "description": "<98 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<76 chars>"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "<39 chars>"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "<5033 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "fork_context": {
+                      "type": "boolean",
+                      "description": "<111 chars>"
+                    },
+                    "items": {
+                      "type": "array",
+                      "description": "<96 chars>",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "audio_url": {
+                            "type": "string",
+                            "description": "<34 chars>"
+                          },
+                          "image_url": {
+                            "type": "string",
+                            "description": "Image URL when type is image."
+                          },
+                          "name": {
+                            "type": "string",
+                            "description": "<43 chars>"
+                          },
+                          "path": {
+                            "type": "string",
+                            "description": "<173 chars>"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "Text content when type is text."
+                          },
+                          "type": {
+                            "type": "string",
+                            "description": "<81 chars>"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "<71 chars>"
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "<77 chars>"
+                    },
+                    "reasoning_effort": {
+                      "type": "string",
+                      "description": "<79 chars>"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "<252 chars>",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "targets": {
+                      "type": "array",
+                      "description": "<77 chars>",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "timeout_ms": {
+                      "type": "number",
+                      "description": "<120 chars>"
+                    }
+                  },
+                  "required": [
+                    "targets"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
+          {
+            "type": "function",
+            "name": "get_goal",
+            "description": "<122 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "create_goal",
+            "description": "<265 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "objective": {
+                  "type": "string",
+                  "description": "<151 chars>"
+                },
+                "token_budget": {
+                  "type": "integer",
+                  "description": "<73 chars>"
+                }
+              },
+              "required": [
+                "objective"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "function",
+            "name": "update_goal",
+            "description": "<1541 chars>",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "description": "<370 chars>",
+                  "enum": [
+                    "complete",
+                    "blocked",
+                    "paused"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "web_search",
+            "external_web_access": false
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true,
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      }
+    }
+  ]
+}

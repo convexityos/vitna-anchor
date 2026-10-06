@@ -208,6 +208,27 @@ static const char* status_reason(int status) {
     }
 }
 
+/* A HEAD request is answered as GET would be, without the body: the bytes
+ * of the response after its headers end are dropped, as HTTP requires. */
+typedef struct {
+    socket_t* s;
+    int seen;   /* how much of the blank line that ends the headers has gone by */
+    bool body;  /* the headers have ended */
+} head_sink_t;
+
+static bool head_write(void* ctx, const void* data, size_t len) {
+    head_sink_t* h = (head_sink_t*)ctx;
+    const char* p = (const char*)data;
+    size_t i = 0;
+    while (i < len && !h->body) {
+        const char want = "\r\n\r\n"[h->seen];
+        if (p[i] == want) h->body = ++h->seen == 4;
+        else h->seen = p[i] == '\r' ? 1 : 0;
+        i++;
+    }
+    return i == 0 || sock_write(h->s, data, i);
+}
+
 static void handle_client(socket_t client, vitna_api_t* api) {
     set_timeouts(client);
     request_t req;
@@ -218,7 +239,13 @@ static void handle_client(socket_t client, vitna_api_t* api) {
         fprintf(stderr, "? ? %d\n", rc);
     } else if (rc == 0) {
         vitna_sink_t sink = { sock_write, &client, false };
-        vitna_api_result_t r = vitna_api_handle(api, req.method, req.path, req.buf + req.body_off, req.body_len, &sink);
+        head_sink_t head = { &client, 0, false };
+        const bool is_head = strcmp(req.method, "HEAD") == 0;
+        if (is_head) {
+            sink.write = head_write;
+            sink.ctx = &head;
+        }
+        vitna_api_result_t r = vitna_api_handle(api, is_head ? "GET" : req.method, req.path, req.buf + req.body_off, req.body_len, &sink);
         char route[128];
         size_t n = strcspn(req.path, "?");
         snprintf(route, sizeof(route), "%.*s", (int)(n < 120 ? n : 120), req.path);
@@ -346,9 +373,10 @@ int vitna_server_run(const vitna_server_config_t* config) {
     if (api && vitna_api_embeds(api)) {
         printf("Serving %s at /v1/embeddings, one request at a time.\n", vitna_api_model_id(api));
     } else if (api && vitna_api_parallel(api) > 1) {
-        printf("Serving %s at /v1/chat/completions and /v1/completions, %zu requests at a time.\n", vitna_api_model_id(api), vitna_api_parallel(api));
+        printf("Serving %s at /v1/chat/completions, /v1/completions, /v1/responses and /v1/messages, %zu requests at a time.\n", vitna_api_model_id(api),
+               vitna_api_parallel(api));
     } else if (api) {
-        printf("Serving %s at /v1/chat/completions and /v1/completions, one request at a time.\n", vitna_api_model_id(api));
+        printf("Serving %s at /v1/chat/completions, /v1/completions, /v1/responses and /v1/messages, one request at a time.\n", vitna_api_model_id(api));
     } else {
         printf("%s\n", vitna_api_no_model_message());
         printf("Generation endpoints answer 501.\n");

@@ -408,7 +408,9 @@ bool vitna_convert_messages(const vitna_json_value_t* req, vitna_chat_request_t*
     /* Consecutive messages of one role are one turn, as Anthropic's API
      * combines them. A user turn is its tool results, each a tool message,
      * then its text as one user message; an assistant turn is its thinking,
-     * text and tool uses, as one assistant message. */
+     * text and tool uses, as one assistant message. A system message among
+     * them (Anthropic's mid-conversation system beta, which Claude Code
+     * sends) is a system message there, as the template writes one. */
     vitna_strbuf_t text;
     vitna_sb_init(&text);
     bool any_text = false, user_open = false, any_result = false;
@@ -418,11 +420,11 @@ bool vitna_convert_messages(const vitna_json_value_t* req, vitna_chat_request_t*
         snprintf(param, sizeof(param), "messages.%zu", i);
         const vitna_json_value_t* role = is_obj(m) ? vitna_json_get(m, "role") : NULL;
         const vitna_json_value_t* content = is_obj(m) ? vitna_json_get(m, "content") : NULL;
-        const bool user = str_eq(role, "user"), assistant = str_eq(role, "assistant");
-        if (!user && !assistant) {
+        const bool user = str_eq(role, "user"), assistant = str_eq(role, "assistant"), sys = str_eq(role, "system");
+        if (!user && !assistant && !sys) {
             vitna_sb_free(&text);
             conv_end(&c);
-            return refuse(cr, false, param, "a message's role is user or assistant");
+            return refuse(cr, false, param, "a message's role is user, assistant or system");
         }
         if (!is_str(content) && !is_arr(content)) {
             vitna_sb_free(&text);
@@ -435,10 +437,24 @@ bool vitna_convert_messages(const vitna_json_value_t* req, vitna_chat_request_t*
             any_text = any_result = false;
             vitna_sb_clear(&text);
         }
-        if (assistant && user_open) {
+        if (!user && user_open) {
             /* A turn of tool results alone has no user message after them. */
             if (any_text || !any_result) conv_message(&c, "user", text.data, text.len, NULL, 0);
             user_open = false;
+        }
+        if (sys) {
+            vitna_strbuf_t s;
+            vitna_sb_init(&s);
+            bool any = false;
+            if (!text_of(content, text_blocks, &s, &any)) {
+                vitna_sb_free(&s);
+                vitna_sb_free(&text);
+                conv_end(&c);
+                return refuse(cr, true, param, "a system message holds text only");
+            }
+            conv_message(&c, "system", s.data, s.len, NULL, 0);
+            vitna_sb_free(&s);
+            continue;
         }
         if (is_str(content)) {
             if (user) join(&text, &any_text, content->u.string.ptr, content->u.string.len);
@@ -552,6 +568,56 @@ bool vitna_convert_messages(const vitna_json_value_t* req, vitna_chat_request_t*
 }
 
 /* --- OpenAI's Responses --- */
+
+/* The tools OpenAI runs on its own side, which a local server cannot. */
+static bool hosted_tool(const vitna_json_value_t* type) {
+    static const char* const hosted[] = { "file_search", "code_interpreter", "image_generation", "mcp", "computer_use_preview", "computer", NULL };
+    if (!is_str(type)) return false;
+    if (strncmp(type->u.string.ptr, "web_search", 10) == 0) return true;
+    for (size_t i = 0; hosted[i]; i++) {
+        if (strcmp(type->u.string.ptr, hosted[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Name something left out in cr->ignored, after what is there. */
+static void note_ignored(vitna_chat_request_t* cr, const char* fmt, ...) {
+    size_t at = strlen(cr->ignored);
+    if (at && at + 2 < sizeof(cr->ignored)) {
+        memcpy(cr->ignored + at, ", ", 3);
+        at += 2;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cr->ignored + at, sizeof(cr->ignored) - at, fmt, ap);
+    va_end(ap);
+}
+
+/* Whether a Responses request's tools have a function of this name, at the top or in a namespace. */
+static bool responses_has_tool(const vitna_json_value_t* tools, const char* name) {
+    for (size_t i = 0; is_arr(tools) && i < tools->u.array.count; i++) {
+        const vitna_json_value_t* t = tools->u.array.items[i];
+        if (str_eq(vitna_json_get(t, "type"), "function") && str_eq(top_tool_name(t), name)) return true;
+        if (str_eq(vitna_json_get(t, "type"), "namespace") && vitna_responses_namespace(tools, name, strlen(name))) return true;
+    }
+    return false;
+}
+
+const vitna_json_value_t* vitna_responses_namespace(const vitna_json_value_t* tools, const char* name, size_t len) {
+    for (size_t i = 0; is_arr(tools) && i < tools->u.array.count; i++) {
+        const vitna_json_value_t* t = tools->u.array.items[i];
+        if (!is_obj(t) || !str_eq(vitna_json_get(t, "type"), "namespace")) continue;
+        const vitna_json_value_t* inner = vitna_json_get(t, "tools");
+        for (size_t k = 0; is_arr(inner) && k < inner->u.array.count; k++) {
+            const vitna_json_value_t* fname = top_tool_name(inner->u.array.items[k]);
+            if (is_str(fname) && fname->u.string.len == len && memcmp(fname->u.string.ptr, name, len) == 0) {
+                const vitna_json_value_t* ns = vitna_json_get(t, "name");
+                return is_str(ns) ? ns : NULL;
+            }
+        }
+    }
+    return NULL;
+}
 
 bool vitna_convert_responses(const vitna_json_value_t* req, vitna_chat_request_t* cr) {
     static const char* const text_parts[] = { "input_text", "output_text", "text", NULL };
@@ -667,15 +733,42 @@ bool vitna_convert_responses(const vitna_json_value_t* req, vitna_chat_request_t
         if (!is_arr(tools)) return refuse(cr, false, "tools", "`tools` must be an array");
         for (size_t i = 0; i < tools->u.array.count; i++) {
             const vitna_json_value_t* t = tools->u.array.items[i];
-            const vitna_json_value_t* name = top_tool_name(t);
+            const vitna_json_value_t* type = is_obj(t) ? vitna_json_get(t, "type") : NULL;
             snprintf(param, sizeof(param), "tools[%zu]", i);
-            if (!str_eq(vitna_json_get(t, "type"), "function")) {
-                return refuse(cr, true, param, "a tool here is of type function, not of type %s", type_name(is_obj(t) ? vitna_json_get(t, "type") : NULL));
+            if (str_eq(type, "function")) {
+                const vitna_json_value_t* name = top_tool_name(t);
+                if (!is_str(name)) return refuse(cr, false, param, "a function tool needs a name");
+                put_tool(&cr->tools, cr->tools.len == 0, name, vitna_json_get(t, "description"), vitna_json_get(t, "parameters"));
+            } else if (str_eq(type, "namespace")) {
+                /* A namespace's functions are offered as functions, each by
+                 * its own name, and a call to one is returned with its
+                 * namespace beside its name (vitna_responses_namespace). */
+                const vitna_json_value_t* inner = vitna_json_get(t, "tools");
+                for (size_t k = 0; is_arr(inner) && k < inner->u.array.count; k++) {
+                    const vitna_json_value_t* f = inner->u.array.items[k];
+                    const vitna_json_value_t* fname = top_tool_name(f);
+                    if (!str_eq(vitna_json_get(f, "type"), "function") || !is_str(fname)) {
+                        return refuse(cr, true, param, "the tools of a namespace here are functions with names");
+                    }
+                    put_tool(&cr->tools, cr->tools.len == 0, fname, vitna_json_get(f, "description"), vitna_json_get(f, "parameters"));
+                }
+            } else if (hosted_tool(type)) {
+                /* A tool OpenAI runs on its own side, which a local server
+                 * cannot: left out of what the model is offered, and named
+                 * among what was ignored, in characters a header can carry. */
+                char safe[48];
+                size_t k = 0;
+                for (; k + 1 < sizeof(safe) && k < type->u.string.len; k++) {
+                    const char ch = type->u.string.ptr[k];
+                    safe[k] = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' ? ch : '_';
+                }
+                safe[k] = '\0';
+                note_ignored(cr, "tools.%zu.%s", i, safe);
+            } else {
+                return refuse(cr, true, param, "a tool here is a function, or a namespace of functions, not of type %s", type_name(type));
             }
-            if (!is_str(name)) return refuse(cr, false, param, "a function tool needs a name");
-            put_tool(&cr->tools, i == 0, name, vitna_json_get(t, "description"), vitna_json_get(t, "parameters"));
         }
-        if (tools->u.array.count) vitna_sb_puts(&cr->tools, "]");
+        if (cr->tools.len) vitna_sb_puts(&cr->tools, "]");
     }
     const vitna_json_value_t* choice = vitna_json_get(req, "tool_choice");
     if (str_eq(choice, "none")) {
@@ -691,7 +784,12 @@ bool vitna_convert_responses(const vitna_json_value_t* req, vitna_chat_request_t
     } else if (given(choice) && !str_eq(choice, "auto")) {
         return refuse(cr, false, "tool_choice", "`tool_choice` is none, auto, required or a function");
     }
-    if (!check_choice(cr, tools, top_tool_name)) return false;
+    if ((cr->tool_choice == VITNA_TOOLS_REQUIRED || cr->tool_choice == VITNA_TOOLS_NAMED) && cr->tools.len == 0) {
+        return refuse(cr, false, "tool_choice", "a tool_choice that calls a tool needs tools to call");
+    }
+    if (cr->tool_choice == VITNA_TOOLS_NAMED && !responses_has_tool(tools, cr->tool_name)) {
+        return refuse(cr, false, "tool_choice", "tool_choice names the tool \"%s\", which is not among the tools", cr->tool_name);
+    }
 
     const vitna_json_value_t* reasoning = vitna_json_get(req, "reasoning");
     const vitna_json_value_t* effort = is_obj(reasoning) ? vitna_json_get(reasoning, "effort") : NULL;
