@@ -351,3 +351,218 @@ bool vitna_chat_qwen3(vitna_strbuf_t* out, const vitna_json_value_t* messages, c
     if (!out->ok) return fail(err, err_len, "out of memory");
     return true;
 }
+
+/* --- A reply in Qwen3's own format, read back (vitna_reply_feed) --- */
+
+enum { P_START, P_REASON, P_TEXT, P_TOOL, P_AFTER, P_DONE };
+
+static const char OPEN_THINK[] = "<think>";
+static const char CLOSE_THINK[] = "</think>";
+static const char OPEN_CALL[] = "<tool_call>";
+static const char CLOSE_CALL[] = "</tool_call>";
+
+void vitna_reply_init(vitna_reply_parser_t* rp, bool think, bool tools) {
+    memset(rp, 0, sizeof(*rp));
+    rp->think = think;
+    rp->tools = tools;
+    rp->phase = P_START;
+}
+
+/* Where tag first begins in text[from..len), or -1. */
+static long find_tag(const char* text, size_t from, size_t len, const char* tag) {
+    const size_t k = strlen(tag);
+    for (size_t i = from; i + k <= len; i++) {
+        if (memcmp(text + i, tag, k) == 0) return (long)i;
+    }
+    return -1;
+}
+
+/* The longest end of text[from..len) that could still grow into tag. */
+static size_t tag_holdback(const char* text, size_t from, size_t len, const char* tag) {
+    size_t k = strlen(tag) - 1;
+    if (k > len - from) k = len - from;
+    for (; k > 0; k--) {
+        if (memcmp(text + len - k, tag, k) == 0) return k;
+    }
+    return 0;
+}
+
+static void report(vitna_reply_fn fn, void* ctx, vitna_reply_kind_t kind, const char* data, size_t n) {
+    if (n == 0) return;
+    const vitna_reply_part_t part = { kind, data, n, NULL, 0 };
+    fn(ctx, &part);
+}
+
+static void report_newlines(vitna_reply_fn fn, void* ctx, vitna_reply_kind_t kind, size_t n) {
+    static const char nl[] = "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
+    while (n > 0) {
+        const size_t k = n < sizeof(nl) - 1 ? n : sizeof(nl) - 1;
+        report(fn, ctx, kind, nl, k);
+        n -= k;
+    }
+}
+
+/* Bytes of a part, its newlines held back: those before the part's first
+ * other byte are dropped, and the others go out with the next other byte. */
+static void part_bytes(vitna_reply_parser_t* rp, vitna_reply_kind_t kind, const char* s, size_t n, vitna_reply_fn fn, void* ctx) {
+    size_t i = 0;
+    while (i < n) {
+        if (s[i] == '\n') {
+            rp->nl++;
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j < n && s[j] != '\n') j++;
+        if (rp->nl && rp->any_text) report_newlines(fn, ctx, kind, rp->nl);
+        rp->nl = 0;
+        report(fn, ctx, kind, s + i, j - i);
+        rp->any_text = true;
+        i = j;
+    }
+}
+
+static void begin_part(vitna_reply_parser_t* rp) {
+    rp->nl = 0;
+    rp->any_text = false;
+}
+
+static bool is_space(char c) { return c == '\n' || c == ' ' || c == '\t' || c == '\r'; }
+
+/* A tool call's body, between its tags: {"name": ..., "arguments": ...},
+ * reported as a call. False if it is not one. */
+static bool report_call(const char* body, size_t n, vitna_reply_fn fn, void* ctx) {
+    while (n && is_space(body[0])) {
+        body++;
+        n--;
+    }
+    while (n && is_space(body[n - 1])) n--;
+    char err[64];
+    vitna_json_doc_t* doc = vitna_json_parse(body, n, err, sizeof(err));
+    const vitna_json_value_t* call = doc ? vitna_json_root(doc) : NULL;
+    const vitna_json_value_t* name = call && call->type == VITNA_JSON_OBJECT ? vitna_json_get(call, "name") : NULL;
+    if (!name || name->type != VITNA_JSON_STRING || name->u.string.len == 0) {
+        vitna_json_free(doc);
+        return false;
+    }
+    const vitna_json_value_t* args = vitna_json_get(call, "arguments");
+    /* Arguments a model wrote as a string of JSON are the object it holds. */
+    vitna_json_doc_t* inner = NULL;
+    if (args && args->type == VITNA_JSON_STRING) {
+        inner = vitna_json_parse(args->u.string.ptr, args->u.string.len, err, sizeof(err));
+        if (inner && vitna_json_root(inner)->type == VITNA_JSON_OBJECT) args = vitna_json_root(inner);
+    }
+    vitna_strbuf_t a;
+    vitna_sb_init(&a);
+    if (args && !vitna_json_is_null(args)) vitna_json_write_py(&a, args);
+    else vitna_sb_puts(&a, "{}");
+    const vitna_reply_part_t part = { VITNA_REPLY_TOOL_CALL, name->u.string.ptr, name->u.string.len, a.data ? a.data : "{}", a.data ? a.len : 2 };
+    fn(ctx, &part);
+    vitna_sb_free(&a);
+    vitna_json_free(inner);
+    vitna_json_free(doc);
+    return true;
+}
+
+void vitna_reply_feed(vitna_reply_parser_t* rp, const char* text, size_t len, bool final, vitna_reply_fn fn, void* ctx) {
+    for (;;) {
+        const size_t at = rp->at;
+        switch (rp->phase) {
+            case P_START: {
+                const size_t k = sizeof(OPEN_THINK) - 1;
+                if (rp->think && len - at < k && !final && memcmp(text + at, OPEN_THINK, len - at) == 0) return;
+                begin_part(rp);
+                if (rp->think && len - at >= k && memcmp(text + at, OPEN_THINK, k) == 0) {
+                    rp->at += k;
+                    rp->phase = P_REASON;
+                } else {
+                    rp->phase = P_TEXT;
+                }
+                continue;
+            }
+            case P_REASON: {
+                const long c = find_tag(text, at, len, CLOSE_THINK);
+                if (c >= 0) {
+                    part_bytes(rp, VITNA_REPLY_REASONING, text + at, (size_t)c - at, fn, ctx);
+                    rp->at = (size_t)c + sizeof(CLOSE_THINK) - 1;
+                    begin_part(rp);
+                    rp->phase = P_TEXT;
+                    continue;
+                }
+                size_t end = len;
+                if (!final) end -= tag_holdback(text, at, len, CLOSE_THINK);
+                part_bytes(rp, VITNA_REPLY_REASONING, text + at, end - at, fn, ctx);
+                rp->at = end;
+                if (final) rp->phase = P_DONE;
+                return;
+            }
+            case P_TEXT: {
+                const long c = rp->tools ? find_tag(text, at, len, OPEN_CALL) : -1;
+                if (c >= 0) {
+                    part_bytes(rp, VITNA_REPLY_TEXT, text + at, (size_t)c - at, fn, ctx);
+                    rp->nl = 0; /* the newline before a tool call is the template's */
+                    rp->at = (size_t)c + sizeof(OPEN_CALL) - 1;
+                    rp->phase = P_TOOL;
+                    continue;
+                }
+                size_t end = len;
+                if (!final && rp->tools) end -= tag_holdback(text, at, len, OPEN_CALL);
+                part_bytes(rp, VITNA_REPLY_TEXT, text + at, end - at, fn, ctx);
+                rp->at = end;
+                if (final) {
+                    /* A reply's text keeps the newlines it ends with. */
+                    if (rp->nl && rp->any_text) report_newlines(fn, ctx, VITNA_REPLY_TEXT, rp->nl);
+                    rp->nl = 0;
+                    rp->phase = P_DONE;
+                }
+                return;
+            }
+            case P_TOOL: {
+                const long c = find_tag(text, at, len, CLOSE_CALL);
+                if (c < 0) {
+                    if (final) {
+                        /* Never closed: what was written is text. */
+                        part_bytes(rp, VITNA_REPLY_TEXT, OPEN_CALL, sizeof(OPEN_CALL) - 1, fn, ctx);
+                        part_bytes(rp, VITNA_REPLY_TEXT, text + at, len - at, fn, ctx);
+                        if (rp->nl && rp->any_text) report_newlines(fn, ctx, VITNA_REPLY_TEXT, rp->nl);
+                        rp->nl = 0;
+                        rp->at = len;
+                        rp->phase = P_DONE;
+                    }
+                    return;
+                }
+                if (report_call(text + at, (size_t)c - at, fn, ctx)) {
+                    rp->calls++;
+                } else {
+                    part_bytes(rp, VITNA_REPLY_TEXT, OPEN_CALL, sizeof(OPEN_CALL) - 1, fn, ctx);
+                    part_bytes(rp, VITNA_REPLY_TEXT, text + at, (size_t)c - at, fn, ctx);
+                    part_bytes(rp, VITNA_REPLY_TEXT, CLOSE_CALL, sizeof(CLOSE_CALL) - 1, fn, ctx);
+                }
+                rp->at = (size_t)c + sizeof(CLOSE_CALL) - 1;
+                rp->phase = P_AFTER;
+                continue;
+            }
+            case P_AFTER: {
+                size_t i = at;
+                while (i < len && is_space(text[i])) i++;
+                rp->at = i;
+                const size_t k = sizeof(OPEN_CALL) - 1;
+                if (i == len) {
+                    if (final) rp->phase = P_DONE;
+                    return;
+                }
+                if (len - i < k && !final && memcmp(text + i, OPEN_CALL, len - i) == 0) return;
+                if (len - i >= k && memcmp(text + i, OPEN_CALL, k) == 0) {
+                    rp->at = i + k;
+                    rp->phase = P_TOOL;
+                } else {
+                    begin_part(rp);
+                    rp->phase = P_TEXT;
+                }
+                continue;
+            }
+            default:
+                return;
+        }
+    }
+}

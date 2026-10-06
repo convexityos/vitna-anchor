@@ -50,6 +50,53 @@ void vitna_py_float_repr(double x, char* buf, size_t len);
 bool vitna_chat_qwen3(vitna_strbuf_t* out, const vitna_json_value_t* messages, const vitna_json_value_t* tools, int enable_thinking,
                       bool add_generation_prompt, char* err, size_t err_len);
 
+/*
+ * A reply in Qwen3's own format, read back as it is written: its reasoning
+ * between <think> and </think> at the start, then its text, then tool calls,
+ * each <tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>. The
+ * parser is fed the whole reply so far each time it grows, and reports each
+ * part once it is sure of it: it holds back only the end that could still
+ * begin a tag, and the newlines the template strips around the parts (the
+ * reasoning's at both ends, the text's before a tool call and at the end).
+ */
+
+typedef enum {
+    VITNA_REPLY_REASONING,  /* bytes of reasoning */
+    VITNA_REPLY_TEXT,       /* bytes of the reply's text */
+    VITNA_REPLY_TOOL_CALL,  /* a whole tool call: name, and arguments as JSON text (Python's writing of them) */
+} vitna_reply_kind_t;
+
+typedef struct {
+    vitna_reply_kind_t kind;
+    const char* data;       /* REASONING and TEXT: the bytes; TOOL_CALL: the name */
+    size_t len;
+    const char* args;       /* TOOL_CALL: the arguments as JSON text */
+    size_t args_len;
+} vitna_reply_part_t;
+
+typedef void (*vitna_reply_fn)(void* ctx, const vitna_reply_part_t* part);
+
+typedef struct {
+    bool think;             /* the reply may open with <think> */
+    bool tools;             /* <tool_call> blocks are tool calls, not text */
+    int phase;              /* where the parser is (chat.c) */
+    size_t at;              /* bytes of the reply read */
+    size_t nl;              /* newlines read and held back, not yet known to be the part's */
+    bool any_text;          /* text has been reported, so later newlines are not leading ones */
+    size_t calls;           /* tool calls reported */
+} vitna_reply_parser_t;
+
+void vitna_reply_init(vitna_reply_parser_t* rp, bool think, bool tools);
+
+/**
+ * Read the reply so far, text[0..len), from where the last call left off,
+ * calling fn for each part it is now sure of. With final, the reply has
+ * ended: everything held back is reported as what it is, a tool call left
+ * open or one whose JSON is not a call is reported as text, and the
+ * newlines at the ends of the parts are dropped.
+ */
+void vitna_reply_feed(vitna_reply_parser_t* rp, const char* text, size_t len, bool final, vitna_reply_fn fn, void* ctx);
+
 #ifdef __cplusplus
 }
 #endif
