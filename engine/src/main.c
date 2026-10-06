@@ -946,8 +946,9 @@ static int cmd_weights_sha256(const args_t* a) {
         print_matrix(&first, NAMED("self_attn.v_proj.weight"), &L->v, &x);
         print_matrix(&first, NAMED("self_attn.o_proj.weight"), &L->o, &x);
         if (c->qk_norm) {
-            print_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->n_heads * c->head_dim);
-            print_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->n_kv_heads * c->head_dim);
+            /* A head's weights, shared by every head, or all the heads' (model.h). */
+            print_floats(&first, NAMED("self_attn.q_norm.weight"), L->q_norm, c->qk_norm_per_head ? c->head_dim : c->n_heads * c->head_dim);
+            print_floats(&first, NAMED("self_attn.k_norm.weight"), L->k_norm, c->qk_norm_per_head ? c->head_dim : c->n_kv_heads * c->head_dim);
         }
         if (c->n_experts) {
             print_matrix(&first, NAMED("mlp.gate.weight"), &L->router, &x);
