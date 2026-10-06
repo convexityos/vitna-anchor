@@ -114,6 +114,15 @@ test("the model list and health name the served model", A3, async () => {
   assert.equal(health.context, 1024);
 });
 
+test("a model that generates refuses /v1/embeddings, and says what it does instead", A3, async () => {
+  const r = await post("/v1/embeddings", { model: MODEL, input: "hello" });
+  assert.equal(r.status, 404, r.text);
+  assert.equal(r.json.error.code, "model_not_supported");
+  assert.match(r.json.error.message, /generates text and produces no embeddings/);
+  const get = await fetch(base + "/v1/embeddings");
+  assert.equal(get.status, 405);
+});
+
 test("a greedy completion is the reference's greedy output, and usage counts its tokens", A3, async (t) => {
   for (const p of fixture.prompts) {
     const r = await post("/v1/completions", { model: MODEL, prompt: p.text, max_tokens: p.greedy_ids.length, temperature: 0 });

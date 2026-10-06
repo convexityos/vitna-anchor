@@ -45,9 +45,10 @@ NAME = "bge-small-en-v1.5"
 REF = ROOT / "reference" / NAME
 FIXTURE_FORMAT = 1
 
-# The tolerance gate A14 is held to, from reference/compare.mjs. --check holds
-# the reference itself to it on other machines.
-EMBED_ATOL = 1e-4
+# The tolerance gate A14 is held to, from reference/compare.mjs, which says
+# why it is 1e-5 and not the 1e-4 first written here. --check holds the
+# reference itself to it on other machines.
+EMBED_ATOL = 1e-5
 
 # The most tokens the model reads at once: its 512 positions, [CLS] and [SEP]
 # included. An input longer than this is refused here, as the engine refuses it.
@@ -137,7 +138,7 @@ def record_embeddings(model_dir: Path, inputs: dict, allow_other: bool) -> dict:
             "sha256_lf": sha256_text(Path(__file__)),
             "imports": {"script": "reference/record.py", "sha256_lf": sha256_text(Path(record.__file__))},
         },
-        "inputs": {"file": f"reference/{NAME}/inputs.json", "sha256_lf": sha256_text(REF / "inputs.json")},
+        "inputs_file": {"file": f"reference/{NAME}/inputs.json", "sha256_lf": sha256_text(REF / "inputs.json")},
         "model": {
             "repo": model_pin["repo"],
             "revision": model_pin["revision"],
