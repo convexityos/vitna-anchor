@@ -85,6 +85,21 @@ bool vitna_cuda_moe_head(struct vitna_cuda_model* g, float* logits, char* err, s
 /** What the device's expert cache has done so far, in a sentence, for --timing; empty for a dense model. Returns buf. */
 const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, size_t len);
 
+/**
+ * From now on, a step of a mixture of experts shares the experts the device
+ * lacks between the CPU, on threads threads, and copies to the device, while
+ * the device runs those it holds (gate A8): the CPU takes as many as let a
+ * layer finish soonest, by what an expert has cost each lately, the least
+ * used first, and none when copying them all is sooner. The CPU computes
+ * in the GPU's arithmetic (warp.h) and the outputs are added in the
+ * device's order, so every value, the logits among them, is the bits it
+ * would have been, whichever experts ran where.
+ * Rows (vitna_cuda_moe_rows_*) copy in what they lack, as before. False,
+ * with the reason in err, for a dense model or if the memory or the threads
+ * cannot be had.
+ */
+bool vitna_cuda_cpu_experts(struct vitna_cuda_model* g, size_t threads, char* err, size_t err_len);
+
 /*
  * Several rows of a mixture of experts at once, each a token at its position
  * in its sequence (vitna_cuda_row_t), a layer at a time as one token runs
@@ -207,6 +222,17 @@ void vitna_cuda_free(struct vitna_cuda_model* g);
  * matrix seen so far.
  */
 bool vitna_cuda_widen(const vitna_matrix_t* m, float* out, char* err, size_t err_len);
+
+/**
+ * Run one expert on the GPU as a step runs a mixture's experts, for
+ * checking the CPU's copy of that arithmetic (warp.h): x through RMSNorm
+ * with norm_w into xs, then the expert's gate and up projections and
+ * activation into act (gate->rows floats), then its down projection into y
+ * (gate->cols floats), by the kernels a step uses. Copies the expert to the
+ * device and back.
+ */
+bool vitna_cuda_expert_check(const vitna_matrix_t* gate, const vitna_matrix_t* up, const vitna_matrix_t* down, const float* norm_w,
+                             const float* x, float eps, float* xs, float* act, float* y, char* err, size_t err_len);
 
 #ifdef __cplusplus
 }

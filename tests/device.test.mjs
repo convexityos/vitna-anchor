@@ -74,6 +74,23 @@ test("--gpu-expert-cache is refused without --device cuda, before anything is lo
   }
 });
 
+test("--cpu-experts is refused without --device cuda, and with no threads, before anything is loaded", { skip }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "vitna-device-"));
+  try {
+    const base = ["logits", "--model", join(dir, "no-model"), "--ids", "1", "--out", join(dir, "logits.f32")];
+    let r = run([...base, "--cpu-experts", "4"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--cpu-experts runs experts on the CPU beside the GPU, and needs --device cuda/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+    r = run([...base, "--device", "cuda", "--cpu-experts", "0"]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /--cpu-experts takes the threads to run experts on, 1 or more/);
+    assert.doesNotMatch(r.stderr, /cannot read/, "refused before loading anything");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("--device cpu is accepted, and the engine goes on to load the model", { skip }, () => {
   const r = logitsOn("cpu");
   assert.notEqual(r.status, 0, "there is no model to load");

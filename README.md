@@ -39,7 +39,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 |---|---|---|
 | Llama forward pass in float32: embeddings, RMSNorm, grouped-query attention over a key-value cache, half-split rotary embeddings, SwiGLU MLP, tied output layer | `engine/src/model.c`, `engine/src/ops.c` | Matches the reference: every compared logit within the stated tolerance of 1e-2, and 192 of 192 greedy tokens equal. The largest difference on the machine that recorded the reference was 2.2e-4 |
 | The same forward pass on an NVIDIA GPU, in float32: five fused kernels a layer, attention split across blocks by position, and each token a replay of CUDA graphs; the weights uploaded once, the key-value cache on the device, logits copied back only when a step asks for them | `engine/src/model_cuda.cu` | Matches the reference on one GPU, checked by hand: every compared logit within 1e-2, the largest difference 2.25e-4, and 192 of 192 greedy tokens equal. CI compiles it and does not run it |
-| OLMoE's mixture of experts in float32: an RMSNorm over all of each query and key projection, a router over 64 experts, the 8 with the largest weights each a SwiGLU MLP, weighted by the router's softmax without renormalizing; a checkpoint in shards, read through its index | `engine/src/model.c` | Matches its reference on the CPU, checked by hand: with every token's experts pinned to the reference's, every compared logit within the tolerance of 1e-2, the largest difference 4.96e-5, and 192 of 192 greedy tokens equal; the engine's own router chose the reference's experts in all 6,848 decisions, and unpinned it decodes the same 192 tokens. On the GPU too, checked by hand: the largest difference 4.77e-5, 192 of 192 greedy tokens equal pinned and unpinned, and the router the reference's in every decision. CI does not run it: the weights are 13.8 GB |
+| OLMoE's mixture of experts in float32: an RMSNorm over all of each query and key projection, a router over 64 experts, the 8 with the largest weights each a SwiGLU MLP, weighted by the router's softmax without renormalizing; a checkpoint in shards, read through its index | `engine/src/model.c` | Matches its reference on the CPU, checked by hand: with every token's experts pinned to the reference's, every compared logit within the tolerance of 1e-2, the largest difference 4.96e-5, and 192 of 192 greedy tokens equal; the engine's own router chose the reference's experts in all 6,848 decisions, and unpinned it decodes the same 192 tokens. On the GPU too, checked by hand: the largest difference 6.29e-5 (4.77e-5 before gate A8 changed how the GPU computes the experts' activation), 192 of 192 greedy tokens equal pinned and unpinned, and the router the reference's in every decision. CI does not run it: the weights are 13.8 GB |
 | Byte-level BPE tokenizer read from `tokenizer.json`, with NFC normalization and added tokens matched before and after it, as the tokenizers library does | `engine/src/tokenizer.c`, `engine/src/unicode.c` | Matches each model's own `tokenizer.json` on all of its reference strings, 48 for SmolLM2 and 60 for OLMoE, both in CI. Tested on vocabularies worked by hand. NFC equals Python's `unicodedata` (Unicode 15.0, where the tables come from) on every code point and 1.2 million random strings of marks, composites and jamo (`engine/tools/check_nfc.py`). Refuses tokenizer features it does not implement |
 | Greedy decoding and seeded temperature, top-k and top-p sampling | `engine/src/sampler.c` | Greedy matches the reference. Sampling is tested for its proportions and its seed |
 | Float32 matrix-vector product over F32, BF16 or F16 weights, with scalar, AVX2 and NEON paths | `engine/src/ops.c` | Tested against double precision |
@@ -47,6 +47,7 @@ Each gate has a pass condition that a test checks. Nothing is claimed here, in t
 | GGUF reader in C (versions 2 and 3): the file's tensors listed under the names a Hugging Face checkpoint gives them, each expert of a stack as a tensor of its own, and its metadata checked against `config.json` | `engine/src/gguf.c`, `engine/src/model.c` | Tested on files made for the test: names, shapes, slices of a stack, and refusals of a permuted Llama file, an unknown tensor, an unknown type, a misaligned or out-of-range offset, a duplicate, a truncated file and another format. Reads OLMoE's official GGUF files ([below](#quantized-weights-from-a-gguf-file)) |
 | ggml's Q8_0, Q4_K and Q6_K block formats widened to float32, in gguf-py's arithmetic, and matrix-vector products over them on the CPU | `engine/src/quant.c`, `engine/src/ops.c` | Tested on blocks built from the layout by hand; a quantized matrix multiplies as its widened float32 rows do, bit for bit. Every tensor of OLMoE's Q8_0 and Q4_K_M files widens to the bits gguf-py gives, checked by digest |
 | The same block formats on an NVIDIA GPU: each kernel instantiated for the dtype of each matrix it reads, so a file that keeps some matrices at more bits than others (Q4_K_M's Q6_K value and down projections) runs as stored, and the expert cache's slots sized for the largest layer's experts | `engine/src/model_cuda.cu` | Checked by hand on one GPU: every tensor of both files widens to gguf-py's bits there too, read each of the three ways the kernels read weights (eight at a time, four, and one), which must agree. The model then matches the same fixtures as on the CPU ([below](#quantized-weights-from-a-gguf-file)). CI compiles it and does not run it |
+| A mixture of experts on the GPU with the CPU beside it (`--cpu-experts`): the experts the GPU lacks shared between copies to it and CPU threads, by what each costs as measured, the CPU computing each row in the GPU kernel's order and the activation in arithmetic both devices round alike, and every output added in the GPU's order | `engine/src/warp.c`, `engine/src/exact.c`, `engine/src/pool.c`, `engine/src/model_cuda.cu` | Checked by hand on one GPU: `expert-check` gives the same activations and outputs on both devices, byte for byte, for all 1,024 experts in BF16, Q8_0 and Q4_K_M, and with the CPU beside it the logits are the GPU alone's, byte for byte, at every cache size tried, from the mapped file and from a cache in memory. The unit tests, which CI runs, check the CPU's order and its threads. How fast it runs was measured ([below](#speed-with-the-cpu-beside-the-gpu)) |
 | RMSNorm and SwiGLU | `engine/src/kernels.c` | Tested against double precision. RMSNorm is used by the forward pass |
 | int2/3/4/8 matrix-vector products, with scalar, AVX2 and NEON paths | `engine/src/kernels.c` | Tested against their documented packing formats. No model uses them yet |
 | Interleaved rotary position embedding | `engine/src/kv_cache.c` | Tested against its formula. Unused: Hugging Face Llama checkpoints need the half-split form in `ops.c` |
@@ -136,6 +137,13 @@ With `--device cuda`, in an engine built with the CUDA path, OLMoE runs on the G
 ./engine/vitna-anchor generate --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 32 --greedy --timing --device cuda
 ```
 
+With `--cpu-experts <threads>` as well (gate A8), the experts a token wants that the GPU lacks no longer all wait to be copied in. The GPU starts on the experts it holds; of those it lacks, some are copied in and run there, and the CPU runs the rest from memory at the same time, on that many threads. How many go each way follows what an expert has cost each side lately, measured as they run: the CPU takes as many as let the layer finish soonest, none when copying them all is sooner, and the least used ones, so that the experts copied, which then stay on the GPU, are the ones most worth keeping. A side left out for 64 layers is given one expert, so that neither cost goes stale. The CPU computes an expert in the GPU's own arithmetic: each row's sum in the order a warp adds it, 32 lanes of eight-weight chunks and then the warp's tree (`engine/src/warp.c`), and the activation's `exp` in operations both devices round alike (`engine/src/exact.c`), since CUDA's `expf` ends in a hardware approximation no CPU reproduces. The GPU then weights and adds every expert's output in the order it adds its own, so the logits are the GPU alone's, bit for bit, whichever experts ran where. Tokens that run together as rows (a prompt's, drafted ones, requests at once) still copy in what they lack: this is for decoding a token at a time. `expert-check` runs experts on both devices and compares what they give:
+
+```bash
+./engine/vitna-anchor generate --model models/olmoe-1b-7b --prompt "The capital of France is" --max-new 32 --greedy --timing --device cuda --gpu-expert-cache 1024 --cpu-experts 8
+./engine/vitna-anchor expert-check --model models/olmoe-1b-7b --device cuda --count 1024
+```
+
 ### Quantized weights from a GGUF file
 
 With `--weights <file.gguf>`, the weights come from a GGUF file rather than the model directory's SafeTensors files, and may be quantized: Q8_0, Q4_K and Q6_K, as llama.cpp writes them, beside F32, F16 and BF16. `--model` still gives `config.json`, which the file's metadata must agree with, and the tokenizer. A quantized weight is widened to float32 as it is used, block by block, to the bits gguf-py's `dequantize` gives, and the arithmetic after that is the same as for a float32 checkpoint. On the CPU and, in an engine built with the CUDA path, with `--device cuda` on the GPU, which widens to the same bits and keeps the experts in their stored format in its cache, so that more of them fit and each copy is smaller.
@@ -160,6 +168,7 @@ node scripts/fetch-model.mjs olmoe-1b-7b-gguf          # OLMoE's own Q8_0 and Q4
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
 | `read-experts --model <dir> [--expert-cache <MiB>]` | Reads every expert of a mixture once from the drive, as `--expert-cache` reads them, computing nothing, and says how fast |
 | `weights-sha256 --model <dir> [--weights <file.gguf>]` | Prints, as JSON, the SHA-256 of every tensor's values widened to float32, under its Hugging Face name, each layer's experts together under the name of their stack |
+| `expert-check --model <dir> --device cuda [--weights <file.gguf>] [--count <n>]` | Runs n experts of a mixture (64 by default, spread over the layers; layers times experts takes every one) on the GPU and on the CPU in the GPU's arithmetic, for residuals it makes up, and prints, as JSON, how many gave the same activations and outputs, byte for byte; exits 1 if any differs |
 
 `run`, `generate`, `logits` and `serve` run the model on the CPU unless given `--device cuda`, which runs it on the first CUDA device, in an engine built with the CUDA path. Decoding is greedy unless `--temperature <t>` is given, with optional `--top-k`, `--top-p` and `--seed`. The model directory needs `config.json`, `tokenizer.json`, and `model.safetensors` or the shards `model.safetensors.index.json` names, each tensor of which must be in the shard it names. A config that asks for something the engine does not implement is refused on load, and the error says what it was: rope scaling, attention or MLP biases, another activation, clipped query, key and value activations, or expert weights renormalized over those a token uses.
 
@@ -314,6 +323,8 @@ All fifteen tests passed, in 463 s with the engines run one at a time, against t
 
 Checked again at the merge of [#35](https://github.com/convexityos/vitna-anchor/pull/35), which followed [#33](https://github.com/convexityos/vitna-anchor/pull/33)'s change to how a failed step on the GPU is handled, on a tree identical to main's after it (tree `59cc9ed`), on the same machine, with both engines built as above and `VITNA_REQUIRE_REFERENCE=1` added: the whole suite on the CPU passed 77 of its 81 tests, the other 4 needing a GPU; on the GPU, `tests/reference-moe.test.mjs` alone passed 15 of 15 with the figures above, and the whole suite 71 of 81, the other 10 skipped: the OLMoE file's 8 that need a model on the device, which on a GPU run only when `VITNA_REQUIRE_MOE=1` asks for them, and 2 that need an engine without the CUDA path or a machine without a GPU.
 
+Checked again on 2026-10-05, on the same machine, after gate A8 changed how the GPU computes the experts' activation. CUDA's `expf` ends in a hardware approximation no CPU reproduces, so the experts' SiLU on the GPU now takes `exp` in operations both devices round alike (`engine/src/exact.c`, within 3 ulp of the true value), which the CPU can then repeat bit for bit (see [below](#speed-with-the-cpu-beside-the-gpu)). The dense path and the CPU path keep the library's `expf`. `tests/reference-moe.test.mjs` passed 17 of 17 on the GPU, its seventeenth A8's. With the experts pinned, the largest logit difference was 6.29e-5, and 3.67e-5 for logsumexp; the router logits differed by at most 3.15e-5, and the router chose the reference's experts in all 3,872 decisions at the prompts' positions. Greedy decoding with the experts pinned gave 192 of 192 tokens equal, the top logits at each step within 2.29e-5, and unpinned the routing was the reference's throughout and it decoded the same 192 tokens.
+
 ## Speed with the experts read from a drive
 
 Measured on 2026-10-01 on the machine above: AMD Ryzen 7 3700X, 64 GB of memory, Windows 11, the engine built by MSVC 19.44 through CMake, and the model on a Crucial P5 500 GB (CT500P5SSD8), an NVMe drive. One thread computes; four read. The commands:
@@ -407,6 +418,40 @@ On the CPU, one thread computing and every weight read through the operating sys
 | Q4_K_M | 1,140.1 | 0.88 |
 
 The CPU path is slower on quantized weights than on BF16: it widens each block to float32 with a scalar loop before the multiply-adds, and that loop, not reading the weights, is what a token costs. Vectorizing it is the next step on the CPU.
+
+Gate A8 then widened the blocks eight weights at a time with AVX2, to the same bits (`engine/src/quant.c`). The same command later the same day, at commit `5b0ee04`:
+
+| Weights | ms a token | Tokens a second |
+|---|---|---|
+| BF16 | 140.1 | 7.14 |
+| Q8_0 | 384.8 | 2.60 |
+| Q4_K_M | 326.9 | 3.06 |
+
+Q4_K_M is 3.5 times as fast as before, and Q8_0 1.26 times. BF16's path did not change in between, so its move from 187.5 to 140.1 is the machine's: other programs kept the CPU busy to different degrees in the two runs, and a single-threaded figure here moves that much with them.
+
+## Speed with the CPU beside the GPU
+
+Measured on 2026-10-05 on the same machine and GPU, the engine built as for gate A4 at commit `5b0ee04`. The machine's 64 GB is a DDR4-3200 kit running at 2133 MT/s, two channels: about 34 GB/s in theory, for the CPU and the GPU's copies together. Other programs kept the CPU 8% to 34% busy. The command, with each `--weights` and without it:
+
+```powershell
+node scripts/bench-experts.mjs --device cuda --tokens 64 --runs 5 --gpu-caches default,2048,1024 --cpu-experts 0,4,8 [--weights models/olmoe-1b-7b-gguf/<file>]
+```
+
+The same 64 greedy tokens after "The capital of France is", the median of the 63 steps timed, five runs at each size of the GPU's cache, with the experts it lacks copied in (the GPU alone) and with `--cpu-experts` at 4 and at 8 threads. In brackets, the share of the experts a step wanted that the CPU ran; the logits are the same in every column, byte for byte.
+
+| Weights | Cache on the GPU | GPU alone, ms a token | 4 CPU threads | 8 CPU threads |
+|---|---|---|---|---|
+| BF16 | 5,460 MiB, what the device allowed | 16.3 | 15.0 (2%) | 15.8 (2%) |
+| BF16 | 2,040 MiB | 37.7 | 33.5 (10%) | 36.1 (9%) |
+| BF16 | 1,020 MiB | 48.1 | 44.6 (12%) | 43.8 (12%) |
+| Q8_0 | 5,884 MiB, what the device allowed | 5.9 | 5.8 (0%) | 6.3 (0%) |
+| Q8_0 | 2,046 MiB | 14.2 | 12.9 (1%) | 12.5 (2%) |
+| Q8_0 | 1,020 MiB | 21.2 | 21.0 (3%) | 21.1 (6%) |
+| Q4_K_M | 3,984 MiB, every expert | 4.7 | 4.7 (0%) | 4.7 (0%) |
+| Q4_K_M | 2,046 MiB | 6.0 | 6.2 (0%) | 5.9 (0%) |
+| Q4_K_M | 1,023 MiB | 9.9 | 10.1 (0%) | 10.0 (0%) |
+
+The CPU helps where copies are most of a token: BF16 with a cache of 1 to 2 GiB on the GPU decodes 4% to 11% faster, and Q8_0 at 2 GiB 9% to 12%. At Q4_K_M it does nothing, and the scheduler knows it: it gives the CPU an expert only to measure it again. On this machine an expert costs the CPU more than a copy does. The engine measured a GiB of BF16 experts at 65 to 96 ms on the CPU against 42 to 47 ms over the bus, and a GiB of Q4_K_M experts at 157 to 249 ms against 44 or 45, since the CPU widens each block before it multiplies. So the CPU can only take a share of a layer's misses while the bus carries the rest, and both draw on the same memory, of which the copies alone read 23 to 26 GB/s. Strata's premise, that a missing expert costs less as a read from memory than as a copy over the bus, needs memory that reads well beyond what the bus carries, and this machine's reads little more. On one whose memory does, the same scheduler would give the CPU more, since it follows the costs it measures. The rows a prompt runs together copy in what they lack, with or without the CPU.
 
 ## Measurements
 

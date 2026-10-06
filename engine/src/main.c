@@ -18,6 +18,7 @@
 #include "server.h"
 #include "strbuf.h"
 #include "tokenizer.h"
+#include "warp.h"
 
 #if defined(VITNA_OS_WINDOWS)
   #include <fcntl.h>
@@ -55,7 +56,8 @@ static void print_usage(const char* prog) {
     printf("  %s info     --model <file.safetensors>\n", prog);
     printf("  %s bench    [--iterations <n>]\n", prog);
     printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n", prog);
-    printf("  %s weights-sha256 --model <dir> [--weights <file.gguf>]\n\n", prog);
+    printf("  %s weights-sha256 --model <dir> [--weights <file.gguf>]\n", prog);
+    printf("  %s expert-check --model <dir> [--weights <file.gguf>] --device cuda [--count <n>]\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
     printf("--weights <file.gguf> reads the weights from a GGUF file, which may be quantized (Q8_0, Q4_K, Q6_K), rather\n");
@@ -69,7 +71,11 @@ static void print_usage(const char* prog) {
     printf("--gpu-expert-cache <MiB>, with --device cuda, is how much of the GPU holds a mixture of experts' experts, each\n");
     printf("copied in when a layer wants it, from --expert-cache's cache or else the mapped checkpoint (default: what\n");
     printf("the GPU has free once the rest of the model is there, less 512 MiB); the logits are the same, bit for bit,\n");
-    printf("whatever its size.\n\n");
+    printf("whatever its size.\n");
+    printf("--cpu-experts <threads>, with --device cuda, shares a step's experts that the GPU lacks between that many CPU\n");
+    printf("threads and copies to the GPU, as many to the CPU as let a layer finish soonest by what each has cost\n");
+    printf("lately, and none when copying is sooner, while the GPU runs those it holds. The CPU computes in the GPU's\n");
+    printf("order, so the logits are the same, bit for bit.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
@@ -127,7 +133,9 @@ typedef struct {
     size_t ctx;
     size_t expert_cache_mib; /* read a mixture of experts' experts from the drive into a cache this large */
     size_t gpu_expert_cache_mib; /* --device cuda: the GPU memory that holds a mixture of experts' experts */
+    size_t cpu_experts;  /* --device cuda: CPU threads that run the experts the GPU lacks; 0, they are copied in */
     int iterations;
+    size_t count;        /* --count: experts expert-check runs */
     uint16_t port;
     bool stop_at_special;
     bool no_prefix_cache;
@@ -177,12 +185,20 @@ static bool parse_args(int argc, char** argv, args_t* a) {
             a->gpu_expert_cache_mib = (size_t)strtoull(v, NULL, 10);
             if (a->gpu_expert_cache_mib == 0) a->gpu_expert_cache_mib = 1; /* refused on load as too small, not taken as the default */
         }
+        else if (TAKE("--cpu-experts")) {
+            a->cpu_experts = (size_t)strtoull(v, NULL, 10);
+            if (a->cpu_experts == 0) {
+                fprintf(stderr, "--cpu-experts takes the threads to run experts on, 1 or more\n");
+                return false;
+            }
+        }
         else if (TAKE("--threads")) {
             a->threads = (size_t)strtoull(v, NULL, 10);
             if (a->threads == 0) a->threads = SIZE_MAX; /* refused where it is used, not taken as the default */
         }
         else if (TAKE("--pooling")) a->pooling = v;
         else if (TAKE("--iterations")) a->iterations = atoi(v);
+        else if (TAKE("--count")) a->count = (size_t)strtoull(v, NULL, 10);
         else if (TAKE("--port")) a->port = (uint16_t)atoi(v);
         else if (TAKE("--temperature")) a->sampling.temperature = (float)atof(v);
         else if (TAKE("--top-k")) a->sampling.top_k = (size_t)strtoull(v, NULL, 10);
@@ -560,6 +576,11 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
      * experts copies its experts there from the cache above, if there is one. */
     if (wants_cuda(a) && !vitna_llama_use_cuda(m, a->gpu_expert_cache_mib << 20, err, sizeof(err))) {
         fprintf(stderr, "--device cuda: %s\n", err);
+        vitna_llama_free(m);
+        return false;
+    }
+    if (a->cpu_experts && !vitna_llama_cpu_experts(m, a->cpu_experts, err, sizeof(err))) {
+        fprintf(stderr, "--cpu-experts: %s\n", err);
         vitna_llama_free(m);
         return false;
     }
@@ -1127,6 +1148,80 @@ static int cmd_weights_sha256(const args_t* a) {
     return x.failed ? 1 : 0;
 }
 
+/* expert-check: experts of a mixture run on the GPU as a step runs them and
+ * on the CPU in the GPU's order (warp.h), for residuals made up here, with
+ * the normalized input the GPU computed; the activations and the outputs
+ * must be the same bits. --count experts (64 by default), spread over the
+ * layers; layers times experts takes every one. Prints JSON, and exits 1 if
+ * any differs. */
+static int cmd_expert_check(const args_t* a) {
+    if (!a->model) { fprintf(stderr, "--model <dir> is required\n"); return 1; }
+    if (!a->device || strcmp(a->device, "cuda") != 0) { fprintf(stderr, "expert-check compares the CPU with the GPU: --device cuda is required\n"); return 1; }
+    args_t on_cpu = *a;
+    on_cpu.device = NULL;
+    vitna_llama_t m;
+    if (!load_model(&on_cpu, &m)) return 1;
+    const vitna_llama_config_t* c = &m.cfg;
+    if (!c->n_experts) { vitna_llama_free(&m); fprintf(stderr, "this model has no experts\n"); return 1; }
+    const size_t H = c->hidden, I = c->intermediate, n = a->count ? a->count : 64;
+    float* x = (float*)malloc(H * sizeof(float));
+    float* xs = (float*)malloc(H * sizeof(float));
+    float* act = (float*)malloc(I * sizeof(float));
+    float* y = (float*)malloc(H * sizeof(float));
+    float* mine = (float*)malloc((H + 2 * I) * sizeof(float));
+    int status = 0;
+    size_t act_equal = 0, y_equal = 0;
+    if (!x || !xs || !act || !y || !mine) { fprintf(stderr, "out of memory\n"); status = 1; }
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; status == 0 && i < n; i++) {
+        /* Layer after layer, and in each an odd stride through the experts,
+         * so that layers times experts checks take every expert once. */
+        const size_t l = i % c->n_layers, e = ((i / c->n_layers) * 37) % c->n_experts;
+        /* A residual of a plausible size, the same every run. */
+        for (size_t j = 0; j < H; j++) {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            x[j] = (float)((double)(rng >> 40) / (double)(1ull << 24) * 4.0 - 2.0);
+        }
+        char err[512];
+        if (!vitna_llama_expert_on_gpu(&m, l, e, x, xs, act, y, err, sizeof(err))) {
+            fprintf(stderr, "--device cuda: %s\n", err);
+            status = 1;
+            break;
+        }
+        const vitna_expert_t* ex = &m.layers[l].experts[e];
+        if (!vitna_warp_expert(ex->gate.data, ex->up.data, ex->down.data, ex->gate.dtype, ex->down.dtype, H, I, xs, mine, mine + H)) {
+            fprintf(stderr, "out of memory\n");
+            status = 1;
+            break;
+        }
+        const bool a_ok = memcmp(mine + H, act, I * sizeof(float)) == 0;
+        const bool y_ok = memcmp(mine, y, H * sizeof(float)) == 0;
+        act_equal += a_ok;
+        y_equal += y_ok;
+        if (!a_ok || !y_ok) {
+            size_t at = 0;
+            while (at < H && mine[at] == y[at]) at++;
+            fprintf(stderr, "layer %zu expert %zu: the CPU's %s differs from the GPU's%s\n", l, e, a_ok ? "output" : "activation",
+                    a_ok ? "" : " (and so its output)");
+            if (a_ok && at < H) fprintf(stderr, "  first at %zu: %.9g on the CPU, %.9g on the GPU\n", at, mine[at], y[at]);
+        }
+    }
+    if (status == 0) {
+        printf("{\"experts\": %zu, \"activations_equal\": %zu, \"outputs_equal\": %zu, \"cpu_path\": \"%s\"}\n", n, act_equal, y_equal,
+               vitna_warp_path(H));
+        if (act_equal != n || y_equal != n) status = 1;
+    }
+    free(x);
+    free(xs);
+    free(act);
+    free(y);
+    free(mine);
+    vitna_llama_free(&m);
+    return status;
+}
+
 /* read-experts: every expert of a mixture read once through the expert
  * cache, with nothing computed: how fast this drive feeds --expert-cache. */
 static int cmd_read_experts(const args_t* a) {
@@ -1337,6 +1432,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "--gpu-expert-cache needs --device cuda\n");
         return 1;
     }
+    if (a.cpu_experts && !wants_cuda(&a)) {
+        fprintf(stderr, "--cpu-experts runs experts on the CPU beside the GPU, and needs --device cuda\n");
+        return 1;
+    }
     if (a.device && strcmp(a.device, "cpu") != 0) {
         char err[512];
         if (!wants_cuda(&a)) {
@@ -1359,6 +1458,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "bench") == 0) return cmd_bench(a.iterations);
     if (strcmp(cmd, "read-experts") == 0) return cmd_read_experts(&a);
     if (strcmp(cmd, "weights-sha256") == 0) return cmd_weights_sha256(&a);
+    if (strcmp(cmd, "expert-check") == 0) return cmd_expert_check(&a);
     if (strcmp(cmd, "serve") == 0) return cmd_serve(&a);
     print_usage(argv[0]);
     return 1;

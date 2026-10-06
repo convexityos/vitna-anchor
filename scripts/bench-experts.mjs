@@ -5,7 +5,7 @@
 //
 //   node scripts/bench-experts.mjs [--engine <path>] [--model <dir>] [--weights <file.gguf>] [--prompt <text>]
 //                                  [--tokens <n>] [--runs <n>] [--caches <MiB,MiB,...>] [--no-mapped]
-//                                  [--device cpu|cuda] [--gpu-caches <MiB|default,...>]
+//                                  [--device cpu|cuda] [--gpu-caches <MiB|default,...>] [--cpu-experts <threads,...>]
 //
 // --weights reads the weights from a GGUF file, which may be quantized, as
 // the engine's own --weights does; the drive named is then that file's.
@@ -25,7 +25,10 @@
 // 2048 and 1024 MiB), from the mapped checkpoint and, for each size
 // --caches names (none by default on the GPU), from a cache that size in
 // memory. The GPU's cache starts empty in every run too. Loading, which
-// registers the memory the copies come from, is not timed.
+// registers the memory the copies come from, is not timed. --cpu-experts
+// times each of those again with the engine's --cpu-experts at each thread
+// count it names, 0 meaning without it (default: 0 alone): the experts the
+// GPU lacks shared between the CPU and copies (gate A8).
 //
 // What it prints was measured on the machine and the drive it ran on, with
 // that engine build, and says nothing about another. Zero external dependencies.
@@ -56,6 +59,7 @@ const runs = Number(option("--runs", "3"));
 const caches = list(option("--caches", gpu ? "" : "512,1024,2048,4096,8192,16384")).map(Number);
 const gpuCaches = gpu ? list(option("--gpu-caches", "default,4096,2048,1024")).map((c) => (c === "default" ? 0 : Number(c))) : [null];
 const mapped = !process.argv.includes("--no-mapped");
+const cpuThreads = gpu ? list(option("--cpu-experts", "0")).map(Number) : [0];
 const engine = resolve(
   option("--engine", "") ||
     [
@@ -71,15 +75,17 @@ if (!existsSync(engine)) throw new Error("no built engine found; pass --engine <
 if (!Number.isInteger(tokens) || tokens < 2 || !Number.isInteger(runs) || runs < 1) throw new Error("--tokens must be at least 2, and --runs at least 1");
 if (caches.some((c) => !Number.isInteger(c) || c < 1)) throw new Error("--caches is a list of sizes in MiB");
 if (gpu && gpuCaches.some((c) => !Number.isInteger(c) || c < 0)) throw new Error("--gpu-caches is a list of sizes in MiB, or default");
+if (cpuThreads.some((c) => !Number.isInteger(c) || c < 0)) throw new Error("--cpu-experts is a list of thread counts, 0 for none");
 
 const base = ["generate", "--model", model, ...(weights ? ["--weights", weights] : []), "--prompt", prompt, "--max-new", String(tokens),
   "--greedy", "--timing", "--ctx", "512", ...(gpu ? ["--device", "cuda"] : [])];
 
 const num = (s) => Number(s);
-function once(cache, gpuCache) {
+function once(cache, gpuCache, threads = 0) {
   const args = [...base];
   if (cache) args.push("--expert-cache", String(cache));
   if (gpuCache) args.push("--gpu-expert-cache", String(gpuCache));
+  if (threads) args.push("--cpu-experts", String(threads));
   const r = spawnSync(engine, args, { encoding: "utf8", maxBuffer: 1 << 26 });
   if (r.status !== 0) throw new Error(`${engine} exited ${r.status}: ${r.stderr}`);
   const t = r.stderr.match(/timing: (\d+) prompt tokens in [\d.]+ ms; (\d+) tokens after the first new one in [\d.]+ ms, ([\d.]+) ms each/);
@@ -99,7 +105,7 @@ function once(cache, gpuCache) {
     run.lookahead = num(e[12]);
   }
   const g = r.stderr.match(
-    /experts on the GPU: (\d+) slots, (\d+) MiB, copied from [^.]+\. (\d+) acquired: (\d+) already on the GPU, (\d+) still being copied for a guess, (\d+) copied when asked for\. (\d+) copied for a guess, (\d+) of those used\. ([\d.]+) MiB copied in (\d+) copies\. The lookahead named ([\d.]+)%/,
+    /experts on the GPU: (\d+) slots, (\d+) MiB, copied from [^.]+\. (\d+) acquired: (\d+) already on the GPU, (\d+) still being copied for a guess, (\d+) copied when asked for\. (\d+) copied for a guess, (\d+) of those used\. ([\d.]+) MiB copied in (\d+) copies(?:\. In steps, (\d+) of those the GPU lacked ran on the CPU, on \d+ threads, in \d+ ms; lately a GiB of experts cost the CPU (\d+) ms and a copy (\d+) ms)?\. The lookahead named ([\d.]+)%/,
   );
   if (gpu && !g) throw new Error(`no GPU expert report in: ${r.stderr}`);
   if (g) {
@@ -112,7 +118,10 @@ function once(cache, gpuCache) {
       guessed: num(g[7]),
       guessUsed: num(g[8]),
       copiedMib: num(g[9]),
-      lookahead: num(g[11]),
+      onCpu: g[11] ? num(g[11]) : 0,
+      cpuMsGiB: g[12] ? num(g[12]) : 0,
+      copyMsGiB: g[13] ? num(g[13]) : 0,
+      lookahead: num(g[14]),
     };
   }
   return run;
@@ -149,7 +158,7 @@ function gpuName() {
 }
 
 console.log(`engine:  ${engine}`);
-console.log(`command: ${[engine, ...base].join(" ")} [--expert-cache <MiB>]${gpu ? " [--gpu-expert-cache <MiB>]" : ""}`);
+console.log(`command: ${[engine, ...base].join(" ")} [--expert-cache <MiB>]${gpu ? " [--gpu-expert-cache <MiB>] [--cpu-experts <threads>]" : ""}`);
 console.log(`machine: ${cpus()[0].model.trim()}, ${Math.round(totalmem() / 2 ** 30)} GiB, ${type()} ${release()}`);
 if (gpu) console.log(`GPU:     ${gpuName()}`);
 console.log(`drive:   ${drive()}`);
@@ -196,13 +205,16 @@ if (!gpu) {
   if (mapped) once(null, gpuCaches[0]); // warm the file cache, thrown away
   const rows = [];
   for (const cache of sources) {
-    for (const gpuCache of gpuCaches) {
-      const mid = medianRun(Array.from({ length: runs }, () => once(cache, gpuCache)));
+    for (const gpuCache of gpuCaches) for (const threads of cpuThreads) {
+      const mid = medianRun(Array.from({ length: runs }, () => once(cache, gpuCache, threads)));
       const positions = mid.prompt + mid.steps;
       const g = mid.gpu;
       rows.push({
         source: cache ? `${cache} MiB` : "mapped",
         gpuCache: `${g.mib} MiB, ${g.slots}`,
+        threads: threads ? String(threads) : "-",
+        onCpu: (100 * g.onCpu) / g.acquired,
+        costs: threads ? `${g.cpuMsGiB}/${g.copyMsGiB}` : "",
         ms: mid.ms,
         onGpu: (100 * g.onGpu) / g.acquired,
         inFlight: (100 * g.inFlight) / g.acquired,
@@ -212,17 +224,20 @@ if (!gpu) {
       });
     }
   }
-  console.log("from     GPU cache, slots   ms/token  tokens/s  on the GPU  in flight  MiB copied/position  guesses used  lookahead");
+  console.log("from     GPU cache, slots   CPU   ms/token  tokens/s  on the GPU  in flight  on the CPU  ms/GiB CPU/copy  MiB copied/position  guesses used  lookahead");
   for (const r of rows) {
     console.log(
-      `${r.source.padEnd(8)} ${r.gpuCache.padEnd(17)} ${r.ms.toFixed(1).padStart(9)} ${(1000 / r.ms).toFixed(2).padStart(9)} ` +
-        `${r.onGpu.toFixed(0).padStart(10)}% ${r.inFlight.toFixed(0).padStart(9)}% ${r.copiedPerPosition.toFixed(1).padStart(20)} ` +
+      `${r.source.padEnd(8)} ${r.gpuCache.padEnd(17)} ${r.threads.padStart(3)} ${r.ms.toFixed(1).padStart(10)} ${(1000 / r.ms).toFixed(2).padStart(9)} ` +
+        `${r.onGpu.toFixed(0).padStart(10)}% ${r.inFlight.toFixed(0).padStart(9)}% ${r.onCpu.toFixed(0).padStart(10)}% ${r.costs.padStart(16)} ` +
+        `${r.copiedPerPosition.toFixed(1).padStart(20)} ` +
         `${r.guessUsed.toFixed(0).padStart(12)}% ${r.lookahead.toFixed(1).padStart(9)}%`,
     );
   }
   console.log("");
   console.log("from: where the GPU copies its experts from, the mapped checkpoint or an --expert-cache that size in memory.");
   console.log("on the GPU: experts a layer wanted that its cache held already; in flight: still being copied for a guess then.");
+  console.log("CPU: --cpu-experts threads; on the CPU: experts a step ran there, of all acquired; ms/GiB CPU/copy: what a GiB of");
+  console.log("experts lately cost the CPU and a copy, as the engine measured them to share the experts the GPU lacked.");
   console.log("MiB copied/position covers the prompt's positions too. guesses used: copies made for the lookahead's guess");
   console.log("that a layer then wanted.");
 }
