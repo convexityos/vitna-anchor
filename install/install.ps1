@@ -47,6 +47,29 @@
     $models = Join-Path $root 'models'
     New-Item -ItemType Directory -Force -Path $bin, $models | Out-Null
     $engine = Join-Path $bin 'vitna-anchor.exe'
+    $utf8 = New-Object Text.UTF8Encoding $false
+
+    # The engine, its output read as the engine writes it. PowerShell reads what
+    # a program prints in the console's encoding, and the engine writes UTF-8,
+    # being a UTF-8 program on Windows 10 version 1903 and later (before that it
+    # writes the ANSI code page), so the two are matched while it runs: a path
+    # with any letters in it, as a user's name often has, comes back whole.
+    $speaks = if ([Environment]::OSVersion.Version.Build -ge 18362) { $utf8 } else { [Text.Encoding]::Default }
+    function Ask([string[]]$Arguments) {
+        $was = [Console]::OutputEncoding
+        try {
+            try { [Console]::OutputEncoding = $speaks } catch { }
+            & $engine @Arguments
+        } finally {
+            try { [Console]::OutputEncoding = $was } catch { }
+        }
+    }
+
+    # What the engine said, kept beside the install as install.sh keeps it:
+    # plan.tsv and verify.tsv, in UTF-8, each line ending in a line feed.
+    function Keep([string]$Name, [string[]]$Lines) {
+        [IO.File]::WriteAllText((Join-Path $root $Name), (($Lines | ForEach-Object { "$_`n" }) -join ''), $utf8)
+    }
 
     # The file, resuming what is there, unless it is already whole; what is
     # longer than the file should be is fetched anew.
@@ -77,8 +100,10 @@
 
     $planArgs = @('plan', '--dir', $models)
     if ($env:VITNA_MODEL) { $planArgs += @('--model', $env:VITNA_MODEL) }
-    $plan = @(& $engine @planArgs)
-    if ($LASTEXITCODE -ne 0) { Fail 'no plan for this machine' }
+    $plan = @(Ask $planArgs)
+    $planned = $LASTEXITCODE
+    Keep 'plan.tsv' $plan
+    if ($planned -ne 0) { Fail 'no plan for this machine' }
     $info = @{}
     $files = @()
     $serve = @()
@@ -105,8 +130,10 @@
             Fetch $f[1] (Join-Path $models $f[2].Replace('/', '\')) ([long]$f[3])
         }
         Say 'Checking every file against its pinned SHA-256'
-        $verdicts = @(& $engine verify --dir $models --model $model)
-        if ($LASTEXITCODE -eq 0) { break }
+        $verdicts = @(Ask @('verify', '--dir', $models, '--model', $model))
+        $verified = $LASTEXITCODE
+        Keep 'verify.tsv' $verdicts
+        if ($verified -eq 0) { break }
         if ($round -eq 2) {
             $verdicts | ForEach-Object { Write-Host $_ }
             Fail 'the files are not the pinned files'
@@ -120,12 +147,14 @@
         }
     }
 
-    # A script that starts the server again, in UTF-8 for a path with any letters in it.
+    # A script that starts the server again. Its paths start from its own
+    # folder, %~dp0, rather than being written out, so it holds nothing but
+    # ASCII however the folder is named, and works still if the folder moves.
     $start = Join-Path $root 'serve.cmd'
-    $quoted = ($serve | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $quoted = ($serve | ForEach-Object { '"' + $_.Replace($models, '%~dp0models') + '"' }) -join ' '
     $text = "@echo off`r`nrem Starts the server vitna-anchor installed, on port %VITNA_PORT% or 8765.`r`nchcp 65001 >nul`r`nsetlocal`r`n" +
-        "if not defined VITNA_PORT set VITNA_PORT=8765`r`n`"$engine`" serve $quoted --port %VITNA_PORT%`r`n"
-    [IO.File]::WriteAllText($start, $text, (New-Object Text.UTF8Encoding $false))
+        "if not defined VITNA_PORT set VITNA_PORT=8765`r`n`"%~dp0bin\vitna-anchor.exe`" serve $quoted --port %VITNA_PORT%`r`n"
+    [IO.File]::WriteAllText($start, $text, $utf8)
     Say ''
     Say "Installed in $root. $start starts the server."
     Say "OpenAI clients: http://127.0.0.1:$port/v1   Anthropic clients: http://127.0.0.1:$port   model: $model"
@@ -144,9 +173,13 @@
             }
         }
     }
+    # The server writes to the console itself, which shows its UTF-8 so set.
+    $was = [Console]::OutputEncoding
     try {
+        try { [Console]::OutputEncoding = $speaks } catch { }
         & $engine serve @serve --port $port
     } finally {
+        try { [Console]::OutputEncoding = $was } catch { }
         Remove-Job -Force $opener -ErrorAction SilentlyContinue
     }
 }

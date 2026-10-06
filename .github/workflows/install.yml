@@ -19,6 +19,8 @@ on:
       - engine/src/install.c
       - engine/include/install.h
       - engine/src/catalog.c
+      - engine/windows/**
+      - engine/CMakeLists.txt
       - reference/smollm2-360m-instruct/**
       - .github/workflows/install.yml
   workflow_dispatch:
@@ -48,9 +50,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A folder whose name has a letter of Windows' ANSI code page (e with
+      # acute) and one outside it (Cyrillic Zhe), as a user's name often has,
+      # which the engine must open and the scripts must carry whole.
       - name: Where it installs
         shell: bash
-        run: echo "VITNA_HOME=${RUNNER_TEMP}/vitna-anchor" >> "$GITHUB_ENV"
+        run: printf 'VITNA_HOME=%s/vitna-anchor-\303\251\320\226\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Build the engine, as a release would (Linux)
         if: env.VERSION == '' && runner.os == 'Linux'
@@ -78,7 +83,8 @@ jobs:
         run: |
           rev=$(node -p "require('./reference/smollm2-360m-instruct/model.json').revision")
           mkdir -p "$VITNA_HOME/models/smollm2-360m-instruct"
-          curl -fL -r 0-10485759 -o "$VITNA_HOME/models/smollm2-360m-instruct/model.safetensors" \
+          cd "$VITNA_HOME/models/smollm2-360m-instruct"
+          curl -fL -r 0-10485759 -o model.safetensors \
             "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/$rev/model.safetensors"
 
       - name: Install (Linux)

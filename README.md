@@ -90,7 +90,7 @@ curl -fsSL https://github.com/convexityos/vitna-anchor/releases/latest/download/
 
 The installer fetches the engine built for the machine and checks it against the SHA-256 the release wrote into the script. It then asks the engine which model fits the machine (`vitna-anchor plan`), fetches that model's files from Hugging Face at their pinned revisions, resuming any part already there, has the engine check each against its pinned SHA-256 (`vitna-anchor verify`), and starts the server, opening its chat page. With an NVIDIA GPU of 8 GB and 32 GB of memory it installs Qwen3-30B-A3B at Q4_K_M, 18.6 GB, with a context of 16K, or 32K with 48 GB of memory; otherwise SmolLM2-360M-Instruct, 724 MB, a small model for trying the server on the CPU, not a coding assistant. The plan says which, and why. Run again, it fetches only what is missing; `serve.sh` or `serve.cmd`, beside what it installed, starts the server later. `VITNA_HOME`, `VITNA_MODEL` and `VITNA_PORT` change where it installs, the model, and the port. The catalogue it chooses from is [`install/catalog.json`](install/catalog.json), built into the engine.
 
-CI runs the installer end to end on GitHub's hosted runners, which are fresh virtual machines, on Windows and on Linux ([`install.yml`](.github/workflows/install.yml)): from an engine built in the same run, it plans the small model for a machine with no GPU, resumes a part fetched first, checks every file and serves, and the server answers with its chat page and a reply.
+CI runs the installer end to end on GitHub's hosted runners, which are fresh virtual machines, on Windows and on Linux ([`install.yml`](.github/workflows/install.yml)): from an engine built in the same run, it plans the small model for a machine with no GPU, resumes a part fetched first, checks every file and serves, and the server answers with its chat page and a reply. It installs into a folder named with `é` and `Ж`, as a user's name may be: on Windows the first is in the ANSI code page and the second is not, and the engine opens both because it is a UTF-8 program there (below).
 
 ## Build the engine and run the model
 
@@ -111,6 +111,8 @@ cmake -B engine/build -S engine
 cmake --build engine/build --config Release
 .\engine\build\Release\vitna-anchor-tests.exe
 ```
+
+This build embeds [`engine/windows/utf8.manifest`](engine/windows/utf8.manifest), which makes the engine a UTF-8 program on Windows 10 version 1903 and later, so it opens a path with any letters in it. The releases are built this way. The build below does not embed it, and its engine reads paths in the ANSI code page, where a letter outside that code page becomes a question mark.
 
 Windows, with any clang, gcc or `zig cc`. Set `VITNA_CC` to the compiler's path if it is not on `PATH`:
 

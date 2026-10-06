@@ -136,7 +136,10 @@ test("a machine nothing fits is refused, as is a model asked for that does not f
 
 test("what is already fetched is not fetched again, and a file longer than it should be is fetched anew", ENGINE, () => {
   // A catalogue of its own, so the files are small; verify and plan read it as they read the built-in one.
-  const dir = join(scratch, "fetched");
+  // The folder's name has a letter of Windows' ANSI code page and one outside it,
+  // as a user's name often has, which an engine reading paths in that code page
+  // could not open: on Windows the engine is a UTF-8 program (engine/windows/utf8.manifest).
+  const dir = join(scratch, `fetched-${String.fromCharCode(0xe9, 0x416)}`);
   mkdirSync(join(dir, "tiny"), { recursive: true });
   const content = { "a.bin": Buffer.from("alpha alpha alpha"), "b.bin": Buffer.from("bravo") };
   const sha = (b) => createHash("sha256").update(b).digest("hex");
@@ -181,7 +184,10 @@ test("what is already fetched is not fetched again, and a file longer than it sh
   v = verify();
   assert.equal(v.status, 0, v.stdout);
   assert.equal(v.stdout, "ok\ttiny/a.bin\nok\ttiny/b.bin\n");
-  assert.equal(plan().fetch, "0");
+  const done = plan();
+  assert.equal(done.fetch, "0");
+  // And the folder comes back whole in the arguments to serve it with, which the scripts write out.
+  assert.equal(done.serve[done.serve.indexOf("--model") + 1].replace(/\\/g, "/"), join(dir, "tiny").replace(/\\/g, "/"));
 });
 
 test("the machine as the engine sees it", ENGINE, () => {
