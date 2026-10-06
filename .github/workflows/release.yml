@@ -3,9 +3,10 @@ name: Release
 # A release: the engine built for Linux and Windows on x86-64 with the CUDA
 # path, and for macOS on arm64 on the CPU, with the installers (install/)
 # filled in with the release's version and each engine's SHA-256, and a
-# SHA256SUMS over everything. A tag (v1.2.3) publishes it; started by hand it
-# builds everything and publishes nothing, leaving the files as the run's
-# artifacts, a release's dry run.
+# SHA256SUMS over everything. A tag (v1.2.3) publishes it, and then starts
+# install.yml, which installs the release on fresh Windows and Linux runners
+# as a person would. Started by hand it builds everything and publishes
+# nothing, leaving the files as the run's artifacts, a release's dry run.
 #
 # An engine built with the CUDA path runs on a machine with no NVIDIA GPU or
 # driver too, on the CPU: the CUDA runtime is linked in statically and finds
@@ -112,6 +113,9 @@ jobs:
     name: The installers filled in, the checksums, and the release
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -147,6 +151,13 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+      - name: Install it on fresh runners, as a person would
+        if: startsWith(github.ref, 'refs/tags/v')
+        # A release published with this workflow's token starts no workflow of
+        # itself, so install.yml is started here, with the release's tag.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run install.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f version="$GITHUB_REF_NAME"
 
   npm:
     name: The Node.js package, to npm, only when asked

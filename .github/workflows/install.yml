@@ -8,9 +8,11 @@ name: Install
 # with the chat page and a reply.
 #
 # Before a release exists the engine is built here and fetched from the
-# runner's own disk (VITNA_ENGINE_URL, a file:// URL). With a release's tag,
-# from a release or given by hand, the runner does what a person does: the one
-# command, from the release.
+# runner's own disk (VITNA_ENGINE_URL, a file:// URL). Given a release's tag,
+# by the release workflow once it publishes one or by hand, the runner does
+# what a person does: the one command, from the release. (A release published
+# with a workflow's own token starts no workflow of itself, so release.yml
+# starts this one.)
 
 on:
   pull_request:
@@ -29,8 +31,6 @@ on:
         description: "A release's tag to install from, as a person would; empty to build the engine here"
         required: false
         default: ""
-  release:
-    types: [published]
 
 permissions:
   contents: read
@@ -44,7 +44,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     env:
-      VERSION: ${{ github.event.release.tag_name || inputs.version }}
+      VERSION: ${{ inputs.version }}
       VITNA_NO_START: "1"
       VITNA_PORT: "8799"
     steps:
