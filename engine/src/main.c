@@ -8,6 +8,7 @@
 #include "compat.h"
 #include "crypto.h"
 #include "encoder.h"
+#include "install.h"
 #include "json.h"
 #include "kernels.h"
 #include "model.h"
@@ -59,7 +60,10 @@ static void print_usage(const char* prog) {
     printf("  %s bench    [--iterations <n>]\n", prog);
     printf("  %s read-experts --model <dir> [--expert-cache <MiB>]\n", prog);
     printf("  %s weights-sha256 --model <dir> [--weights <file.gguf>]\n", prog);
-    printf("  %s expert-check --model <dir> [--weights <file.gguf>] --device cuda [--count <n>]\n\n", prog);
+    printf("  %s expert-check --model <dir> [--weights <file.gguf>] --device cuda [--count <n>]\n", prog);
+    printf("  %s hardware [--dir <dir>]\n", prog);
+    printf("  %s plan --dir <dir> [--model <id>]\n", prog);
+    printf("  %s verify --dir <dir> --model <id>\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
     printf("--weights <file.gguf> reads the weights from a GGUF file, which may be quantized (Q8_0, Q4_K, Q6_K), rather\n");
@@ -124,6 +128,13 @@ static void print_usage(const char* prog) {
     printf("          on --threads threads\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
+    printf("hardware  prints, as JSON, what the installer sizes a model by: the CPU, the memory, the drive's free\n");
+    printf("          space where --dir is, and the NVIDIA GPUs an engine built with the CUDA path finds\n");
+    printf("plan      prints the installer's plan for this machine, as lines of tab-separated fields: the first\n");
+    printf("          model of the built-in catalogue whose needs it meets (or --model's), why, every file to\n");
+    printf("          fetch into --dir with its URL, size and SHA-256, and the arguments to serve it with\n");
+    printf("verify    checks --model's files in --dir against the catalogue's sizes and SHA-256s, a line\n");
+    printf("          each, and exits 1 if any differs or is missing\n");
     printf("read-experts reads every expert of a mixture once from the drive, as --expert-cache does (512 MiB unless\n");
     printf("          given), computing nothing, and says how fast: what this drive can feed the cache\n");
 }
@@ -1608,6 +1619,100 @@ static int cmd_serve(const args_t* a) {
     return rc;
 }
 
+/* hardware, plan and verify, the installer's commands (install.h), with
+ * options of their own: --dir, where the models go; --model, a model of the
+ * catalogue; and for tests, --hardware, a file describing a machine to plan
+ * for in place of this one (as hardware prints it), and --catalog, a
+ * catalogue in place of the one built in. */
+static int cmd_install(const char* cmd, int argc, char** argv) {
+    binary_stdio(); /* a plan's lines end in a line feed alone, as the scripts that read them want */
+    const char* dir = NULL;
+    const char* model = NULL;
+    const char* hardware = NULL;
+    const char* catalog = NULL;
+    for (int i = 2; i < argc; i++) {
+        const char* o = argv[i];
+        const char** slot = strcmp(o, "--dir") == 0        ? &dir
+                            : strcmp(o, "--model") == 0    ? &model
+                            : strcmp(o, "--hardware") == 0 ? &hardware
+                            : strcmp(o, "--catalog") == 0  ? &catalog
+                                                           : NULL;
+        if (!slot || i + 1 >= argc) {
+            fprintf(stderr, "%s takes --dir <dir>, --model <id>, --hardware <file> and --catalog <file>, not %s\n", cmd, o);
+            return 1;
+        }
+        *slot = argv[++i];
+    }
+    const bool is_hardware = strcmp(cmd, "hardware") == 0, is_verify = strcmp(cmd, "verify") == 0;
+    if (!dir && !is_hardware) {
+        fprintf(stderr, "%s needs --dir, the directory the models go in\n", cmd);
+        return 1;
+    }
+    if (is_verify && !model) {
+        fprintf(stderr, "verify needs --model, the catalogue's model to check\n");
+        return 1;
+    }
+    char err[1024];
+    vitna_hardware_t hw;
+    vitna_strbuf_t out;
+    vitna_sb_init(&out);
+    int rc = 1;
+    char* hw_text = NULL;
+    char* cat_text = NULL;
+    vitna_json_doc_t* hw_doc = NULL;
+    vitna_json_doc_t* cat_doc = NULL;
+
+    if (is_hardware || (!is_verify && !hardware)) {
+        if (!vitna_hardware_detect(dir ? dir : ".", &hw, err, sizeof(err))) {
+            fprintf(stderr, "%s\n", err);
+            goto done;
+        }
+    } else if (!is_verify) {
+        if (!(hw_text = read_whole_file(hardware))) goto done;
+        hw_doc = vitna_json_parse(hw_text, strlen(hw_text), err, sizeof(err));
+        if (!hw_doc || !vitna_hardware_read(vitna_json_root(hw_doc), &hw, err, sizeof(err))) {
+            fprintf(stderr, "%s: %s\n", hardware, err);
+            goto done;
+        }
+    }
+    if (is_hardware) {
+        vitna_hardware_json(&hw, &out);
+        printf("%s\n", out.data);
+        rc = 0;
+        goto done;
+    }
+    if (catalog && !(cat_text = read_whole_file(catalog))) goto done;
+    const char* text = cat_text ? cat_text : vitna_catalog_text();
+    cat_doc = vitna_json_parse(text, strlen(text), err, sizeof(err));
+    if (!cat_doc) {
+        fprintf(stderr, "the catalogue: %s\n", err);
+        goto done;
+    }
+    if (is_verify) {
+        bool all_ok = false;
+        if (!vitna_verify(vitna_json_root(cat_doc), dir, model, &out, &all_ok, err, sizeof(err))) {
+            fprintf(stderr, "%s\n", err);
+            goto done;
+        }
+        fwrite(out.data ? out.data : "", 1, out.len, stdout);
+        rc = all_ok ? 0 : 1;
+        goto done;
+    }
+    if (!vitna_plan(vitna_json_root(cat_doc), &hw, dir, model, &out, err, sizeof(err))) {
+        fprintf(stderr, "%s\n", err);
+        goto done;
+    }
+    fwrite(out.data, 1, out.len, stdout);
+    rc = 0;
+done:
+    vitna_sb_free(&out);
+    vitna_json_free(hw_doc);
+    vitna_json_free(cat_doc);
+    free(hw_text);
+    free(cat_text);
+    return rc;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -1619,6 +1724,7 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 0;
     }
+    if (strcmp(cmd, "hardware") == 0 || strcmp(cmd, "plan") == 0 || strcmp(cmd, "verify") == 0) return cmd_install(cmd, argc, argv);
     args_t a;
     if (!parse_args(argc, argv, &a)) return 1;
     /* A device the engine cannot use is refused before anything is loaded,

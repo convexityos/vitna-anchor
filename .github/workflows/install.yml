@@ -1,0 +1,133 @@
+name: Install
+
+# Gate A12: the installer, end to end, on fresh machines. A hosted runner is a
+# new virtual machine every run, which is the fresh Windows and Linux machine
+# the gate asks for. It has no GPU, so the engine's plan gives it the small
+# model, which the installer fetches from Hugging Face at its pin, resuming a
+# part fetched first, has checked, and serves; the server must then answer,
+# with the chat page and a reply.
+#
+# Before a release exists the engine is built here and fetched from the
+# runner's own disk (VITNA_ENGINE_URL, a file:// URL). With a release's tag,
+# from a release or given by hand, the runner does what a person does: the one
+# command, from the release.
+
+on:
+  pull_request:
+    paths:
+      - install/**
+      - engine/src/install.c
+      - engine/include/install.h
+      - engine/src/catalog.c
+      - reference/smollm2-360m-instruct/**
+      - .github/workflows/install.yml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "A release's tag to install from, as a person would; empty to build the engine here"
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
+      VITNA_NO_START: "1"
+      VITNA_PORT: "8799"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Where it installs
+        shell: bash
+        run: echo "VITNA_HOME=${RUNNER_TEMP}/vitna-anchor" >> "$GITHUB_ENV"
+
+      - name: Build the engine, as a release would (Linux)
+        if: env.VERSION == '' && runner.os == 'Linux'
+        run: |
+          make -C engine all
+          mkdir -p dist && cp engine/vitna-anchor dist/vitna-anchor-linux-x86_64
+      - name: Build the engine, as a release would (Windows)
+        if: env.VERSION == '' && runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -B engine/build -S engine
+          cmake --build engine/build --config Release
+          mkdir -p dist && cp engine/build/Release/vitna-anchor.exe dist/vitna-anchor-windows-x64.exe
+      - name: The installer fetches it from the runner's disk, with its SHA-256
+        if: env.VERSION == ''
+        shell: bash
+        run: |
+          asset=$(ls dist)
+          path=$(cd dist && pwd -W 2>/dev/null || pwd)
+          echo "VITNA_ENGINE_URL=file:///${path#/}/$asset" >> "$GITHUB_ENV"
+          echo "VITNA_ENGINE_SHA256=$(sha256sum "dist/$asset" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+
+      - name: A part of the model fetched already, which the installer must resume
+        shell: bash
+        run: |
+          rev=$(node -p "require('./reference/smollm2-360m-instruct/model.json').revision")
+          mkdir -p "$VITNA_HOME/models/smollm2-360m-instruct"
+          curl -fL -r 0-10485759 -o "$VITNA_HOME/models/smollm2-360m-instruct/model.safetensors" \
+            "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/$rev/model.safetensors"
+
+      - name: Install (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -n "$VERSION" ]; then
+            curl -fsSL "https://github.com/convexityos/vitna-anchor/releases/download/$VERSION/install.sh" | sh
+          else
+            sh install/install.sh
+          fi
+      - name: Install (Windows, in Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($env:VERSION) {
+            irm "https://github.com/convexityos/vitna-anchor/releases/download/$env:VERSION/install.ps1" | iex
+          } else {
+            iex (Get-Content -Raw install/install.ps1)
+          }
+
+      - name: It chose the small model, for a machine with no GPU, and every file is the pinned file
+        shell: bash
+        run: |
+          tab=$(printf '\t')
+          grep -q "^model${tab}smollm2-360m-instruct\$" "$VITNA_HOME/plan.tsv"
+          grep -q -e "no NVIDIA GPU was found" -e "built without the CUDA path" "$VITNA_HOME/plan.tsv"
+          engine="$VITNA_HOME/bin/vitna-anchor"
+          [ -f "$engine" ] || engine="$engine.exe"
+          "$engine" verify --dir "$VITNA_HOME/models" --model smollm2-360m-instruct
+
+      - name: The server it installed answers, with the chat page and a reply
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            cmd.exe //c "$(cygpath -w "$VITNA_HOME/serve.cmd")" > server.log 2>&1 &
+          else
+            "$VITNA_HOME/serve.sh" > server.log 2>&1 &
+          fi
+          for i in $(seq 1 120); do
+            curl -fs "http://127.0.0.1:$VITNA_PORT/v1/health" > health.json && break
+            sleep 1
+          done
+          cat health.json; echo
+          curl -fs "http://127.0.0.1:$VITNA_PORT/" | grep -q "<title>vitna-anchor</title>"
+          curl -fs "http://127.0.0.1:$VITNA_PORT/v1/chat/completions" -H "content-type: application/json" \
+            -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":24,"temperature":0}' > reply.json
+          cat reply.json; echo
+          node -e "const r = require('./reply.json'); if (!r.choices[0].message.content) process.exit(1)"
+      - name: What the server printed
+        if: always()
+        shell: bash
+        run: cat server.log 2>/dev/null || true

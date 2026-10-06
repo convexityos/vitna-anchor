@@ -27,6 +27,17 @@ typedef struct {
 /** Whether the CUDA runtime finds a device. Returns false, with the reason in err, if not. */
 bool vitna_cuda_probe(char* err, size_t err_len);
 
+/** A CUDA device as the installer sizes a model for it (install.h). */
+typedef struct {
+    char name[128];
+    size_t total_bytes;  /* its whole memory */
+    size_t free_bytes;   /* free when asked */
+    int major, minor;    /* compute capability */
+} vitna_cuda_device_t;
+
+/** The CUDA devices the runtime finds, up to max of them: how many. 0 when it finds none, or there is no driver. */
+int vitna_cuda_devices(vitna_cuda_device_t* out, int max);
+
 /**
  * Upload m's weights to the first device, with the rotary cos and sin of
  * every position its cache holds (m->ctx rows of head_dim / 2), and allocate

@@ -30,8 +30,9 @@ function literal(bytes, newline) {
   return s + (newline ? "\\n" : "") + '"';
 }
 
-export function embedPage(html) {
-  const bytes = Buffer.from(html, "utf8");
+/** text as C string literals, a line of it to each, which C joins into one string. */
+export function cStringLines(text) {
+  const bytes = Buffer.from(text, "utf8");
   const lines = [];
   let start = 0;
   for (let i = 0; i < bytes.length; i++) {
@@ -41,6 +42,10 @@ export function embedPage(html) {
     }
   }
   if (start < bytes.length) lines.push(literal(bytes.subarray(start), false));
+  return lines.join("\n");
+}
+
+export function embedPage(html) {
   return [
     "/**",
     " * chat_page.c - The chat page the server answers GET / with: engine/web/chat.html,",
@@ -51,7 +56,7 @@ export function embedPage(html) {
     "#include <stddef.h>",
     "",
     "const char vitna_chat_page[] =",
-    lines.join("\n") + ";",
+    cStringLines(html) + ";",
     "",
     "const size_t vitna_chat_page_len = sizeof(vitna_chat_page) - 1;",
     "",

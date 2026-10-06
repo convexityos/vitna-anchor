@@ -143,6 +143,13 @@ jobs:
         env:
           VITNA_REQUIRE_REFERENCE: "1"
         run: node --test --test-reporter=spec tests/chat-page.test.mjs
+      # And its installer's engine half: the catalogue, the plan for a
+      # machine and the files' check. The scripts run end to end on fresh
+      # runners in install.yml.
+      - name: Gate A12, the installer's plan and check
+        env:
+          VITNA_REQUIRE_ENGINE: "1"
+        run: node --test --test-reporter=spec tests/install.test.mjs
       - name: Gate A3, serving over the OpenAI-compatible API
         env:
           VITNA_REQUIRE_REFERENCE: "1"

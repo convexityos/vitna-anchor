@@ -1,0 +1,36 @@
+{
+  "about": "What the installer may install, in order of preference: the first model whose needs the machine meets. Each file is a pinned file of reference/<pin>/model.json, fetched at the pin's revision and kept only if its size and SHA-256 match. engine/tools/gen_catalog.mjs writes this, with the pins, into the engine as engine/src/catalog.c, which `vitna-anchor plan` reads.",
+  "models": [
+    {
+      "id": "qwen3-30b-a3b",
+      "title": "Qwen3-30B-A3B at Q4_K_M",
+      "note": "A 30B mixture of experts, in Qwen's own Q4_K_M quantization, for chat and for coding agents, with its reasoning and tool calls in each API's shape.",
+      "needs": { "cuda": true, "gpu_gib": 7.5, "memory_gib": 30 },
+      "files": [
+        { "pin": "qwen3-30b-a3b", "path": "config.json" },
+        { "pin": "qwen3-30b-a3b", "path": "tokenizer.json" },
+        { "pin": "qwen3-30b-a3b-gguf", "path": "Qwen3-30B-A3B-Q4_K_M.gguf" }
+      ],
+      "weights": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "device": "cuda",
+      "ctx": [
+        { "memory_gib": 46, "ctx": 32768 },
+        { "memory_gib": 0, "ctx": 16384 }
+      ]
+    },
+    {
+      "id": "smollm2-360m-instruct",
+      "title": "SmolLM2-360M-Instruct",
+      "note": "A small model for trying the server, not a coding assistant. It runs on the CPU, on one thread.",
+      "needs": { "memory_gib": 3 },
+      "files": [
+        { "pin": "smollm2-360m-instruct", "path": "config.json" },
+        { "pin": "smollm2-360m-instruct", "path": "tokenizer.json" },
+        { "pin": "smollm2-360m-instruct", "path": "model.safetensors" }
+      ],
+      "ctx": [
+        { "memory_gib": 0, "ctx": 4096 }
+      ]
+    }
+  ]
+}
