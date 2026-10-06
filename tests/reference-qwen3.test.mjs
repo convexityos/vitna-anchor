@@ -192,7 +192,12 @@ const required = (v) => process.env[v] === "1";
 const DEVICE = process.env.VITNA_DEVICE ?? "";
 assert.ok(["", "cpu", "cuda"].includes(DEVICE), `VITNA_DEVICE must be cpu or cuda, not ${DEVICE}`);
 const GPU = DEVICE === "cuda";
-const RUN = ["--ctx", "512", ...(DEVICE ? ["--device", DEVICE] : [])];
+// On a GPU the experts are copied from memory the device has locked, and
+// the whole 61.1 GB checkpoint is more than most machines can lock, so they
+// come through a cache in memory read from the drive (--expert-cache), of
+// VITNA_QWEN3_EXPERT_CACHE MiB, 16 GiB unless it says otherwise.
+const RUN = ["--ctx", "512", ...(DEVICE ? ["--device", DEVICE] : []),
+  ...(GPU ? ["--expert-cache", process.env.VITNA_QWEN3_EXPERT_CACHE || "16384"] : [])];
 
 function missing(files, fetch) {
   if (!recorded) return "reference/qwen3-30b-a3b/fixture.json is not recorded yet";
