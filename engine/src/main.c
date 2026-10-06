@@ -79,6 +79,9 @@ static void print_usage(const char* prog) {
     printf("--gpu-kv-layers <n>, with --device cuda, keeps the key-value cache of a mixture of experts' first n layers on\n");
     printf("the GPU and the others' in page-locked host memory (default: as many on the GPU as it has room for beside\n");
     printf("the rest of the model and the least expert cache); the logits are the same, bit for bit, whatever n is.\n");
+    printf("--precision exact|fast, with --device cuda, for a mixture of experts: fast runs a prompt's chunks of 64\n");
+    printf("tokens or more through tiled matrix products, whose sums run in another order, so its logits are close\n");
+    printf("to exact's and not the same bits; decoding a token at a time is exact either way (default: exact).\n");
     printf("--ids-file <file> and --prompt-file <file> read --ids or --prompt from a file, for a prompt longer than\n");
     printf("a command line holds.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
@@ -140,6 +143,7 @@ typedef struct {
     size_t gpu_expert_cache_mib; /* --device cuda: the GPU memory that holds a mixture of experts' experts */
     size_t cpu_experts;  /* --device cuda: CPU threads that run the experts the GPU lacks; 0, they are copied in */
     int gpu_kv_layers;   /* --device cuda: the layers whose key-value cache the GPU holds; -1 for as many as fit */
+    bool fast;           /* --precision fast */
     int iterations;
     size_t count;        /* --count: experts expert-check runs */
     uint16_t port;
@@ -206,6 +210,13 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         }
         else if (TAKE("--prompt-file")) {
             if (!(a->prompt = read_whole_file(v))) return false;
+        }
+        else if (TAKE("--precision")) {
+            if (strcmp(v, "exact") != 0 && strcmp(v, "fast") != 0) {
+                fprintf(stderr, "--precision is exact or fast, not %s\n", v);
+                return false;
+            }
+            a->fast = strcmp(v, "fast") == 0;
         }
         else if (TAKE("--gpu-kv-layers")) {
             char* end = NULL;
@@ -635,6 +646,14 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
         }
         m->gpu_kv_layers = a->gpu_kv_layers;
     }
+    if (a->fast) {
+        if (!m->cfg.n_experts) {
+            fprintf(stderr, "--precision fast: this model has no experts, and its prompts run as tiled products already\n");
+            vitna_llama_free(m);
+            return false;
+        }
+        m->gpu_fast = true;
+    }
     /* Asked for the GPU, the model runs there or not at all. A mixture of
      * experts copies its experts there from the cache above, if there is one. */
     if (wants_cuda(a) && !vitna_llama_use_cuda(m, a->gpu_expert_cache_mib << 20, err, sizeof(err))) {
@@ -663,6 +682,14 @@ static bool load_model(const args_t* a, vitna_llama_t* m) {
     /* For tests only: VITNA_TEST_LONG_FROM=n gives rows attending to more
      * than n positions a long context's attention (gate A10), so that short
      * prompts can check it against the reference, and rows against steps. */
+    /* For tests only: VITNA_TEST_FAST_ROWS=n, with --precision fast, takes
+     * passes of n rows or more through its tiled products. */
+    const char* fast_rows = getenv("VITNA_TEST_FAST_ROWS");
+    if (fast_rows && *fast_rows && a->fast) {
+        vitna_llama_test_fast_rows(m, (size_t)strtoull(fast_rows, NULL, 10));
+        fprintf(stderr, "VITNA_TEST_FAST_ROWS is set, for a test: passes of %s rows or more take --precision fast's tiled products.\n",
+                fast_rows);
+    }
     const char* long_from = getenv("VITNA_TEST_LONG_FROM");
     if (long_from && *long_from && wants_cuda(a) && m->cfg.n_experts) {
         vitna_llama_test_long_from(m, (size_t)strtoull(long_from, NULL, 10));
@@ -1515,6 +1542,10 @@ int main(int argc, char** argv) {
     }
     if (a.gpu_kv_layers >= 0 && !wants_cuda(&a)) {
         fprintf(stderr, "--gpu-kv-layers needs --device cuda\n");
+        return 1;
+    }
+    if (a.fast && !wants_cuda(&a)) {
+        fprintf(stderr, "--precision fast needs --device cuda\n");
         return 1;
     }
     if (a.device && strcmp(a.device, "cpu") != 0) {

@@ -91,6 +91,9 @@ int vitna_cuda_kv_layers(const struct vitna_cuda_model* g);
 /** For tests: vitna_llama_test_long_from. */
 void vitna_cuda_test_long_from(struct vitna_cuda_model* g, size_t n);
 
+/** For tests: vitna_llama_test_fast_rows. */
+void vitna_cuda_test_fast_rows(struct vitna_cuda_model* g, size_t n);
+
 /**
  * From now on, a step of a mixture of experts shares the experts the device
  * lacks between the CPU, on threads threads, and copies to the device, while

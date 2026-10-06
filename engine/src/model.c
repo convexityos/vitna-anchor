@@ -853,6 +853,15 @@ void vitna_llama_test_long_from(vitna_llama_t* m, size_t n) {
 #endif
 }
 
+void vitna_llama_test_fast_rows(vitna_llama_t* m, size_t n) {
+#if defined(VITNA_CUDA)
+    if (m->cuda) vitna_cuda_test_fast_rows(m->cuda, n);
+#else
+    (void)m;
+    (void)n;
+#endif
+}
+
 size_t vitna_llama_gpu_kv_layers(const vitna_llama_t* m) {
 #if defined(VITNA_CUDA)
     if (m->cuda) return (size_t)vitna_cuda_kv_layers(m->cuda);
