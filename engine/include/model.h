@@ -148,6 +148,10 @@ typedef struct {
      * host memory (gate A10); -1, as loaded, for as many as it has room for
      * beside the rest and the least expert cache. */
     int gpu_kv_layers;
+    /* Read by vitna_llama_use_cuda for a mixture of experts: --precision fast,
+     * a prompt's chunks through tiled matrix products, whose sums run in
+     * another order than a token at a time's (model_cuda.cu, FAST_ROWS). */
+    bool gpu_fast;
 
     /* Set when a step on the GPU fails with an error CUDA calls sticky (an
      * illegal address, a kernel that faulted, and others), after which the
@@ -421,6 +425,13 @@ void vitna_llama_test_long_from(vitna_llama_t* m, size_t n);
 
 /** On the GPU, the layers whose key-value cache the device holds; 0 otherwise. */
 size_t vitna_llama_gpu_kv_layers(const vitna_llama_t* m);
+
+/**
+ * For tests, after vitna_llama_use_cuda with gpu_fast: passes of n rows or
+ * more take --precision fast's tiled products, where otherwise they take them
+ * from 64, so that short prompts can check that arithmetic against a reference.
+ */
+void vitna_llama_test_fast_rows(vitna_llama_t* m, size_t n);
 
 /**
  * What the GPU's expert cache has done so far, in a sentence, for --timing:

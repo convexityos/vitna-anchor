@@ -4,11 +4,11 @@
 //
 //   node scripts/bench-prefill.mjs [--device cpu|cuda] [--engine <path> ...] [--model <dir>] [--weights <file.gguf>]
 //                                  [--prompt-tokens <n,n,...>] [--runs <n>] [--text <file> ...] [--ctx <n>]
-//                                  [--gpu-kv-layers <n>]
+//                                  [--gpu-kv-layers <n>] [--precision exact|fast]
 //
 // --weights reads the weights from a GGUF file, as the engine's own --weights
-// does; --model still gives config.json and the tokenizer. --ctx and
-// --gpu-kv-layers go to the engine as they are.
+// does; --model still gives config.json and the tokenizer. --ctx,
+// --gpu-kv-layers and --precision go to the engine as they are.
 //
 // Each run is one `generate --greedy --timing --max-new 2` over the first n
 // tokens of the text, README.md unless --text names files, which are read
@@ -55,7 +55,7 @@ const weights = option("--weights", "") ? resolve(option("--weights", "")) : "";
 const lengths = option("--prompt-tokens", "8,100,500,2000").split(",").map(Number);
 const runs = Number(option("--runs", "5"));
 const texts = (options("--text").length ? options("--text") : ["README.md"]).map((p) => resolve(ROOT, p));
-const passed = ["--ctx", "--gpu-kv-layers"].flatMap((name) => (option(name, "") ? [name, option(name, "")] : []));
+const passed = ["--ctx", "--gpu-kv-layers", "--precision"].flatMap((name) => (option(name, "") ? [name, option(name, "")] : []));
 const fallback = [
   process.env.VITNA_ENGINE,
   join(ROOT, `engine/vitna-anchor${EXE}`),
