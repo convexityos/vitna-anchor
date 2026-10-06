@@ -1,0 +1,138 @@
+{
+  "about": "Inputs for reference/record_embed.py. Every input is tokenized and embedded; text is exactly what the model reads, so a query carries the model's query instruction already. The corpus is only tokenized. Change either and the fixture must be recorded again.",
+  "query_instruction": "Represent this sentence for searching relevant passages: ",
+  "inputs": [
+    {
+      "id": "query-photosynthesis",
+      "text": "Represent this sentence for searching relevant passages: how do plants turn sunlight into food"
+    },
+    {
+      "id": "query-interest-rates",
+      "text": "Represent this sentence for searching relevant passages: why does the central bank raise interest rates"
+    },
+    {
+      "id": "query-python-lists",
+      "text": "Represent this sentence for searching relevant passages: remove duplicates from a python list keeping order"
+    },
+    {
+      "id": "query-short",
+      "text": "Represent this sentence for searching relevant passages: tides"
+    },
+    {
+      "id": "passage-photosynthesis",
+      "text": "Photosynthesis is the process by which green plants, algae and some bacteria use light energy to turn carbon dioxide and water into glucose. Oxygen is released as a by-product. The light-dependent reactions take place in the thylakoid membranes of the chloroplast, and the Calvin cycle fixes carbon in the stroma."
+    },
+    {
+      "id": "passage-interest-rates",
+      "text": "When inflation runs above its target, a central bank usually raises its policy rate. Borrowing becomes more expensive for households and firms, spending slows, and price pressure eases over the following year or two. Cutting the rate works the other way round."
+    },
+    {
+      "id": "passage-python",
+      "text": "def dedupe(items):\n    seen = set()\n    out = []\n    for item in items:\n        if item not in seen:\n            seen.add(item)\n            out.append(item)\n    return out\n\n# dict.fromkeys(items) keeps the first occurrence of each item, in order, since Python 3.7."
+    },
+    {
+      "id": "passage-tides",
+      "text": "Tides are the regular rise and fall of the sea, caused mostly by the Moon's gravity and, to a lesser degree, the Sun's. Most coasts see two high tides and two low tides a day."
+    },
+    {
+      "id": "passage-unrelated",
+      "text": "The recipe needs 250 g of flour, 2 eggs, 300 ml of milk and a pinch of salt. Whisk until smooth, rest the batter for 30 minutes, then fry thin pancakes in a hot pan."
+    },
+    {
+      "id": "word",
+      "text": "hello"
+    },
+    {
+      "id": "empty",
+      "text": ""
+    },
+    {
+      "id": "numbers-and-units",
+      "text": "In 2024 the population grew by 3.7% to 1,234,567 people; GDP was $2.5 trillion (approx. 2.3 trillion EUR) and the median rent rose 12.5 percent."
+    },
+    {
+      "id": "accents-and-case",
+      "text": "Caf\u00e9 \u00c9COLE na\u00efve r\u00e9sum\u00e9 \u00c5ngstr\u00f6m Stra\u00dfe \u0130STANBUL \u00d8RESUND co\u00f6perate \u00e1\u00e9\u00ed\u00f3\u00fa \u00e0\u00e8\u00ec\u00f2\u00f9"
+    },
+    {
+      "id": "cjk-and-kana",
+      "text": "\u6771\u4eac\u90fd\u306f\u65e5\u672c\u306e\u9996\u90fd\u3067\u3059\u3002\u5317\u4eac\u662f\u4e2d\u56fd\u7684\u9996\u90fd\u3002\ud55c\uad6d\uc5b4 \ud14d\uc2a4\ud2b8"
+    },
+    {
+      "id": "special-token-text",
+      "text": "a [SEP] b [CLS] c [MASK] d [unk] e [PAD]f"
+    },
+    {
+      "id": "punctuation-and-symbols",
+      "text": "Wait... what?! (Really) -- \"quoted\" 'single' [brackets] {braces} <angle> a+b=c x^2 ~tilde `tick` | pipe \\ back / slash @ # $ % & * _ \u00b1 \u00d7 \u00f7 \u20ac \u00a3 \u00a5 \u00a7 \u00b6 \u2022 \u2026 \u2014 \u2013 \u00ab \u00bb \u201c \u201d"
+    },
+    {
+      "id": "whitespace-and-controls",
+      "text": "tabs\tand\nnew\r\nlines   and\u00a0nbsp\u3000ideographic\u200bzero\u200dwidth\u00adsoft\ufffdreplacement\u0007bell end"
+    },
+    {
+      "id": "url-and-email",
+      "text": "See https://example.com/docs/v1/embeddings?model=bge-small&dims=384#usage or write to ops@example.org for access."
+    },
+    {
+      "id": "long-word",
+      "text": "pneumonoultramicroscopicsilicovolcanoconiosis supercalifragilisticexpialidocious aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa end"
+    },
+    {
+      "id": "french-and-german",
+      "text": "La banque centrale europ\u00e9enne a relev\u00e9 ses taux directeurs. Die Europ\u00e4ische Zentralbank hat die Leitzinsen erh\u00f6ht, um die Inflation zu bremsen."
+    },
+    {
+      "id": "greek-and-cyrillic",
+      "text": "\u039f\u0394\u03a5\u03a3\u03a3\u0395\u03a5\u03a3 \u03ba\u03b1\u03b9 \u0391\u0398\u0397\u039d\u0391\u03a3. \u041c\u043e\u0441\u043a\u0432\u0430 \u0438 \u0421\u0410\u041d\u041a\u0422-\u041f\u0415\u0422\u0415\u0420\u0411\u0423\u0420\u0413."
+    },
+    {
+      "id": "emoji",
+      "text": "launch day \ud83d\ude80\ud83d\ude80 thumbs \ud83d\udc4d\ud83c\udffd family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 flag \ud83c\uddeb\ud83c\uddf7 pleading \ud83e\udd7a"
+    },
+    {
+      "id": "long-passage",
+      "text": "The history of measuring time runs from shadows to atoms. Early sundials divided daylight into parts by the length and angle of a shadow, which worked only when the sun was out and drifted with the seasons. Water clocks let a vessel fill or drain at a steady rate, so they could keep going at night and indoors, and some carried floats that moved pointers or struck bells. Mechanical clocks appeared in European towers in the thirteenth and fourteenth centuries. They were driven by falling weights and regulated by an escapement, a device that lets the gear train advance in small, regular steps. The verge and foliot escapement was crude, and those early clocks could gain or lose a quarter of an hour in a day, which is why many had no minute hand at all. The pendulum changed that. Christiaan Huygens built the first pendulum clock in 1656, and because a pendulum's swing takes nearly the same time whatever its width, the error fell to around a minute a day and later to seconds. The anchor escapement and the temperature-compensated pendulum improved it further, and by the nineteenth century observatories kept regulator clocks that could hold a fraction of a second over weeks. At sea the problem was harder, since a pendulum is useless on a rolling ship, and finding longitude depends on knowing the time at a reference meridian. John Harrison's marine chronometers solved it in the eighteenth century with springs, balances and materials chosen to cancel the effects of heat and cold. Quartz crystal oscillators arrived in the twentieth century. A piece of quartz cut the right way vibrates at a precise frequency when a voltage is applied, and counting those vibrations gives a timebase far steadier than any pendulum. Atomic clocks went further again. They lock an oscillator to the frequency of a transition between energy levels of an atom, usually caesium or rubidium, and since 1967 the second has been defined as a fixed number of periods of the radiation from a caesium transition. Optical clocks, which use transitions at much higher frequencies, are now so stable that they would drift by less than a second over the age of the universe, and they can detect the slowing of time caused by raising them a few centimetres in Earth's gravity. Each step made the ticking smaller and steadier, and each changed what people could build: railways needed standard time, navigation needed chronometers, and satellite positioning needs clocks good to a few billionths of a second."
+    }
+  ],
+  "corpus": [
+    "",
+    " ",
+    "   leading and trailing   ",
+    "UPPER lower MiXeD",
+    "don't won't it's we'll they're I'd",
+    "e-mail co-operate state-of-the-art",
+    "3.14159 1,000,000 10^6 1e-9 0x1F 0b1010",
+    "\u0661\u0662\u0663 \u0967\u0968\u0969 \u2167\u2163 \u00bd \u00b2",
+    "\u00c0\u00c1\u00c2\u00c3\u00c4\u00c5 \u00e7 \u00f1 \u00fc \u0153 \u00e6 \u00f8 \u00df \u0131 \u0130",
+    "e\u0301 a\u0300 o\u0302 n\u0303 u\u0308 combining",
+    "\u0301\u0300 marks alone",
+    "\u4e2d\u6587\u5b57\u7b26\u6d4b\u8bd5 \u3402\u3403 \ud840\udc00\ud840\udc01 \ufa0e\ufa0f",
+    "\u3072\u3089\u304c\u306a \u30ab\u30bf\u30ab\u30ca \uff8a\uff9d\uff76\uff78",
+    "\ud55c\uae00 \uac00\ub098\ub2e4",
+    "\u0627\u0644\u0639\u0631\u0628\u064a\u0629 \u05e2\u05d1\u05e8\u05d9\u05ea",
+    "\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22 \u0939\u093f\u0928\u094d\u0926\u0940",
+    "[CLS][SEP][MASK][PAD][UNK]",
+    "[cls] [sep] [Mask]",
+    "[SEP[SEP]]",
+    "##suffix ##",
+    "\u0000nul\u0001soh\u001fus\u007fdel\u0085nel",
+    "\u2028line\u2029para\u000bvt\fff",
+    "\u200b\u200c\u200d\u2060\ufeff invisible",
+    "\ue000\uf8ff private use",
+    "\ud83e\udee8 unassigned in older tables",
+    "\u2122 \u00a9 \u00ae \u2103 \u212b \u2126",
+    "\uff21\uff22\uff23 \uff11\uff12\uff13 fullwidth",
+    "\u1e9e \u00df capital sharp s",
+    "\u03a3\u0399\u03a3\u03a5\u03a6\u039f\u03a3 \u03c3\u03b9\u03c3\u03c5\u03c6\u03bf\u03c2",
+    "abc\u00a0def\u2003ghi\u202fjkl",
+    "a.b,c;d:e!f?g",
+    "<p>html &amp; entities</p>",
+    "C:\\Users\\path\\file.txt /usr/local/bin",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9 accented hundred",
+    "unaffable unbelievably antidisestablishmentarianism",
+    "\ud835\udc00\ud835\udc01 math bold \u2460\u2461 circled"
+  ]
+}
