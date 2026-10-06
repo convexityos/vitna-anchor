@@ -176,6 +176,12 @@
 #define PENDING_MAX 64
 #define EXPERT_MARGIN ((size_t)512 << 20)
 
+/* --cpu-experts (moe_experts_split): the layers with misses after which a
+ * side the split has left out is given one expert, to measure it again. A
+ * probe that loses costs a layer one expert's difference, about a
+ * millisecond on OLMoE; 64 layers are four of its tokens. */
+#define SPLIT_PROBE 64
+
 /* The most rows a mixture of experts runs a layer at a time: a prompt goes
  * in chunks of this many. A chunk's experts are copied to the device once
  * a layer, so a larger chunk copies less a token, and costs about 70 KB a
@@ -263,7 +269,7 @@ typedef struct {
     uint64_t on_cpu;
     double cpu_ms;
     double cpu_ms_b, copy_ms_b;
-    double share;             /* the CPU's share of the misses, carried from layer to layer */
+    int cpu_idle, copy_idle;  /* layers with misses since the CPU, and a copy, last took one */
     cudaEvent_t copy_t0, copy_t1; /* timing a layer's copies for the device */
     size_t copy_timed;        /* the bytes between them, until read; 0 for none */
 } expert_cache_t;
@@ -3163,13 +3169,13 @@ static void average(double* v, double x) {
  * one vitna_cuda_moe_experts leaves, bit for bit, whichever experts ran where.
  *
  * The split follows what each costs, measured as they run. Of the experts a
- * layer lacks, the CPU takes the share it would finish as the copies of the
- * rest finish, given what a byte has cost each so far, the least used first;
- * the rest are copied in, where they stay for the tokens after. At least a
- * tenth goes each way, carried from layer to layer, so that neither cost
- * goes unmeasured. The CPU's outputs leave host_y on the device's stream,
- * which the next layer's vitna_cuda_moe_route waits for before this runs
- * again. */
+ * layer lacks, the CPU takes as many as let the layer finish soonest, given
+ * what an expert has cost each lately, the least used first, and none when
+ * the copies alone finish sooner; the rest are copied in, where they stay
+ * for the tokens after. A side left out for SPLIT_PROBE layers is given one
+ * expert, so that neither cost goes stale. The CPU's outputs leave host_y
+ * on the device's stream, which the next layer's vitna_cuda_moe_route waits
+ * for before this runs again. */
 static bool moe_experts_split(struct vitna_cuda_model* g, size_t layer, const int32_t* ids, const float* weights, size_t k,
                               const int32_t* guess, char* err, size_t err_len) {
     expert_cache_t* c = &g->ec;
@@ -3234,16 +3240,39 @@ static bool moe_experts_split(struct vitna_cuda_model* g, size_t layer, const in
         }
     }
 
-    /* The CPU's share of those it lacks, the least used of them. */
+    /* The CPU's share of those it lacks, the least used of them: as many
+     * as let the layer finish soonest, the CPU running its share while the
+     * rest are copied, by what an expert has cost each lately. Until both
+     * costs are known, both sides take some. Every SPLIT_PROBE layers with
+     * misses that one side has not been given any, it is given one, so that
+     * its cost is never long out of date: the box's load changes it. */
     bool on_cpu[EXPERTS_MAX] = { false };
     int n_cpu = 0;
     if (n_miss) {
-        double r = c->copy_ms_b > 0 && c->cpu_ms_b > 0 ? c->copy_ms_b / (c->copy_ms_b + c->cpu_ms_b) : 0.5;
-        r = r < 0.1 ? 0.1 : (r > 0.9 ? 0.9 : r);
-        c->share += r * (double)n_miss;
-        n_cpu = (int)c->share;
-        if (n_cpu > n_miss) n_cpu = n_miss;
-        c->share -= (double)n_cpu;
+        const double cpu_e = c->cpu_ms_b * (double)expert_bytes, copy_e = c->copy_ms_b * (double)expert_bytes;
+        if (cpu_e <= 0) {
+            n_cpu = (n_miss + 1) / 2;
+        } else if (copy_e <= 0) {
+            n_cpu = n_miss / 2;
+        } else {
+            double best = copy_e * (double)n_miss;
+            for (int n = 1; n <= n_miss; n++) {
+                const double t = fmax(cpu_e * (double)n, copy_e * (double)(n_miss - n));
+                if (t < best) {
+                    best = t;
+                    n_cpu = n;
+                }
+            }
+        }
+        c->cpu_idle = n_cpu > 0 ? 0 : c->cpu_idle + 1;
+        c->copy_idle = n_cpu < n_miss ? 0 : c->copy_idle + 1;
+        if (c->cpu_idle >= SPLIT_PROBE) {
+            n_cpu = 1;
+            c->cpu_idle = 0;
+        } else if (c->copy_idle >= SPLIT_PROBE) {
+            n_cpu--;
+            c->copy_idle = 0;
+        }
         int order[EXPERTS_MAX];
         for (int j = 0; j < n_miss; j++) {
             int at = j;

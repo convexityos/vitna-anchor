@@ -88,11 +88,12 @@ const char* vitna_cuda_moe_report(const struct vitna_cuda_model* g, char* buf, s
 /**
  * From now on, a step of a mixture of experts shares the experts the device
  * lacks between the CPU, on threads threads, and copies to the device, while
- * the device runs those it holds (gate A8): the CPU takes the share it
- * finishes as the copies of the rest do, by what each has cost so far, the
- * least used first. The CPU computes in the GPU's arithmetic (warp.h) and
- * the outputs are added in the device's order, so every value, the logits
- * among them, is the bits it would have been, whichever experts ran where.
+ * the device runs those it holds (gate A8): the CPU takes as many as let a
+ * layer finish soonest, by what an expert has cost each lately, the least
+ * used first, and none when copying them all is sooner. The CPU computes
+ * in the GPU's arithmetic (warp.h) and the outputs are added in the
+ * device's order, so every value, the logits among them, is the bits it
+ * would have been, whichever experts ran where.
  * Rows (vitna_cuda_moe_rows_*) copy in what they lack, as before. False,
  * with the reason in err, for a dense model or if the memory or the threads
  * cannot be had.

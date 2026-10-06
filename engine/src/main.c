@@ -71,8 +71,9 @@ static void print_usage(const char* prog) {
     printf("the GPU has free once the rest of the model is there, less 512 MiB); the logits are the same, bit for bit,\n");
     printf("whatever its size.\n");
     printf("--cpu-experts <threads>, with --device cuda, shares a step's experts that the GPU lacks between that many CPU\n");
-    printf("threads and copies to the GPU, by what each has cost so far, while the GPU runs those it holds. The CPU\n");
-    printf("computes in the GPU's order, so the logits are the same, bit for bit.\n\n");
+    printf("threads and copies to the GPU, as many to the CPU as let a layer finish soonest by what each has cost\n");
+    printf("lately, and none when copying is sooner, while the GPU runs those it holds. The CPU computes in the GPU's\n");
+    printf("order, so the logits are the same, bit for bit.\n\n");
     printf("run       prints the prompt's continuation as it is generated\n");
     printf("generate  prints JSON: the prompt's ids, the new ids and their text. --logits-out writes each\n");
     printf("          step's logits as float32, little-endian, steps x vocab. --timing prints to stderr how\n");
