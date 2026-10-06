@@ -63,14 +63,22 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
     const vitna_json_value_t* scaling = vitna_json_get(cfg, "rope_scaling");
     const vitna_json_value_t* clip = vitna_json_get(cfg, "clip_qkv");
     const bool olmoe = model_type && strcmp(model_type, "olmoe") == 0;
+    const bool qwen3 = model_type && strcmp(model_type, "qwen3_moe") == 0;
+    const bool moe = olmoe || qwen3;
+    /* Qwen3-MoE's dense layers among the experts', which its configs leave empty. */
+    const vitna_json_value_t* dense = vitna_json_get(cfg, "mlp_only_layers");
+    const bool some_dense = dense && !vitna_json_is_null(dense) && !(dense->type == VITNA_JSON_ARRAY && dense->u.array.count == 0);
     double d;
     memset(c, 0, sizeof(*c));
-    if (!model_type || (strcmp(model_type, "llama") != 0 && !olmoe)) {
-        fail(err, err_len, "config.json: model_type is %s, and only llama and olmoe are supported%s", model_type ? model_type : "missing", NULL);
+    if (!model_type || (strcmp(model_type, "llama") != 0 && !moe)) {
+        fail(err, err_len, "config.json: model_type is %s, and only llama, olmoe and qwen3_moe are supported%s", model_type ? model_type : "missing",
+             NULL);
     } else if (olmoe && clip && !vitna_json_is_null(clip)) {
         fail(err, err_len, "config.json: clip_qkv is not supported%s%s", NULL, NULL);
-    } else if (olmoe && !cfg_false_or_missing(cfg, "norm_topk_prob")) {
-        fail(err, err_len, "config.json: norm_topk_prob true is not supported%s%s", NULL, NULL);
+    } else if (qwen3 && !cfg_false_or_missing(cfg, "use_sliding_window")) {
+        fail(err, err_len, "config.json: use_sliding_window true is not supported%s%s", NULL, NULL);
+    } else if (qwen3 && (some_dense || (vitna_json_as_number(vitna_json_get(cfg, "decoder_sparse_step"), &d) && d != 1.0))) {
+        fail(err, err_len, "config.json: dense layers among the experts' (mlp_only_layers, decoder_sparse_step) are not supported%s%s", NULL, NULL);
     } else if (!act || strcmp(act, "silu") != 0) {
         fail(err, err_len, "config.json: hidden_act is %s, and only silu is supported%s", act ? act : "missing", NULL);
     } else if (scaling && !vitna_json_is_null(scaling)) {
@@ -98,21 +106,27 @@ static bool read_config(vitna_llama_config_t* c, const char* dir, char* err, siz
             fail(err, err_len, "config.json: pretraining_tp other than 1 is not supported%s%s", NULL, NULL);
         } else if (c->n_heads % c->n_kv_heads != 0 || c->head_dim % 2 != 0) {
             fail(err, err_len, "config.json: heads do not divide into key-value groups, or head_dim is odd%s%s", NULL, NULL);
-        } else if (olmoe && !(cfg_size(cfg, "num_experts", &c->n_experts, true, err, err_len) &&
-                              cfg_size(cfg, "num_experts_per_tok", &c->n_experts_used, true, err, err_len))) {
+        } else if (moe && !(cfg_size(cfg, "num_experts", &c->n_experts, true, err, err_len) &&
+                            cfg_size(cfg, "num_experts_per_tok", &c->n_experts_used, true, err, err_len))) {
             /* err is set */
-        } else if (olmoe && (c->n_experts_used > c->n_experts || c->n_experts_used > VITNA_EXPERTS_USED_MAX)) {
+        } else if (moe && (c->n_experts_used > c->n_experts || c->n_experts_used > VITNA_EXPERTS_USED_MAX)) {
             fail(err, err_len, "config.json: num_experts_per_tok is more than num_experts, or more than this engine takes%s%s", NULL, NULL);
+        } else if (qwen3 && !cfg_size(cfg, "moe_intermediate_size", &c->intermediate, true, err, err_len)) {
+            /* err is set. Qwen3-MoE's intermediate_size is the width of a dense layer it does not have; an expert's is this. */
         } else {
             /* Where config.json leaves it out, each config class's default:
-             * LlamaConfig's 1e-6, OlmoeConfig's 1e-5. */
+             * LlamaConfig's and Qwen3MoeConfig's 1e-6, OlmoeConfig's 1e-5. */
             c->rms_eps = olmoe ? 1e-5f : 1e-6f;
             c->rope_theta = 10000.0f;
             if (vitna_json_as_number(vitna_json_get(cfg, "rms_norm_eps"), &d)) c->rms_eps = (float)d;
             if (vitna_json_as_number(vitna_json_get(cfg, "rope_theta"), &d)) c->rope_theta = (float)d;
             c->tied_embeddings = false;
             vitna_json_as_bool(vitna_json_get(cfg, "tie_word_embeddings"), &c->tied_embeddings);
-            c->qk_norm = olmoe;
+            c->qk_norm = moe;
+            c->qk_norm_per_head = qwen3;
+            /* OlmoeConfig's and Qwen3MoeConfig's default is false. */
+            c->renormalize = false;
+            if (moe) vitna_json_as_bool(vitna_json_get(cfg, "norm_topk_prob"), &c->renormalize);
             ok = true;
         }
     }
@@ -357,10 +371,10 @@ bool vitna_llama_load_ex(vitna_llama_t* m, const char* dir, const char* weights,
         }
         if (ok && c->qk_norm) {
             snprintf(name, sizeof(name), "model.layers.%zu.self_attn.q_norm.weight", l);
-            ok = (L->q_norm = norm_weights(m, name, q_dim, err, err_len)) != NULL;
+            ok = (L->q_norm = norm_weights(m, name, c->qk_norm_per_head ? c->head_dim : q_dim, err, err_len)) != NULL;
             if (ok) {
                 snprintf(name, sizeof(name), "model.layers.%zu.self_attn.k_norm.weight", l);
-                ok = (L->k_norm = norm_weights(m, name, kv_dim, err, err_len)) != NULL;
+                ok = (L->k_norm = norm_weights(m, name, c->qk_norm_per_head ? c->head_dim : kv_dim, err, err_len)) != NULL;
             }
         }
     }
@@ -649,7 +663,9 @@ static void prefetch_layer(vitna_llama_t* m, size_t layer) {
  * in float32; the experts with the n_experts_used largest weights, which are
  * the largest logits, largest first and the lower expert first between
  * equals, into chosen; and each weighted by its own share of the softmax,
- * not renormalized over those used. The experts the token goes through are
+ * or with renormalize (norm_topk_prob, as Qwen3MoeSparseMoeBlock routes)
+ * by that share over the shares of the experts used, added largest first as
+ * torch.topk returns them. The experts the token goes through are
  * written to order, in order of expert, with their weights in weights: the
  * router's choice, or where a test pins them the pinned experts. The
  * router's logits and choice are traced for tests. The CPU's
@@ -675,6 +691,21 @@ static void route(vitna_llama_t* m, size_t l, size_t pos, const float* logits, i
     float sum = 0.0f;
     for (size_t e = 0; e < E; e++) sum += expf(logits[e] - max);
     for (size_t k = 0; k < K; k++) weights[k] = expf(logits[order[k]] - max) / sum;
+    if (c->renormalize) {
+        /* The shares of the experts used, added largest first, as torch.topk
+         * orders the weights that Qwen3MoeSparseMoeBlock sums. */
+        float share[VITNA_EXPERTS_USED_MAX];
+        memcpy(share, weights, K * sizeof(float));
+        for (size_t i = 1; i < K; i++) {
+            const float s = share[i];
+            size_t j = i;
+            for (; j > 0 && share[j - 1] < s; j--) share[j] = share[j - 1];
+            share[j] = s;
+        }
+        float total = 0.0f;
+        for (size_t k = 0; k < K; k++) total += share[k];
+        for (size_t k = 0; k < K; k++) weights[k] /= total;
+    }
 }
 
 /* How many of layer l's chosen experts the lookahead had named, when it
@@ -862,7 +893,13 @@ bool vitna_llama_step(vitna_llama_t* m, size_t seq, int32_t token, float* logits
         vitna_matvec(L->q.data, L->q.dtype, m->xn, m->q, L->q.rows, L->q.cols);
         vitna_matvec(L->k.data, L->k.dtype, m->xn, m->k, L->k.rows, L->k.cols);
         vitna_matvec(L->v.data, L->v.dtype, m->xn, m->v, L->v.rows, L->v.cols);
-        if (c->qk_norm) {
+        if (c->qk_norm && c->qk_norm_per_head) {
+            /* Qwen3: each head of q and k normalized alone, every head with
+             * the same weights, as Qwen3MoeAttention normalizes q and k
+             * viewed as [heads][head_dim]. */
+            for (size_t h = 0; h < c->n_heads; h++) vitna_rmsnorm(m->q + h * hd, L->q_norm, m->q + h * hd, hd, c->rms_eps);
+            for (size_t h = 0; h < c->n_kv_heads; h++) vitna_rmsnorm(m->k + h * hd, L->k_norm, m->k + h * hd, hd, c->rms_eps);
+        } else if (c->qk_norm) {
             /* OLMoE: q and k each normalized whole, across their heads. */
             vitna_rmsnorm(m->q, L->q_norm, m->q, L->q.rows, c->rms_eps);
             vitna_rmsnorm(m->k, L->k_norm, m->k, L->k.rows, c->rms_eps);

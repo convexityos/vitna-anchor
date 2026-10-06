@@ -323,6 +323,7 @@ struct vitna_cuda_model {
      * and the experts are in the cache below. */
     bool moe;
     bool qk_norm;
+    bool qk_head_norm;      /* QK-norm a head at a time (Qwen3), else across the heads (OLMoE) */
     int n_experts, n_used;
     float* k_raw;           /* QK-norm: a token's keys before it, n_kv_heads * head_dim */
     float* router_out;      /* [2][n_experts]: a layer's router logits, then the next layer's guess */
@@ -990,6 +991,38 @@ __global__ void qk_norm_rope_kernel(float* __restrict__ q, const float* __restri
         const float a = vs[ra], b = vs[rb];
         out[ra] = a * cos_t[j] - b * sin_t[j];
         out[rb] = b * cos_t[j] + a * sin_t[j];
+    }
+}
+
+/* The same for Qwen3, whose QK-norm normalizes each head alone, every head
+ * of the queries with the same head_dim weights and every head of the keys
+ * with theirs, as Qwen3MoeAttention normalizes q and k viewed as
+ * [heads][head_dim], as model.c does: a block a head. Block b < n_heads
+ * takes query head b, in place; the rest key head b - n_heads, from k_raw
+ * into the position's slot in the cache. Each head is rotated as
+ * qk_norm_rope_kernel rotates it. blockIdx.y is the row. */
+__global__ void qk_head_norm_rope_kernel(float* __restrict__ q, const float* __restrict__ k_raw, float* __restrict__ kc,
+                                         const float* __restrict__ q_norm, const float* __restrict__ k_norm, float eps,
+                                         const float* __restrict__ cos_all, const float* __restrict__ sin_all, const row_t* __restrict__ rows,
+                                         size_t seq_stride, int n_heads, int n_kv_heads, int head_dim) {
+    extern __shared__ float4 shared4[];
+    __shared__ float red[WARPS];
+    float* vs = reinterpret_cast<float*>(shared4);
+    const int t = blockIdx.y;
+    const bool keys = (int)blockIdx.x >= n_heads;
+    const int h = keys ? (int)blockIdx.x - n_heads : (int)blockIdx.x;
+    const float* src = keys ? k_raw + ((size_t)t * n_kv_heads + h) * head_dim : q + ((size_t)t * n_heads + h) * head_dim;
+    norm_to_shared(src, keys ? k_norm : q_norm, vs, head_dim, eps, red);
+    const int half = head_dim / 2;
+    const size_t pos = (size_t)rows[t].pos;
+    const float* cos_t = cos_all + pos * half;
+    const float* sin_t = sin_all + pos * half;
+    float* out = keys ? kc + (size_t)rows[t].seq * seq_stride + pos * ((size_t)n_kv_heads * head_dim) + (size_t)h * head_dim
+                      : q + ((size_t)t * n_heads + h) * head_dim;
+    for (int j = threadIdx.x; j < half; j += THREADS) {
+        const float a = vs[j], b = vs[j + half];
+        out[j] = a * cos_t[j] - b * sin_t[j];
+        out[j + half] = b * cos_t[j] + a * sin_t[j];
     }
 }
 
@@ -2117,6 +2150,22 @@ static size_t attention_shared(const struct vitna_cuda_model* g) {
  * and the query, key and value projections, QK-norm where the model has it,
  * the rotary embedding, attention over the cache, and the output projection
  * added to the residual. */
+/* Layer L's QK-norm and rotation for n rows of q and k_raw, the keys into
+ * the cache: across the heads (qk_norm_rope_kernel) or a head at a time
+ * (qk_head_norm_rope_kernel), as the model normalizes them. */
+static void enqueue_qk_norm(const struct vitna_cuda_model* g, cudaStream_t s, const dlayer_t* L, float* q, const float* k_raw, float* kc,
+                            const row_t* rows, size_t seq_stride, int n) {
+    const int hd = g->head_dim;
+    const size_t q_dim = (size_t)g->n_heads * hd, kv_dim = (size_t)g->n_kv_heads * hd;
+    if (g->qk_head_norm) {
+        qk_head_norm_rope_kernel<<<dim3(g->n_heads + g->n_kv_heads, n), THREADS, (size_t)hd * sizeof(float), s>>>(
+            q, k_raw, kc, L->q_norm, L->k_norm, g->eps, g->cos_t, g->sin_t, rows, seq_stride, g->n_heads, g->n_kv_heads, hd);
+    } else {
+        qk_norm_rope_kernel<<<dim3(2, n), THREADS, (q_dim > kv_dim ? q_dim : kv_dim) * sizeof(float), s>>>(
+            q, k_raw, kc, L->q_norm, L->k_norm, g->eps, g->cos_t, g->sin_t, rows, seq_stride, g->n_heads, g->n_kv_heads, hd);
+    }
+}
+
 static void enqueue_attention(const struct vitna_cuda_model* g, int l) {
     const cudaStream_t s = g->stream;
     const int H = g->hidden, hd = g->head_dim, half = hd / 2;
@@ -2130,10 +2179,7 @@ static void enqueue_attention(const struct vitna_cuda_model* g, int l) {
     LAUNCH_QKV(L->q.dtype, L->v.dtype, attn_in_kernel, grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2), (size_t)H * sizeof(float),
                s, g->x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w, g->q, kc, vc, g->cos_t, g->sin_t, g->rows, seq_stride, H, g->n_heads,
                g->n_kv_heads, hd, L->q_norm ? g->k_raw : (float*)NULL);
-    if (L->q_norm) {
-        qk_norm_rope_kernel<<<2, THREADS, (size_t)(q_dim > kv_dim ? q_dim : kv_dim) * sizeof(float), s>>>(
-            g->q, g->k_raw, kc, L->q_norm, L->k_norm, g->eps, g->cos_t, g->sin_t, g->rows, seq_stride, g->n_heads, g->n_kv_heads, hd);
-    }
+    if (L->q_norm) enqueue_qk_norm(g, s, L, g->q, g->k_raw, kc, g->rows, seq_stride, 1);
     attention_kernel<<<dim3(1, g->n_kv_heads, ATTENTION_SPLITS), THREADS, attention_shared(g), s>>>(
         g->q, kc, vc, g->att, g->part_m, g->part_l, g->part_o, g->done, g->rows, seq_stride, hd, kv_dim, group, g->scale, 0);
     LAUNCH(L->o.dtype, matvec_add_kernel, grid_for(g, H), 0, s, L->o.w, g->att, g->x, H, q_dim);
@@ -2432,7 +2478,7 @@ static bool check_shapes(const vitna_llama_t* m, char* err, size_t err_len) {
     if (c->hidden * sizeof(float) > 48 * 1024) {
         return fail(err, err_len, "the GPU path needs hidden to be at most 12288");
     }
-    if (c->qk_norm && (c->n_heads * c->head_dim * sizeof(float) > 48 * 1024 || c->n_kv_heads * c->head_dim * sizeof(float) > 48 * 1024)) {
+    if (c->qk_norm && !c->qk_norm_per_head && (c->n_heads * c->head_dim * sizeof(float) > 48 * 1024 || c->n_kv_heads * c->head_dim * sizeof(float) > 48 * 1024)) {
         return fail(err, err_len, "the GPU path's QK-norm needs n_heads * head_dim to be at most 12288");
     }
     if (c->n_experts && c->n_experts_used > EXPERTS_MAX) {
@@ -2655,6 +2701,7 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
     g->scale = 1.0f / sqrtf((float)c->head_dim); /* as model.c */
     g->moe = c->n_experts > 0;
     g->qk_norm = c->qk_norm;
+    g->qk_head_norm = c->qk_norm_per_head;
     g->n_experts = (int)c->n_experts;
     g->n_used = (int)c->n_experts_used;
     /* A mixture of experts runs a token at a time, its prompts too. */
@@ -2712,7 +2759,9 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         const vitna_matrix_t* mats[8] = { &L->q, &L->k, &L->v, &L->o, &L->gate, &L->up, &L->down, &L->router };
         for (int i = 0; i < 8; i++) total += padded(matrix_bytes(mats[i])); /* those a model lacks are empty */
         total += 2 * padded(c->hidden * sizeof(float));
-        if (c->qk_norm) total += padded(q_dim * sizeof(float)) + padded(kv_dim * sizeof(float));
+        if (c->qk_norm) {
+            total += c->qk_norm_per_head ? 2 * padded(c->head_dim * sizeof(float)) : padded(q_dim * sizeof(float)) + padded(kv_dim * sizeof(float));
+        }
     }
     if (g->moe) {
         total += padded(kv_dim * sizeof(float)) + padded(2 * c->n_experts * sizeof(float)) +
@@ -2799,8 +2848,8 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         UPLOAD_FLOATS(D->attn_norm, L->attn_norm, c->hidden);
         UPLOAD_FLOATS(D->mlp_norm, L->mlp_norm, c->hidden);
         if (c->qk_norm) {
-            UPLOAD_FLOATS(D->q_norm, L->q_norm, q_dim);
-            UPLOAD_FLOATS(D->k_norm, L->k_norm, kv_dim);
+            UPLOAD_FLOATS(D->q_norm, L->q_norm, c->qk_norm_per_head ? c->head_dim : q_dim);
+            UPLOAD_FLOATS(D->k_norm, L->k_norm, c->qk_norm_per_head ? c->head_dim : kv_dim);
         }
     }
     UPLOAD_MATRIX(g->embed, m->embed);
@@ -3731,10 +3780,7 @@ static void enqueue_rows_attention(const struct vitna_cuda_model* g, int l, int 
                dim3(grid_for(g, (g->n_heads + g->n_kv_heads) * half + kv_dim / 2), blocks_for((size_t)n, (size_t)G)), (size_t)G * H * sizeof(float),
                s, g->r_x, L->attn_norm, g->eps, L->q.w, L->k.w, L->v.w, g->r_q, kc, vc, g->cos_t, g->sin_t, g->r_rows, seq_stride, H,
                g->n_heads, g->n_kv_heads, hd, G, n, L->q_norm ? g->r_kraw : (float*)NULL);
-    if (L->q_norm) {
-        qk_norm_rope_kernel<<<dim3(2, n), THREADS, (size_t)(q_dim > kv_dim ? q_dim : kv_dim) * sizeof(float), s>>>(
-            g->r_q, g->r_kraw, kc, L->q_norm, L->k_norm, g->eps, g->cos_t, g->sin_t, g->r_rows, seq_stride, g->n_heads, g->n_kv_heads, hd);
-    }
+    if (L->q_norm) enqueue_qk_norm(g, s, L, g->r_q, g->r_kraw, kc, g->r_rows, seq_stride, n);
     /* Attention keeps its slices for MULTI_MAX rows, so the rows go that many at a time. */
     for (int r0 = 0; r0 < n; r0 += MULTI_MAX) {
         const int t = n - r0 < MULTI_MAX ? n - r0 : MULTI_MAX;
