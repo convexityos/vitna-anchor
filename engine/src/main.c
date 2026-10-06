@@ -13,6 +13,7 @@
 #include "model.h"
 #include "ops.h"
 #include "api.h"
+#include "chat.h"
 #include "safetensors.h"
 #include "sampler.h"
 #include "server.h"
@@ -50,6 +51,7 @@ static void print_usage(const char* prog) {
     printf("               [--router-out <file>] [--experts-out <file>] [--experts-in <file>]\n");
     printf("  %s tokenize --model <dir> [--text <text>]\n", prog);
     printf("  %s normalize --model <dir> [--text <text>]\n", prog);
+    printf("  %s chat-prompt (a JSON request on each line of stdin)\n", prog);
     printf("  %s embed    --model <dir> [--text <text>] [--pooling cls|mean] [--threads <n>] [--timing]\n", prog);
     printf("  %s serve    [--model <dir>] [--model-id <id>] [--host <ip>] [--port <port>] [--no-prefix-cache]\n", prog);
     printf("               [--speculate <k>] [--parallel <n>] [--threads <n>]\n");
@@ -100,6 +102,9 @@ static void print_usage(const char* prog) {
     printf("          per line from stdin and prints one array per line\n");
     printf("normalize prints, as a JSON string, the text the tokenizer's normalizer makes of --text (NFC, or\n");
     printf("          the text as it is when there is none); without --text, of each JSON string on a line of stdin\n");
+    printf("chat-prompt prints, as a JSON string, the prompt Qwen3's chat template writes for each line of stdin, a\n");
+    printf("          JSON object with messages in OpenAI's shape and optionally tools, enable_thinking and\n");
+    printf("          add_generation_prompt (true unless given), as transformers' apply_chat_template would\n");
     printf("embed     with an embedding model (a BERT-architecture sentence-transformers model, such as\n");
     printf("          BAAI/bge-small-en-v1.5), prints for --text, or for each JSON string on a line of stdin, a\n");
     printf("          line of JSON: its token ids, the pooled vector's norm, and its embedding, pooled and\n");
@@ -430,6 +435,69 @@ static int each_text(const args_t* a, text_fn fn) {
 
 static int cmd_tokenize(const args_t* a) {
     return each_text(a, print_encoding);
+}
+
+/* chat-prompt: each line of stdin a JSON object, {"messages": [...],
+ * "tools": [...], "enable_thinking": false, "add_generation_prompt": true},
+ * the last three optional, and for each the prompt Qwen3's chat template
+ * renders, as a JSON string on a line (gate A11, chat.h). No model is read:
+ * the template is the engine's own. */
+static int cmd_chat_prompt(void) {
+    binary_stdio();
+    size_t cap = 1 << 16, len = 0;
+    char* buf = (char*)malloc(cap);
+    for (size_t got; buf && (got = fread(buf + len, 1, cap - len, stdin)) > 0;) {
+        len += got;
+        if (len == cap) {
+            char* grown = (char*)realloc(buf, cap *= 2);
+            if (!grown) free(buf);
+            buf = grown;
+        }
+    }
+    if (!buf) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    int rc = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= len && rc == 0; i++) {
+        if (i < len && buf[i] != '\n') continue;
+        size_t end = i;
+        if (end > start && buf[end - 1] == '\r') end--;
+        if (end > start) {
+            char err[200];
+            vitna_json_doc_t* doc = vitna_json_parse(buf + start, end - start, err, sizeof(err));
+            const vitna_json_value_t* req = doc ? vitna_json_root(doc) : NULL;
+            if (!req || req->type != VITNA_JSON_OBJECT) {
+                fprintf(stderr, "line is not a JSON object: %s\n", doc ? "wrong type" : err);
+                rc = 1;
+            } else {
+                bool b;
+                int think = -1;
+                if (vitna_json_as_bool(vitna_json_get(req, "enable_thinking"), &b)) think = b ? 1 : 0;
+                bool gen = true;
+                if (vitna_json_as_bool(vitna_json_get(req, "add_generation_prompt"), &b)) gen = b;
+                vitna_strbuf_t prompt, line;
+                vitna_sb_init(&prompt);
+                vitna_sb_init(&line);
+                if (!vitna_chat_qwen3(&prompt, vitna_json_get(req, "messages"), vitna_json_get(req, "tools"), think, gen, err, sizeof(err))) {
+                    fprintf(stderr, "chat-prompt: %s\n", err);
+                    rc = 1;
+                } else {
+                    vitna_sb_json_string(&line, (const unsigned char*)prompt.data, prompt.len);
+                    vitna_sb_puts(&line, "\n");
+                    fwrite(line.data, 1, line.len, stdout);
+                }
+                vitna_sb_free(&prompt);
+                vitna_sb_free(&line);
+            }
+            vitna_json_free(doc);
+        }
+        start = i + 1;
+    }
+    free(buf);
+    fflush(stdout);
+    return rc;
 }
 
 static int cmd_normalize(const args_t* a) {
@@ -1564,6 +1632,7 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "generate") == 0) return cmd_generate(&a);
     if (strcmp(cmd, "logits") == 0) return cmd_logits(&a);
     if (strcmp(cmd, "tokenize") == 0) return cmd_tokenize(&a);
+    if (strcmp(cmd, "chat-prompt") == 0) return cmd_chat_prompt();
     if (strcmp(cmd, "normalize") == 0) return cmd_normalize(&a);
     if (strcmp(cmd, "embed") == 0) return cmd_embed(&a);
     if (strcmp(cmd, "info") == 0) return cmd_info(a.model);

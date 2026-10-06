@@ -173,7 +173,8 @@ static bool parse_string(parser_t* ps, const char** out, size_t* out_len) {
     return true;
 }
 
-static bool parse_number(parser_t* ps, double* out) {
+static bool parse_number(parser_t* ps, vitna_json_value_t* v) {
+    double* out = &v->u.number;
     const char* s = ps->p;
     const char* p = s;
     if (p < ps->end && *p == '-') p++;
@@ -211,6 +212,12 @@ static bool parse_number(parser_t* ps, double* out) {
         tmp[n] = '\0';
         *out = strtod(tmp, NULL);
     }
+    char* lit = (char*)arena_alloc(ps->doc, n + 1);
+    if (!lit) return fail(ps, "out of memory");
+    memcpy(lit, s, n);
+    lit[n] = '\0';
+    v->lit = lit;
+    v->lit_len = n;
     ps->p = p;
     return true;
 }
@@ -348,7 +355,7 @@ static vitna_json_value_t* parse_value(parser_t* ps) {
             result = v;
         }
     } else if (*ps->p == '-' || (*ps->p >= '0' && *ps->p <= '9')) {
-        if (parse_number(ps, &v->u.number)) {
+        if (parse_number(ps, v)) {
             v->type = VITNA_JSON_NUMBER;
             result = v;
         }

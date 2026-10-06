@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "api.h"
+#include "chat.h"
 #include "crypto.h"
 #include "exact.h"
 #include "expert_stream.h"
@@ -66,6 +67,45 @@ static bool write_file(const char* path, const void* data, size_t n) {
     bool ok = fwrite(data, 1, n, f) == n;
     fclose(f);
     return ok;
+}
+
+/* --- JSON as Python writes it (chat.h, gate A11) --- */
+
+static void test_py_json(void) {
+    /* Each as Python's repr printed it, which reads back to the same double,
+     * which the engine must print the same: the shortest round trip, fixed
+     * from 1e-4 to below 1e16 with a ".0" when whole, exponents of two digits
+     * or more otherwise. */
+    static const char* const reprs[] = {
+        "0.1", "0.3333333333333333", "0.6666666666666666", "1e+16", "1000000000000000.0", "123456789.123", "5e-324",
+        "1.7976931348623157e+308", "9007199254740992.0", "9007199254740994.0", "0.0001", "1e-05", "-1.5e-07", "1e+22", "1e+21",
+        "1.2345678901234567e+19", "3.14159", "100.0", "-0.0", "1e+100", "1.5e-300", "0.30000000000000004", "12345678000000.0",
+        "4.35", "2.675", "1e-07", "1.23e-18", "0.0",
+    };
+    char buf[48];
+    for (size_t i = 0; i < sizeof(reprs) / sizeof(reprs[0]); i++) {
+        vitna_py_float_repr(strtod(reprs[i], NULL), buf, sizeof(buf));
+        CHECK(strcmp(buf, reprs[i]) == 0, "repr of %s: %s", reprs[i], buf);
+    }
+
+    /* Numbers keep what the document wrote: 1 an int, 1.0 a float. */
+    const char* doc_text = "{\"a\": [1, 1.0, -0, -0.0, 1e2, 1E-7, 12345678901234567890, 2.50], \"s\": \"q\\\"b\\\\n\\n\\t\\u0001\\u007f\\u00e9\", "
+                           "\"d\": 1, \"d\": 2, \"e\": {}}";
+    char err[160];
+    vitna_json_doc_t* doc = vitna_json_parse(doc_text, strlen(doc_text), err, sizeof(err));
+    CHECK(doc != NULL, "parses: %s", err);
+    if (doc) {
+        vitna_strbuf_t sb;
+        vitna_sb_init(&sb);
+        vitna_json_write_py(&sb, vitna_json_root(doc));
+        /* What json.dumps(json.loads(doc_text), ensure_ascii=False) gives,
+         * a repeated key where it first came with its last value. */
+        const char* want = "{\"a\": [1, 1.0, 0, -0.0, 100.0, 1e-07, 12345678901234567890, 2.5], \"s\": \"q\\\"b\\\\n\\n\\t\\u0001\x7f\xc3\xa9\", "
+                           "\"d\": 2, \"e\": {}}";
+        CHECK(sb.ok && strcmp(sb.data, want) == 0, "written as Python writes it: %s", sb.data);
+        vitna_sb_free(&sb);
+        vitna_json_free(doc);
+    }
 }
 
 /* --- JSON --- */
@@ -1659,6 +1699,7 @@ int main(void) {
     test_api_helpers();
     test_jsonpfx();
     test_json();
+    test_py_json();
     test_safetensors();
     test_unicode();
     test_nfc();
