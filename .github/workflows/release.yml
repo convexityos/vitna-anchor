@@ -1,108 +1,162 @@
 name: Release
 
+# A release: the engine built for Linux and Windows on x86-64 with the CUDA
+# path, and for macOS on arm64 on the CPU, with the installers (install/)
+# filled in with the release's version and each engine's SHA-256, and a
+# SHA256SUMS over everything. A tag (v1.2.3) publishes it; started by hand it
+# builds everything and publishes nothing, leaving the files as the run's
+# artifacts, a release's dry run.
+#
+# An engine built with the CUDA path runs on a machine with no NVIDIA GPU or
+# driver too, on the CPU: the CUDA runtime is linked in statically and finds
+# the driver only when asked for the GPU.
+
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      publish_npm:
+        description: "Also publish the Node.js package to npm (never done on a tag)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  packages: write
+
+# The architectures a release's CUDA engine carries code for: Turing (RTX 20,
+# GTX 16), Ampere (A100, RTX 30), Ada (RTX 40), Hopper and Blackwell (RTX 50),
+# and Blackwell's PTX, which a later GPU's driver compiles. CUDA 13 dropped
+# the GPUs before Turing.
+env:
+  CUDA_ARCHITECTURES: "75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
 
 jobs:
-  build-binaries:
-    name: Build Binary (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux-x86_64
-            binary: vitna-anchor-linux-x86_64
-            artifact-name: vitna-anchor-linux-x86_64
-            build-cmd: |
-              cd engine
-              make
-              cp vitna-anchor ../vitna-anchor-linux-x86_64
-              chmod +x ../vitna-anchor-linux-x86_64
-          - os: macos-latest
-            target: macos-arm64
-            binary: vitna-anchor-macos-arm64
-            artifact-name: vitna-anchor-macos-arm64
-            build-cmd: |
-              cd engine
-              make
-              cp vitna-anchor ../vitna-anchor-macos-arm64
-              chmod +x ../vitna-anchor-macos-arm64
-          - os: windows-latest
-            target: windows-x64
-            binary: vitna-anchor-windows-x64.exe
-            artifact-name: vitna-anchor-windows-x64.exe
-            build-cmd: |
-              cmake -B engine/build -S engine
-              cmake --build engine/build --config Release
-              cp engine/build/Release/vitna-anchor.exe vitna-anchor-windows-x64.exe
-
+  linux:
+    name: Linux x86-64, with the CUDA path
+    runs-on: ubuntu-latest
+    # Ubuntu 22.04's glibc, 2.35, so the engine runs on it and later.
+    container: nvidia/cuda:13.1.1-devel-ubuntu22.04
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Compile Native C11 Engine
-        shell: bash
-        run: ${{ matrix.build-cmd }}
-
-      - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v7
+      - name: Install make, a host compiler and CMake
+        run: apt-get update && apt-get install -y --no-install-recommends make gcc g++ cmake
+      - name: Build the engine and its unit tests
+        run: |
+          cmake -B engine/build -S engine -DVITNA_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" -DCMAKE_BUILD_TYPE=Release
+          cmake --build engine/build --parallel
+      - name: The unit tests pass, and with no GPU the engine plans for the CPU
+        run: |
+          ./engine/build/vitna-anchor-tests
+          ./engine/build/vitna-anchor hardware --dir .
+          ./engine/build/vitna-anchor plan --dir models | head -4
+      - name: Keep it
+        run: mkdir -p dist && cp engine/build/vitna-anchor dist/vitna-anchor-linux-x86_64
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact-name }}
-          path: ${{ matrix.binary }}
+          name: vitna-anchor-linux-x86_64
+          path: dist/vitna-anchor-linux-x86_64
 
-  publish-release:
-    name: Publish Release Assets and Package
-    needs: [build-binaries]
+  windows:
+    name: Windows x64, with the CUDA path
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the CUDA toolkit's compiler and runtime
+        # v0.2.36, pinned by commit.
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: "13.1.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "nvvm", "visual_studio_integration"]'
+      - name: Build the engine and its unit tests
+        shell: bash
+        run: |
+          cmake -B engine/build -S engine -DVITNA_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES"
+          cmake --build engine/build --config Release --parallel
+      - name: The unit tests pass, and with no GPU the engine plans for the CPU
+        shell: bash
+        run: |
+          ./engine/build/Release/vitna-anchor-tests.exe
+          ./engine/build/Release/vitna-anchor.exe hardware --dir .
+          ./engine/build/Release/vitna-anchor.exe plan --dir models | head -4
+      - name: Keep it
+        shell: bash
+        run: mkdir -p dist && cp engine/build/Release/vitna-anchor.exe dist/vitna-anchor-windows-x64.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vitna-anchor-windows-x64
+          path: dist/vitna-anchor-windows-x64.exe
+
+  macos:
+    name: macOS arm64, on the CPU
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the engine and its unit tests
+        run: make -C engine all vitna-anchor-tests
+      - name: The unit tests pass
+        run: ./engine/vitna-anchor-tests
+      - name: Keep it
+        run: mkdir -p dist && cp engine/vitna-anchor dist/vitna-anchor-macos-arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vitna-anchor-macos-arm64
+          path: dist/vitna-anchor-macos-arm64
+
+  publish:
+    name: The installers filled in, the checksums, and the release
+    needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          node-version: 20.x
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Run Test Suite
-        run: npm test
-
-      - name: Verify Package Tarball Packaging
-        run: npm pack --dry-run
-
-      - name: Download Built Binaries
-        uses: actions/download-artifact@v4
-        with:
-          path: release-binaries
+          path: dist
           merge-multiple: true
-
-      - name: Compute SHA256 Checksums
+      - name: Fill in the installers with the version and each engine's SHA-256
         run: |
-          cd release-binaries
-          sha256sum vitna-anchor-* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+          version="${GITHUB_REF_NAME}"
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) version="dry-run-$GITHUB_RUN_ID" ;; esac
+          linux=$(sha256sum dist/vitna-anchor-linux-x86_64 | cut -d ' ' -f 1)
+          windows=$(sha256sum dist/vitna-anchor-windows-x64.exe | cut -d ' ' -f 1)
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA256_LINUX_X86_64@/$linux/g" install/install.sh > dist/install.sh
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA256_WINDOWS_X64@/$windows/g" install/install.ps1 > dist/install.ps1
+          # A placeholder left in would ship an installer that refuses to run.
+          if grep -n "@[A-Z0-9_]*@" dist/install.sh dist/install.ps1; then exit 1; fi
+          sh -n dist/install.sh
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          sha256sum vitna-anchor-* install.sh install.ps1 > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v7
         with:
-          files: |
-            release-binaries/*
+          name: release
+          path: dist/*
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        # v3.0.3, pinned by commit.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          files: dist/*
           draft: false
           prerelease: false
           generate_release_notes: true
 
-      - name: Publish to NPM Registry
-        if: startsWith(github.ref, 'refs/tags/v') && env.NPM_AUTH_TOKEN != ''
-        run: npm publish --access public
+  npm:
+    name: The Node.js package, to npm, only when asked
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_npm
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+          registry-url: "https://registry.npmjs.org"
+      - run: npm test
+      - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
