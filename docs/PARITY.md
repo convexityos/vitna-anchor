@@ -24,7 +24,7 @@ Its quality is measured statistically against an FP16 path (KL divergence, top-1
 
 ## Where Anchor stands
 
-See the README. In short: two models, SmolLM2-135M and OLMoE-1B-7B, in float32 over their published weights, on a CPU or an NVIDIA GPU, matched to a pinned reference. Results are the same bit for bit however the experts are cached or read, under speculation and with requests running together. OLMoE on the RTX 3070 here decodes 61 tokens a second from memory and 8.7 with its experts read off the drive.
+As of 2026-10-06 gates A7 to A10 have passed, and the README's table says what each showed. When this was written: two models, SmolLM2-135M and OLMoE-1B-7B, in float32 over their published weights, on a CPU or an NVIDIA GPU, matched to a pinned reference. Results are the same bit for bit however the experts are cached or read, under speculation and with requests running together. OLMoE on the RTX 3070 here decodes 61 tokens a second from memory and 8.7 with its experts read off the drive.
 
 ## Decisions, 2026-10-05
 
@@ -33,6 +33,13 @@ Taken by the owner:
 1. **Target model: Qwen3-30B-A3B first.** It is one step from OLMoE (query and key norms, grouped-query attention, 128 experts, 8 routed), Qwen publishes it as GGUF from 4 to 8 bits, and at 61 GB in BF16 and 18.6 GB at Q4_K_M it exercises the drive and the memory cache on a 64 GB machine. A model of 100B or more follows once quantized weights and CPU expert compute have passed.
 2. **Bit for bit stays.** When the CPU computes experts the GPU lacks, it sums in the GPU kernel's order, so logits never depend on which device ran an expert or what any cache holds. This is the property Strata does not have, and it is kept on purpose.
 3. **Scope: all of it.** Engine speed, the API surface, installing and a chat page, and AMD and several GPUs, in the order below.
+
+## Decisions, 2026-10-06
+
+Taken by the owner, after gate A10 measured llama.cpp reading prompts 1.6 to 2.6 times as fast on the same GPU, mostly because it computes in less precision:
+
+1. **A faster mode in less precision, opt-in.** The experts and matrix products may run on the GPU's tensor cores in less than float32, behind a flag. The default stays float32 and bit for bit, and every gate is checked in it; the fast mode is measured against the reference the way quantization was (KL divergence, top-1 agreement), not held to it bit for bit.
+2. **The stack merges as it goes green**, and the gates after A10 go on without stopping for a go-ahead at each.
 
 ## How a speed claim is made
 
