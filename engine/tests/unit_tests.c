@@ -352,6 +352,93 @@ static void test_tokenizer_nfc(void) {
     remove(path);
 }
 
+/* A BERT tokenizer, WordPiece, on a vocabulary small enough to work by hand:
+ * BertNormalizer that cleans, spaces CJK, strips accents and lowercases, a
+ * word limit of 10 characters, and [CLS] and [SEP] either side. */
+static const char* TINY_WORDPIECE =
+    "{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":["
+    "{\"id\":0,\"content\":\"[PAD]\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true},"
+    "{\"id\":1,\"content\":\"[UNK]\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true},"
+    "{\"id\":2,\"content\":\"[CLS]\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true},"
+    "{\"id\":3,\"content\":\"[SEP]\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true}],"
+    "\"normalizer\":{\"type\":\"BertNormalizer\",\"clean_text\":true,\"handle_chinese_chars\":true,\"strip_accents\":null,\"lowercase\":true},"
+    "\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"},"
+    "\"post_processor\":{\"type\":\"TemplateProcessing\",\"single\":[{\"SpecialToken\":{\"id\":\"[CLS]\",\"type_id\":0}},"
+    "{\"Sequence\":{\"id\":\"A\",\"type_id\":0}},{\"SpecialToken\":{\"id\":\"[SEP]\",\"type_id\":0}}],"
+    "\"special_tokens\":{\"[CLS]\":{\"id\":\"[CLS]\",\"ids\":[2],\"tokens\":[\"[CLS]\"]},\"[SEP]\":{\"id\":\"[SEP]\",\"ids\":[3],\"tokens\":[\"[SEP]\"]}}},"
+    "\"decoder\":{\"type\":\"WordPiece\",\"prefix\":\"##\",\"cleanup\":true},"
+    "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":10,"
+    "\"vocab\":{\"[PAD]\":0,\"[UNK]\":1,\"[CLS]\":2,\"[SEP]\":3,\"un\":4,\"##aff\":5,\"##able\":6,\"a\":7,\"##b\":8,\"cafe\":9,"
+    "\",\":10,\"\\u4e2d\":11,\"!\":12,\"hello\":13,\"##s\":14,\"\\u03c3\":15,\"ab\":16}}}";
+
+static void test_wordpiece(void) {
+    const char* path = "vitna-unit-test-wordpiece.json";
+    write_file(path, TINY_WORDPIECE, strlen(TINY_WORDPIECE));
+    char err[256];
+    vitna_tokenizer_t* tok = vitna_tokenizer_load(path, err, sizeof(err));
+    CHECK(tok != NULL && vitna_tokenizer_is_wordpiece(tok), "the tiny WordPiece tokenizer loads: %s", err);
+    if (tok) {
+        struct { const char* text; int32_t ids[10]; size_t n; const char* why; } cases[] = {
+            { "unaffable", { 2, 4, 5, 6, 3 }, 5, "the longest entries left to right, each after the first with ##" },
+            { "UNAFFABLE", { 2, 4, 5, 6, 3 }, 5, "lowercased" },
+            { "unaffableable", { 2, 1, 3 }, 3, "a word over the 10-character limit is the unknown token" },
+            { "Caf\xC3\xA9, hellos!", { 2, 9, 10, 13, 14, 12, 3 }, 7, "accents stripped, and punctuation split off as words of its own" },
+            { "a\xE4\xB8\xAD" "b", { 2, 7, 11, 1, 3 }, 5, "a CJK ideograph is a word, so b stands alone, where it is not spelled" },
+            { "ab", { 2, 16, 3 }, 3, "the whole word where the vocabulary has it, not a then ##b" },
+            { "abb", { 2, 16, 8, 3 }, 4, "ab, then ##b" },
+            { "ac", { 2, 1, 3 }, 3, "a word with a part nothing spells is the unknown token, whole" },
+            { "x[SEP]a", { 2, 1, 3, 7, 3 }, 5, "an added token is matched as written" },
+            { "[sep]", { 2, 1, 1, 1, 3 }, 5, "and only as written: lowercase it is brackets around a word" },
+            { "a\x07" "b\x0B" "b", { 2, 16, 8, 3 }, 4, "BEL and vertical tab are dropped, not made spaces, so the word stays whole" },
+            { "a\tb", { 2, 7, 1, 3 }, 4, "a tab is a space" },
+            { "\xCE\xA3", { 2, 15, 3 }, 3, "capital sigma lowercases to sigma, character by character" },
+            { "", { 2, 3 }, 2, "an empty text is [CLS] and [SEP]" },
+            { "a\xC3", { 2, 1, 3 }, 3, "a byte that is not UTF-8 stays in its word" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            vitna_token_list_t got = {0};
+            vitna_tokenizer_encode(tok, cases[i].text, strlen(cases[i].text), &got);
+            CHECK(ids_equal(&got, cases[i].ids, cases[i].n), "%s (%zu ids)", cases[i].why, got.count);
+            vitna_token_list_free(&got);
+        }
+        size_t n = 0;
+        unsigned char* norm = vitna_tokenizer_normalize(tok, "Ab\x07 \xC3\xA9\xE4\xB8\xAD", 9, &n);
+        const char want[] = "ab e \xE4\xB8\xAD ";
+        CHECK(norm && n == sizeof(want) - 1 && memcmp(norm, want, n) == 0, "the normalizer: cleaned, CJK spaced, accents stripped, lowercased");
+        free(norm);
+        const unsigned char* b = vitna_tokenizer_token_bytes(tok, 13, &n);
+        CHECK(b && n == 5 && memcmp(b, "hello", 5) == 0, "a token's text");
+        CHECK(vitna_tokenizer_is_special(tok, 2) && !vitna_tokenizer_is_special(tok, 7), "special tokens");
+        CHECK(vitna_tokenizer_vocab_size(tok) == 17, "the vocabulary size");
+        vitna_tokenizer_free(tok);
+    }
+    /* What it does not implement is refused, not approximated. */
+    const struct { const char* json; const char* why; } refused[] = {
+        { "{\"normalizer\":{\"type\":\"NFC\"},\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"},"
+          "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"u\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":9,\"vocab\":{\"u\":0}}}",
+          "BertNormalizer" },
+        { "{\"pre_tokenizer\":{\"type\":\"Whitespace\"},"
+          "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"u\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":9,\"vocab\":{\"u\":0}}}",
+          "BertPreTokenizer" },
+        { "{\"truncation\":{\"max_length\":8},\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"},"
+          "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"u\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":9,\"vocab\":{\"u\":0}}}",
+          "truncation" },
+        { "{\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"},\"added_tokens\":[{\"id\":1,\"content\":\"x\",\"normalized\":true}],"
+          "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"u\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":9,\"vocab\":{\"u\":0}}}",
+          "added token" },
+        { "{\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"},"
+          "\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"missing\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":9,\"vocab\":{\"u\":0}}}",
+          "unk_token" },
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        write_file(path, refused[i].json, strlen(refused[i].json));
+        tok = vitna_tokenizer_load(path, err, sizeof(err));
+        CHECK(tok == NULL && strstr(err, refused[i].why) != NULL, "refused (%s): got \"%s\"", refused[i].why, tok ? "loaded" : err);
+        vitna_tokenizer_free(tok);
+    }
+    remove(path);
+}
+
 /* --- Float operations --- */
 
 static void test_conversions(void) {
@@ -1368,6 +1455,7 @@ int main(void) {
     test_nfc();
     test_tokenizer();
     test_tokenizer_nfc();
+    test_wordpiece();
     test_conversions();
     test_matvec();
     test_rope();
