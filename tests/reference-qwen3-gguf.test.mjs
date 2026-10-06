@@ -251,6 +251,41 @@ for (const { file, quant, path } of FIXTURES) {
     t.diagnostic(`on ${where}, ` + (notes.length ? notes.join("; ") : `its routing was the reference's throughout, and all ${fixture.prompts.length * fixture.prompts[0].greedy.length} greedy tokens equal`));
   });
 
+  // Gate A10: rows attending to more than 1,024 positions take a long
+  // context's attention, whose sums run in another order (model_cuda.cu,
+  // attention_long_kernel). VITNA_TEST_LONG_FROM=0 gives every row that
+  // arithmetic, so the fixture's short prompts check it against the
+  // reference, with the routing pinned; and rows against a token at a time,
+  // byte for byte, which compares the two kernels that run it, since with
+  // the variable every run of rows takes attention_long_rows_kernel and
+  // every token alone attention_long_kernel.
+  if (quant === "q4_k_m") {
+    test(`${quant}: on the GPU, with a long context's attention for every row, the logits match the reference, and rows give a token at a time's, byte for byte`, ON_GPU, async (t) => {
+      const long = { VITNA_TEST_LONG_FROM: "0" };
+      const results = await eachPrompt("vitna-qwen3-gguf-long-", async (p, f) => {
+        writePins(f("pin"), p.routing);
+        const args = ["logits", ...WEIGHTS, "--ids", p.ids.join(","), ...RUN, "--experts-in", f("pin")];
+        await runEngine([...args, "--out", f("rows"), "--router-out", f("router"), "--experts-out", f("experts")], long);
+        await runEngine([...args, "--out", f("steps")], { ...long, VITNA_TEST_NO_ROWS: "1" });
+        const rows = readFileSync(f("rows"));
+        return {
+          p,
+          same: rows.length > 0 && rows.equals(readFileSync(f("steps"))),
+          prefill: comparePrefill(fixture, p, readF32(f("rows"))),
+          routing: compareRouting(fixture, p.routing, readF32(f("router")), readI32(f("experts")), `${p.id} position`),
+        };
+      });
+      for (const r of results) {
+        assert.ok(r.same, `${r.p.id}: rows gave other logits than a token at a time`);
+        assert.deepEqual(r.prefill.failures.slice(0, 10), [], r.p.id);
+        assert.deepEqual(r.routing.failures.slice(0, 10), [], r.p.id);
+      }
+      const worst = (k, w) => Math.max(...results.map((r) => r[k].worst[w]));
+      t.diagnostic(`on ${where}, largest |engine - reference|: logits ${worst("prefill", "logit").toExponential(2)}, logsumexp ${worst("prefill", "lse").toExponential(2)}, router logits ${worst("routing", "logit").toExponential(2)}; tolerances ${LOGIT_ATOL} and ${ROUTE_ATOL}`);
+      t.diagnostic(`every position of all ${results.length} prompts: rows and a token at a time gave the same logits, byte for byte`);
+    });
+  }
+
   // Gate A8 on this model: with --cpu-experts, the experts the device lacks
   // are shared between the CPU, in the GPU's arithmetic, and copies to it,
   // and the logits must be the GPU alone's, byte for byte. Through 1 GiB of
