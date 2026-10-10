@@ -1,11 +1,11 @@
 {
-  "about": "What the installer may install, in order of preference: the first model whose needs the machine meets. Each file is a pinned file of reference/<pin>/model.json, fetched at the pin's revision and kept only if its size and SHA-256 match. engine/tools/gen_catalog.mjs writes this, with the pins, into the engine as engine/src/catalog.c, which `vitna-anchor plan` reads.",
+  "about": "What the installer may install, in order of preference: the first model whose needs the machine meets. Each file is a pinned file of reference/<pin>/model.json, fetched at the pin's revision and kept only if its size and SHA-256 match. A model's ctx and expert_cache lists are each read top down, and the first entry whose memory_gib the machine has is taken: the context to serve with, and the MiB of memory a mixture's experts are read from the drive into (--expert-cache), 0 to hold the whole file in memory. engine/tools/gen_catalog.mjs writes this, with the pins, into the engine as engine/src/catalog.c, which `vitna-anchor plan` reads.",
   "models": [
     {
       "id": "qwen3-30b-a3b",
       "title": "Qwen3-30B-A3B at Q4_K_M",
       "note": "A 30B mixture of experts, in Qwen's own Q4_K_M quantization, for chat and for coding agents, with its reasoning and tool calls in each API's shape.",
-      "needs": { "cuda": true, "gpu_gib": 7.5, "memory_gib": 30 },
+      "needs": { "cuda": true, "gpu_gib": 7.5, "memory_gib": 14 },
       "files": [
         { "pin": "qwen3-30b-a3b", "path": "config.json" },
         { "pin": "qwen3-30b-a3b", "path": "tokenizer.json" },
@@ -16,6 +16,10 @@
       "ctx": [
         { "memory_gib": 46, "ctx": 32768 },
         { "memory_gib": 0, "ctx": 16384 }
+      ],
+      "expert_cache": [
+        { "memory_gib": 30, "mib": 0 },
+        { "memory_gib": 0, "mib": 4096 }
       ]
     },
     {

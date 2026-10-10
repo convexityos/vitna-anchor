@@ -266,7 +266,11 @@ static bool meets(const vitna_json_value_t* model, const vitna_hardware_t* hw, c
         if (!g) return fail(why, why_len, "no NVIDIA GPU was found");
         if ((double)g->memory_bytes < gpu_gib * GIB) return fail(why, why_len, "its largest NVIDIA GPU, %s, has %.1f GiB", g->name, g->memory_bytes / GIB);
     }
-    if ((double)hw->memory_bytes < memory_gib * GIB) return fail(why, why_len, "it has %.0f GiB of memory", hw->memory_bytes / GIB);
+    if ((double)hw->memory_bytes < memory_gib * GIB) {
+        /* In whole GiB unless that rounds up to what it needs: "it has 13.9 GiB", not "14". */
+        const double have = hw->memory_bytes / GIB;
+        return fail(why, why_len, "it has %.*f GiB of memory", (double)(long long)(have + 0.5) >= memory_gib ? 1 : 0, have);
+    }
     if (hw->disk_free_bytes < *fetch + DISK_MARGIN) {
         return fail(why, why_len, "it has %.1f GiB free where the models go, and the files need %.1f GiB more besides 1 GiB to spare", hw->disk_free_bytes / GIB,
                     *fetch / GIB);
@@ -357,6 +361,23 @@ bool vitna_plan(const vitna_json_value_t* catalog, const vitna_hardware_t* hw, c
         }
     }
 
+    /* Whether a mixture's experts are read from the drive into a cache in
+     * memory (--expert-cache), and how large, or the whole file held there (0):
+     * the first entry whose memory the machine has. */
+    size_t expert_cache = 0;
+    const vitna_json_value_t* caches = vitna_json_get(chosen, "expert_cache");
+    for (size_t i = 0; caches && caches->type == VITNA_JSON_ARRAY && i < caches->u.array.count; i++) {
+        const vitna_json_value_t* c = caches->u.array.items[i];
+        if ((double)hw->memory_bytes >= num_of(c, "memory_gib") * GIB) {
+            expert_cache = (size_t)num_of(c, "mib");
+            break;
+        }
+    }
+    if (expert_cache) {
+        vitna_sb_printf(&why, " Its experts are read from the drive as they are wanted, into a cache of %zu MiB in memory, rather than the whole file held there.",
+                        expert_cache);
+    }
+
     vitna_sb_printf(out, "model\t%s\ntitle\t%s\nnote\t%s\nwhy\t%s\n", id, str_of(chosen, "title"), str_of(chosen, "note"), why.data);
     const vitna_json_value_t* files = vitna_json_get(chosen, "files");
     for (size_t i = 0; files && files->type == VITNA_JSON_ARRAY && i < files->u.array.count; i++) {
@@ -372,6 +393,7 @@ bool vitna_plan(const vitna_json_value_t* catalog, const vitna_hardware_t* hw, c
         vitna_sb_printf(out, "\t--weights\t%s", path);
     }
     if (*device) vitna_sb_printf(out, "\t--device\t%s", device);
+    if (expert_cache) vitna_sb_printf(out, "\t--expert-cache\t%zu", expert_cache);
     vitna_sb_puts(out, "\n");
     vitna_sb_free(&why);
     vitna_sb_free(&skipped);

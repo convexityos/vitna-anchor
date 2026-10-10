@@ -92,16 +92,36 @@ test("a machine with an NVIDIA GPU of 8 GB and 64 GB of memory gets Qwen3-30B-A3
   );
 });
 
-test("less memory, a smaller context; less than Qwen3-30B-A3B needs, the small model, and the plan says why", ENGINE, () => {
+test("less memory, a smaller context; less than holds the whole file, its experts read from the drive; less than that, the small model, and the plan says why", ENGINE, () => {
   const thirtyTwo = readPlan(planFor({ memory_bytes: 31.9 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
   assert.equal(thirtyTwo.model, "qwen3-30b-a3b");
   assert.equal(thirtyTwo.serve[thirtyTwo.serve.indexOf("--ctx") + 1], "16384");
+  assert.equal(thirtyTwo.serve.includes("--expert-cache"), false, "30 GiB and more holds the whole file");
+  assert.doesNotMatch(thirtyTwo.why, /read from the drive/);
 
-  const sixteen = readPlan(planFor({ memory_bytes: 16 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
-  assert.equal(sixteen.model, "smollm2-360m-instruct");
-  assert.match(sixteen.why, /^Qwen3-30B-A3B at Q4_K_M needs an NVIDIA GPU with 7\.5 GiB and 30 GiB of memory, and it has 16 GiB of memory\. /);
-  assert.equal(sixteen.serve.includes("--device"), false, "the small model runs on the CPU");
-  assert.equal(sixteen.serve[sixteen.serve.indexOf("--ctx") + 1], "4096");
+  // A machine sold with 16 GB, as Windows counts it once the firmware has kept its share.
+  const sixteen = readPlan(planFor({ memory_bytes: 15.9 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
+  assert.equal(sixteen.model, "qwen3-30b-a3b");
+  assert.equal(sixteen.serve[sixteen.serve.indexOf("--ctx") + 1], "16384");
+  assert.equal(sixteen.serve[sixteen.serve.indexOf("--expert-cache") + 1], "4096");
+  assert.equal(sixteen.serve[sixteen.serve.indexOf("--device") + 1], "cuda");
+  assert.match(
+    sixteen.why,
+    /^This machine has an NVIDIA GeForce RTX 3070 with 8\.0 GiB, 16 GiB of memory and 200 GiB free where the models go\. Its experts are read from the drive as they are wanted, into a cache of 4096 MiB in memory, rather than the whole file held there\.$/,
+  );
+  const below = readPlan(planFor({ memory_bytes: 29.9 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
+  assert.equal(below.serve[below.serve.indexOf("--expert-cache") + 1], "4096", "just under 30 GiB reads from the drive");
+
+  const twelve = readPlan(planFor({ memory_bytes: 12 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
+  assert.equal(twelve.model, "smollm2-360m-instruct");
+  assert.match(twelve.why, /^Qwen3-30B-A3B at Q4_K_M needs an NVIDIA GPU with 7\.5 GiB and 14 GiB of memory, and it has 12 GiB of memory\. /);
+  assert.equal(twelve.serve.includes("--device"), false, "the small model runs on the CPU");
+  assert.equal(twelve.serve.includes("--expert-cache"), false, "the small model has no experts");
+  assert.equal(twelve.serve[twelve.serve.indexOf("--ctx") + 1], "4096");
+  // Just short of what it needs is said with its tenth, so it never reads as having enough.
+  const short = readPlan(planFor({ memory_bytes: 13.9 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }).stdout);
+  assert.equal(short.model, "smollm2-360m-instruct");
+  assert.match(short.why, /and 14 GiB of memory, and it has 13\.9 GiB of memory\. /);
 
   const smallGpu = readPlan(
     planFor({ memory_bytes: 64 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [{ ...RTX3070, name: "NVIDIA GeForce GTX 1650", memory_bytes: 4 * GIB }] }).stdout,
@@ -126,7 +146,7 @@ test("a machine nothing fits is refused, as is a model asked for that does not f
   assert.match(none.stderr, /^no model in the catalogue fits this machine: .*SmolLM2-360M-Instruct needs 3 GiB of memory, and it has 2 GiB of memory/);
   const asked = planFor({ memory_bytes: 64 * GIB, disk_free_bytes: 200 * GIB, cuda_built: false }, ["--model", "qwen3-30b-a3b"]);
   assert.equal(asked.status, 1);
-  assert.match(asked.stderr, /Qwen3-30B-A3B at Q4_K_M needs an NVIDIA GPU with 7\.5 GiB and 30 GiB of memory, and this engine was built without the CUDA path/);
+  assert.match(asked.stderr, /Qwen3-30B-A3B at Q4_K_M needs an NVIDIA GPU with 7\.5 GiB and 14 GiB of memory, and this engine was built without the CUDA path/);
   const smaller = readPlan(planFor({ memory_bytes: 64 * GIB, disk_free_bytes: 200 * GIB, cuda_built: true, gpus: [RTX3070] }, ["--model", "smollm2-360m-instruct"]).stdout);
   assert.equal(smaller.model, "smollm2-360m-instruct");
   const unknown = planFor({ memory_bytes: 64 * GIB, disk_free_bytes: 200 * GIB }, ["--model", "nope"]);
