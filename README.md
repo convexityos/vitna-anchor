@@ -746,9 +746,35 @@ The key-value cache of 16K positions takes 3 GiB of the GPU, which leaves room t
 
 Checked by hand on the same machine, the plan for it described as having 15.9 GiB of memory (`plan --hardware`, a machine sold with 16 GB as Windows counts it): it chose Qwen3-30B-A3B with a context of 16K, the experts read through 4,096 MiB, and said so; `verify` passed its three files; and the server, started with the plan's arguments, answered two turns of a conversation, the second reusing the first's prompt, at a peak working set of 5.1 GiB. It has not been run on a machine that has only 16 GB, where the operating system and whatever else runs share what the engine leaves, nor from a drive slower than this one, which would make every read through the cache slower; the plan does not measure the drive.
 
+## Speed beside AirLLM
+
+[AirLLM](https://github.com/lyogavin/airllm) (retrieved 2026-10-10, Apache-2.0, release 4.0.0 on PyPI) runs a model larger than the GPU by loading each layer from the drive just before it runs and freeing it after, every token, so its GPU memory is about a layer's. Measured beside it on 2026-10-10 on the machine that checked A9 to A12 (AMD Ryzen 7 3700X, 64 GB, an RTX 3070 with 8 GB, driver 591.86, Windows 11): the same checkpoints for both, OLMoE's on the Crucial P5 and Qwen3-30B-A3B's on a Samsung 970 PRO, AirLLM 4.0.0 with PyTorch 2.11.0 for CUDA 12.8 and transformers 4.57.6, the engine at release v0.2.0, and greedy decoding after "The capital of France is":
+
+```powershell
+python scripts/bench-airllm.py --model <dir> --shards <dir> --prompt "The capital of France is" --ids <the engine's prompt ids> --max-new 32 [--compression 4bit]
+vitna-anchor generate --model <dir> --prompt "The capital of France is" --max-new 32 --greedy --timing --ctx 512 --device cuda [--gpu-expert-cache 256] [--weights <file.gguf>] [--expert-cache 16384]
+```
+
+| | AirLLM 4.0.0 | The engine |
+|---|---|---|
+| OLMoE-1B-7B in BF16, decoding | 11,249 ms a token | 17.3 ms, with 5,460 MiB of experts on the GPU; 61.8 ms with 256 MiB |
+| Reading its prompt of 5 tokens | 10.0 s | 0.22 s |
+| GPU memory | 1,699 MiB | 1,520 MiB with 256 MiB of experts |
+| OLMoE-1B-7B in 4 bits, decoding | 8,161 ms a token (`compression='4bit'`) | 5.1 ms from Q4_K_M; 16.6 ms with 256 MiB of experts on the GPU |
+| GPU memory | 1,043 MiB | 911 MiB with 256 MiB of experts |
+| Qwen3-30B-A3B in BF16, decoding | 73,399 ms a token | 269 ms over 16 tokens and 141 over 128, the experts read from the drive through 16 GiB; 302 ms with 256 MiB of experts on the GPU |
+| Reading its prompt of 5 tokens | 77.7 s | 4.4 s |
+| GPU memory | 1,754 MiB | 3,536 MiB with 256 MiB of experts |
+
+AirLLM's decoding figures are the mean of every step after the first in one run: 31 steps for OLMoE, from 9,670 to 13,355 ms; 15 for Qwen3-30B-A3B, from 68,098 to 79,930 ms; and 7 in 4 bits, from 7,653 to 8,782 ms. The engine's are its timing line's: for OLMoE in BF16 the median of three runs (16.99, 17.29 and 17.57 ms), and one run for the rest. GPU memory is the device's memory in use, sampled by `nvidia-smi` every 250 ms, less what it held just before the run, so the CUDA runtime's own share is in both. Where they ran the same weights they chose the same greedy tokens, all 32 for OLMoE and all 16 for Qwen3-30B-A3B, though AirLLM computes in BF16 through transformers and the engine in float32; AirLLM's 4-bit run gave the first 8 of OLMoE's as well.
+
+AirLLM keeps nothing on the GPU from one token to the next: each token loads every layer from a copy of the checkpoint it first splits into a file a layer (13 GB beside OLMoE, 57 GiB beside Qwen3-30B-A3B), so a token of Qwen3-30B-A3B reads all 61 GB of it, and the drive read about 1.1 GB/s when sampled during that run. The engine keeps as many experts as fit on the GPU and in memory and copies or reads only what a token lacks. AirLLM uses less GPU memory than the engine where the engine keeps a whole BF16 model's embeddings and attention on the device, which for Qwen3-30B-A3B is about 3 GB; from Q4_K_M the engine ran it in 1,578 MiB at 42.7 ms a token. AirLLM's README says its compression speeds inference up to three times; here it ran 1.38 times as fast as its BF16.
+
 ## Measurements
 
 A performance figure appears in this repository only with the hardware and the command that produced it, and it says whether it was measured or estimated. The first published are gate A5's, [above](#speed-with-the-experts-read-from-a-drive), on the CPU and [on a GPU](#speed-on-a-gpu), and the embedding model's, [above](#serve-an-embedding-model). `scripts/bench-decode.mjs` times decoding with `generate --timing` and prints the machine and the command with every result, so that a figure, when there is one, carries both.
+
+The figures that mark how the engine has moved, from each speed section above, are also entries of [`bench/history.json`](bench/history.json), oldest first: each with its date, gate, machine, command, how many runs it summarizes and by which statistic, what it was before or what it was measured beside, and, for those measured from 2026-10-10, each run's own value, from which `tests/bench-history.test.mjs` recomputes the statistic and its spread. The same test finds each entry's figures in the README section it names, so neither can change without the other.
 
 ## License
 
