@@ -1,0 +1,317 @@
+{
+  "about": "How the engine has moved, measured: one entry per step, oldest first, each the README's own figures with the date, the gate or change, the machine, the command, and how each figure summarizes its runs. A figure is printed as the README prints it, and tests/bench-history.test.mjs finds it in the README section the entry names. compare holds what the figure was before the change, or what another program measured on the same machine, or a reference point. summary says which statistic a figure is: for entries measured from 2026-10-10 it is median or mean, and runs holds each run's value in the figure's unit, or each step's where over is steps (a program timed by its tokens, one run), from which the test recomputes it. Earlier entries kept only the figure the README published, and summary says in words how it was taken.",
+  "machines": {
+    "3700x-3070": {
+      "name": "AMD Ryzen 7 3700X and an RTX 3070",
+      "cpu": "AMD Ryzen 7 3700X, 8 cores, 16 threads, AVX2",
+      "memory": "64 GB of DDR4-3200 running at 2133 MT/s, two channels",
+      "gpu": "NVIDIA GeForce RTX 3070, 8 GB, compute capability 8.6, driver 591.86, PCIe 4.0 x16",
+      "os": "Windows 11",
+      "drives": {
+        "p5": "Crucial P5 500 GB (CT500P5SSD8), an NVMe drive",
+        "970pro": "Samsung 970 PRO 512 GB, an NVMe drive"
+      }
+    },
+    "ovh-b3-16": {
+      "name": "an OVHcloud b3-16 instance",
+      "cpu": "4 vCPUs of an AMD EPYC (Milan)",
+      "os": "Linux"
+    }
+  },
+  "entries": [
+    {
+      "id": "a5-cpu-experts-from-drive",
+      "date": "2026-10-01",
+      "gate": "A5",
+      "what": "OLMoE-1B-7B decodes on the CPU with its experts read from the drive, through a cache of 4 GiB, rather than held in memory",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "BF16",
+      "device": "cpu",
+      "command": "node scripts/bench-experts.mjs --tokens 64 --runs 3",
+      "readme": "Speed with the experts read from a drive",
+      "result": { "printed": "2.22", "unit": "tokens a second", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 },
+      "also": [{ "printed": "450.2", "unit": "ms a token", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 }],
+      "compare": [{ "kind": "reference", "label": "the whole model in the file cache", "printed": "6.11", "unit": "tokens a second", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 }]
+    },
+    {
+      "id": "a5-gpu-experts",
+      "date": "2026-10-01",
+      "gate": "A5",
+      "what": "OLMoE-1B-7B on the GPU: everything but the experts on the device, and the experts copied in as the layers want them",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "BF16",
+      "device": "cuda",
+      "command": "node scripts/bench-experts.mjs --device cuda --tokens 64 --runs 5",
+      "readme": "Speed on a GPU",
+      "result": { "printed": "61.3", "unit": "tokens a second", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 },
+      "also": [{ "printed": "16.3", "unit": "ms a token", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 }],
+      "compare": [{ "kind": "before", "label": "the same model on the CPU", "printed": "163.7", "unit": "ms a token", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 }],
+      "factor": "ten times"
+    },
+    {
+      "id": "rows-prefill",
+      "date": "2026-10-01",
+      "gate": "rows",
+      "what": "A prompt's tokens run together as rows on the GPU, each expert once a layer for every row routed to it",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "BF16",
+      "device": "cuda",
+      "command": "node scripts/bench-prefill.mjs --device cuda --model models/olmoe-1b-7b --engine <main's engine> --engine <this engine> --prompt-tokens 8,100,500,2000 --runs 3",
+      "readme": "Speed on a GPU",
+      "result": { "printed": "2,994", "unit": "ms for a prompt of 2,000 tokens", "summary": "the median of 3 runs", "n": 3 },
+      "compare": [{ "kind": "before", "label": "a token at a time", "printed": "53,071", "unit": "ms for a prompt of 2,000 tokens", "summary": "the median of 3 runs", "n": 3 }],
+      "factor": "17.7x"
+    },
+    {
+      "id": "a7-q4km-gpu",
+      "date": "2026-10-05",
+      "gate": "A7",
+      "what": "OLMoE-1B-7B from its own Q4_K_M file, every expert then fitting on the GPU",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-experts.mjs --device cuda --tokens 64 --runs 5 --gpu-caches default,2048 --weights models/olmoe-1b-7b-gguf/olmoe-1b-7b-0924-q4_k_m.gguf",
+      "readme": "Speed with quantized weights",
+      "result": { "printed": "213.6", "unit": "tokens a second", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 },
+      "also": [{ "printed": "4.7", "unit": "ms a token", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 }],
+      "compare": [{ "kind": "before", "label": "BF16", "printed": "60.3", "unit": "tokens a second", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 }]
+    },
+    {
+      "id": "a8-avx2-widening",
+      "date": "2026-10-05",
+      "gate": "A8",
+      "what": "The CPU widens quantized blocks eight weights at a time with AVX2, to the same bits",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "Q4_K_M",
+      "device": "cpu",
+      "command": "node scripts/bench-experts.mjs --tokens 64 --runs 3 --caches none --weights models/olmoe-1b-7b-gguf/olmoe-1b-7b-0924-q4_k_m.gguf",
+      "readme": "Speed with quantized weights",
+      "result": { "printed": "326.9", "unit": "ms a token", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 },
+      "compare": [{ "kind": "before", "label": "a scalar loop", "printed": "1,140.1", "unit": "ms a token", "summary": "the median of 63 steps in the median of 3 runs", "n": 3 }],
+      "factor": "3.5 times"
+    },
+    {
+      "id": "a8-cpu-beside-gpu",
+      "date": "2026-10-05",
+      "gate": "A8",
+      "what": "The CPU runs the experts the GPU lacks, at the same time as the GPU runs the others, with the same logits byte for byte",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "BF16",
+      "device": "cuda",
+      "command": "node scripts/bench-experts.mjs --device cuda --tokens 64 --runs 5 --gpu-caches default,2048,1024 --cpu-experts 0,4,8",
+      "readme": "Speed with the CPU beside the GPU",
+      "result": { "printed": "33.5", "unit": "ms a token, 2,040 MiB of experts on the GPU, 4 CPU threads", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 },
+      "compare": [{ "kind": "before", "label": "the GPU alone", "printed": "37.7", "unit": "ms a token", "summary": "the median of 63 steps in the median of 5 runs", "n": 5 }]
+    },
+    {
+      "id": "a9-qwen3-decode",
+      "date": "2026-10-06",
+      "gate": "A9",
+      "what": "Qwen3-30B-A3B, 30B parameters, on a GPU of 8 GB that holds under a third of its experts",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-experts.mjs --device cuda --model models/qwen3-30b-a3b --weights <Q4_K_M> --tokens 129 --runs 3 --gpu-caches default --cpu-experts 0,4",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "76.7", "unit": "tokens a second, after \"The capital of France is\"", "summary": "the engine's timing line, the median of 3 runs", "n": 3 },
+      "also": [
+        { "printed": "47.2", "unit": "tokens a second, after the Fibonacci code", "summary": "the engine's timing line, the median of 3 runs", "n": 3 },
+        { "printed": "81.7", "unit": "tokens a second, after the lighthouse story", "summary": "the engine's timing line, the median of 3 runs", "n": 3 }
+      ],
+      "compare": [{ "kind": "beside", "label": "llama.cpp b11433 at its best -ncmoe", "printed": "29.2", "unit": "tokens a second", "summary": "llama-bench's mean of 3 runs", "n": 3 }]
+    },
+    {
+      "id": "a9-qwen3-prompt",
+      "date": "2026-10-06",
+      "gate": "A9",
+      "what": "Qwen3-30B-A3B reads a prompt of 512 tokens, every chunk copying in the experts it wants",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-prefill.mjs --device cuda --model models/qwen3-30b-a3b --weights <Q4_K_M> --prompt-tokens 512 --runs 3",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "345", "unit": "tokens a second", "summary": "the median of 3 runs", "n": 3 },
+      "compare": [{ "kind": "beside", "label": "llama.cpp b11433 at its best -ncmoe", "printed": "505", "unit": "tokens a second", "summary": "llama-bench's mean of 3 runs", "n": 3 }]
+    },
+    {
+      "id": "a10-long-prompt",
+      "date": "2026-10-06",
+      "gate": "A10",
+      "what": "A long context's attention in tiles a prompt's tokens share, with the key-value cache the GPU has no room for in host memory",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-prefill.mjs --device cuda --model models/qwen3-30b-a3b --weights <Q4_K_M> --text README.md --text reference/README.md --text engine/src/model_cuda.cu --prompt-tokens 4096 --ctx 4112 --runs 3",
+      "readme": "Speed with a long context",
+      "result": { "printed": "353", "unit": "tokens a second, a prompt of 4,096 tokens", "summary": "the median of 3 runs", "n": 3 },
+      "also": [{ "printed": "182", "unit": "tokens a second, a prompt of 32,768 tokens", "summary": "one run", "n": 1 }],
+      "compare": [
+        { "kind": "before", "label": "every token in the attention the engine had before", "printed": "226", "unit": "tokens a second", "summary": "the median of 3 runs", "n": 3 },
+        { "kind": "beside", "label": "llama.cpp b11433 at its best -ncmoe", "printed": "573", "unit": "tokens a second", "summary": "llama-bench's mean of 2 runs", "n": 2 }
+      ]
+    },
+    {
+      "id": "precision-fast",
+      "date": "2026-10-06",
+      "gate": "fast",
+      "what": "--precision fast, opt-in: a prompt's products on the GPU's tensor cores in float16, decoding still exact",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-prefill.mjs --device cuda --model models/qwen3-30b-a3b --weights <Q4_K_M> --text README.md --text reference/README.md --text engine/src/model_cuda.cu --prompt-tokens 4096 --ctx 4112 --runs 3 --precision fast",
+      "readme": "Speed with --precision fast",
+      "result": { "printed": "1,014", "unit": "tokens a second, a prompt of 4,096 tokens", "summary": "the median of 3 runs", "n": 3 },
+      "also": [
+        { "printed": "521", "unit": "tokens a second, a prompt of 32,768 tokens", "summary": "one run", "n": 1 },
+        { "printed": "1.03e-3", "unit": "KL divergence from the reference at the last position, the mean of 6 prompts", "summary": "the mean of 6 prompts", "n": 6 },
+        { "printed": "234 of 239", "unit": "top tokens agreeing with the reference", "summary": "every position of 6 prompts", "n": 6 }
+      ],
+      "compare": [
+        { "kind": "before", "label": "--precision exact", "printed": "349", "unit": "tokens a second", "summary": "the median of 3 runs", "n": 3 },
+        { "kind": "beside", "label": "llama.cpp b11433 at its best -ncmoe", "printed": "573", "unit": "tokens a second", "summary": "llama-bench's mean of 2 runs", "n": 2 },
+        { "kind": "reference", "label": "Q8_0 against BF16, for scale", "printed": "1.4e-3", "unit": "KL divergence", "summary": "the mean of 6 prompts", "n": 6 }
+      ],
+      "factor": "about three times"
+    },
+    {
+      "id": "a14-embeddings",
+      "date": "2026-10-06",
+      "gate": "A14",
+      "what": "bge-small-en-v1.5's embeddings on the CPU, several texts as the rows of one matrix product",
+      "machine": "ovh-b3-16",
+      "model": "bge-small-en-v1.5",
+      "weights": "F32",
+      "device": "cpu",
+      "command": "vitna-anchor embed --model models/bge-small-en-v1.5 --timing --threads <1 to 4>, 256 passages of 57,508 tokens",
+      "readme": "Serve an embedding model",
+      "result": { "printed": "3,673", "unit": "tokens a second on 4 threads", "summary": "one run", "n": 1 },
+      "compare": [{ "kind": "before", "label": "one thread", "printed": "1,086", "unit": "tokens a second", "summary": "one run", "n": 1 }]
+    },
+    {
+      "id": "install-16gb-memory",
+      "date": "2026-10-10",
+      "gate": "install",
+      "what": "A machine of 16 GB gets Qwen3-30B-A3B, served with its experts read from the drive into 4 GiB of memory rather than the whole file held there",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "vitna-anchor generate --model <dir> --weights <dir>/Qwen3-30B-A3B-Q4_K_M.gguf --ctx 16384 --device cuda --greedy --timing --expert-cache 4096 (--prompt \"The capital of France is\" --max-new 128, or --ids-file <8,000 ids> --max-new 64)",
+      "readme": "Speed with less memory",
+      "result": { "printed": "5.1", "unit": "GiB of memory, the process's peak working set", "summary": "median", "n": 3, "runs": [5.1, 5.1, 5.1] },
+      "also": [
+        { "printed": "59.3", "unit": "ms a token after a prompt of 5 tokens", "summary": "median", "n": 3, "runs": [58.951, 59.2591, 59.2826] },
+        { "printed": "54.1", "unit": "s for a prompt of 8,000 tokens", "summary": "median", "n": 3, "runs": [53.213568, 54.109394, 54.273285] },
+        { "printed": "111.7", "unit": "ms a token after it", "summary": "median", "n": 3, "runs": [111.726, 112.2093, 111.5329] }
+      ],
+      "compare": [
+        { "kind": "reference", "label": "the whole file held in memory", "printed": "17.5", "unit": "GiB of memory", "summary": "median", "n": 3, "runs": [17.5, 17.5, 17.5] },
+        { "kind": "reference", "label": "the whole file held in memory", "printed": "22.3", "unit": "ms a token after a prompt of 5 tokens", "summary": "median", "n": 3, "runs": [22.3423, 22.0518, 23.4487] },
+        { "kind": "reference", "label": "the whole file held in memory", "printed": "26.7", "unit": "s for a prompt of 8,000 tokens", "summary": "median", "n": 3, "runs": [26.506562, 26.815217, 26.687924] },
+        { "kind": "reference", "label": "the whole file held in memory", "printed": "33.9", "unit": "ms a token after it", "summary": "median", "n": 3, "runs": [33.8886, 33.9546, 33.596] }
+      ]
+    },
+    {
+      "id": "airllm-olmoe-bf16",
+      "date": "2026-10-10",
+      "gate": "beside AirLLM",
+      "what": "OLMoE-1B-7B in BF16 beside AirLLM 4.0.0, which loads every layer from the drive for every token",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "BF16",
+      "device": "cuda",
+      "command": "vitna-anchor generate --model models/olmoe-1b-7b --prompt \"The capital of France is\" --max-new 32 --greedy --timing --ctx 512 --device cuda; python scripts/bench-airllm.py --model models/olmoe-1b-7b --shards <dir> --prompt \"The capital of France is\" --ids 510,5347,273,6181,310 --max-new 32",
+      "readme": "Speed beside AirLLM",
+      "result": { "printed": "17.3", "unit": "ms a token", "summary": "median", "n": 3, "runs": [17.5726, 17.2939, 16.9912] },
+      "also": [{ "printed": "61.8", "unit": "ms a token with 256 MiB of experts on the GPU", "summary": "median", "n": 1, "runs": [61.8267] }],
+      "compare": [
+        {
+          "kind": "beside",
+          "label": "AirLLM 4.0.0",
+          "over": "steps",
+          "printed": "11,249",
+          "unit": "ms a token",
+          "summary": "mean",
+          "n": 31,
+          "runs": [9838.1, 9669.6, 10830.4, 13050.6, 13354.6, 12494, 12431.1, 11604.9, 11157.5, 12048.7, 11268.1, 11101.6, 10799.2, 11417.2, 11385.5, 10718.9, 11416, 12010.7, 11250.9, 10938.8, 11407.4, 11814.8, 10824.7, 11034.7, 10687.2, 10188.9, 10351.5, 11112.4, 10550.4, 10935.9, 11020.2]
+        }
+      ]
+    },
+    {
+      "id": "airllm-qwen3-bf16",
+      "date": "2026-10-10",
+      "gate": "beside AirLLM",
+      "what": "Qwen3-30B-A3B in BF16 beside AirLLM 4.0.0: 61 GB, more than the machine's memory, read off the drive",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "BF16",
+      "device": "cuda",
+      "command": "vitna-anchor generate --model models/qwen3-30b-a3b --prompt \"The capital of France is\" --max-new 128 --greedy --timing --ctx 512 --device cuda --expert-cache 16384; python scripts/bench-airllm.py --model models/qwen3-30b-a3b --shards <dir> --prompt \"The capital of France is\" --ids 785,6722,315,9625,374 --max-new 16",
+      "readme": "Speed beside AirLLM",
+      "result": { "printed": "141", "unit": "ms a token over 128 tokens, the experts read from the drive through 16 GiB", "summary": "median", "n": 1, "runs": [141.2129] },
+      "also": [{ "printed": "269", "unit": "ms a token over 16 tokens", "summary": "median", "n": 1, "runs": [268.6499] }],
+      "compare": [
+        {
+          "kind": "beside",
+          "label": "AirLLM 4.0.0",
+          "over": "steps",
+          "printed": "73,399",
+          "unit": "ms a token",
+          "summary": "mean",
+          "n": 15,
+          "runs": [79766.1, 76243.9, 73600.4, 70840.8, 73989.3, 68419, 68167.4, 79930.3, 68097.6, 70402.4, 77201.9, 71953.4, 73641.6, 78470.1, 70254.4]
+        }
+      ]
+    },
+    {
+      "id": "airllm-olmoe-4bit",
+      "date": "2026-10-10",
+      "gate": "beside AirLLM",
+      "what": "OLMoE-1B-7B in 4 bits beside AirLLM 4.0.0's own 4-bit compression",
+      "machine": "3700x-3070",
+      "drive": "p5",
+      "model": "OLMoE-1B-7B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "vitna-anchor generate --model models/olmoe-1b-7b --weights models/olmoe-1b-7b-gguf/olmoe-1b-7b-0924-q4_k_m.gguf --prompt \"The capital of France is\" --max-new 32 --greedy --timing --ctx 512 --device cuda; python scripts/bench-airllm.py --model models/olmoe-1b-7b --shards <dir> --prompt \"The capital of France is\" --ids 510,5347,273,6181,310 --max-new 8 --compression 4bit",
+      "readme": "Speed beside AirLLM",
+      "result": { "printed": "5.1", "unit": "ms a token", "summary": "median", "n": 1, "runs": [5.08] },
+      "also": [{ "printed": "16.6", "unit": "ms a token with 256 MiB of experts on the GPU", "summary": "median", "n": 1, "runs": [16.5559] }],
+      "compare": [
+        {
+          "kind": "beside",
+          "label": "AirLLM 4.0.0, compression='4bit'",
+          "over": "steps",
+          "printed": "8,161",
+          "unit": "ms a token",
+          "summary": "mean",
+          "n": 7,
+          "runs": [7652.7, 7729.2, 8781.8, 7881.7, 8130.7, 8767.7, 8184.6]
+        }
+      ]
+    }
+  ]
+}
