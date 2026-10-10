@@ -32,6 +32,7 @@ export function resolveCatalog(catalog = JSON.parse(readFileSync(CATALOG, "utf8"
       device: m.device ?? null,
       weights: m.weights ?? null,
       ctx: m.ctx,
+      expert_cache: m.expert_cache ?? null,
       files: m.files.map((f) => {
         const p = pin(f.pin);
         const file = p.files.find((x) => x.path === f.path);
