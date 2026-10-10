@@ -1,6 +1,6 @@
 {
   "name": "vitna-anchor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "An inference engine in C, being built one gate at a time. It runs SmolLM2-135M, OLMoE-1B-7B, Qwen3-30B-A3B and bge-small-en-v1.5, and serves them over OpenAI's and Anthropic's APIs.",
   "type": "module",
   "bin": {
