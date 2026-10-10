@@ -51,6 +51,8 @@ test("every entry says when, on what, with which command, and where the README p
       assert.ok(f.unit, `${e.id}: ${f.printed} has no unit`);
       assert.ok(Number.isInteger(f.n) && f.n >= 1, `${e.id}: ${f.printed} does not say how many runs it summarizes`);
       assert.ok(typeof f.summary === "string" && f.summary.length > 0, `${e.id}: ${f.printed} does not say which statistic it is`);
+      if (f.over !== undefined) assert.ok(["runs", "steps"].includes(f.over), `${e.id}: ${f.printed} is over ${f.over}, not runs or steps`);
+      if (f.over === "steps") assert.ok(Array.isArray(f.runs), `${e.id}: ${f.printed} is over steps and keeps none`);
     }
     for (const c of e.compare ?? []) {
       assert.ok(["before", "beside", "reference"].includes(c.kind), `${e.id}: compare kind ${c.kind}`);

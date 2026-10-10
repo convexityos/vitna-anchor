@@ -1,5 +1,5 @@
 {
-  "about": "How the engine has moved, measured: one entry per step, oldest first, each the README's own figures with the date, the gate or change, the machine, the command, and how each figure summarizes its runs. A figure is printed as the README prints it, and tests/bench-history.test.mjs finds it in the README section the entry names. compare holds what the figure was before the change, or what another program measured on the same machine, or a reference point. summary says which statistic a figure is: for entries measured from 2026-10-10 it is median or mean, and runs holds each run's (or each step's) value in the figure's unit, from which the test recomputes it. Earlier entries kept only the figure the README published, and summary says in words how it was taken.",
+  "about": "How the engine has moved, measured: one entry per step, oldest first, each the README's own figures with the date, the gate or change, the machine, the command, and how each figure summarizes its runs. A figure is printed as the README prints it, and tests/bench-history.test.mjs finds it in the README section the entry names. compare holds what the figure was before the change, or what another program measured on the same machine, or a reference point. summary says which statistic a figure is: for entries measured from 2026-10-10 it is median or mean, and runs holds each run's value in the figure's unit, or each step's where over is steps (a program timed by its tokens, one run), from which the test recomputes it. Earlier entries kept only the figure the README published, and summary says in words how it was taken.",
   "machines": {
     "3700x-3070": {
       "name": "AMD Ryzen 7 3700X and an RTX 3070",
@@ -250,6 +250,7 @@
         {
           "kind": "beside",
           "label": "AirLLM 4.0.0",
+          "over": "steps",
           "printed": "11,249",
           "unit": "ms a token",
           "summary": "mean",
@@ -276,6 +277,7 @@
         {
           "kind": "beside",
           "label": "AirLLM 4.0.0",
+          "over": "steps",
           "printed": "73,399",
           "unit": "ms a token",
           "summary": "mean",
@@ -302,6 +304,7 @@
         {
           "kind": "beside",
           "label": "AirLLM 4.0.0, compression='4bit'",
+          "over": "steps",
           "printed": "8,161",
           "unit": "ms a token",
           "summary": "mean",
