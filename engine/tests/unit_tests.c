@@ -14,6 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "api.h"
 #include "chat.h"
@@ -26,6 +32,7 @@
 #include "jsonpfx.h"
 #include "kernels.h"
 #include "kv_cache.h"
+#include "model.h"
 #include "ops.h"
 #include "quant.h"
 #include "safetensors.h"
@@ -2109,6 +2116,261 @@ static void test_gguf(void) {
     remove(path);
 }
 
+/* Helper to emit a GGUF file containing an arbitrary list of F32 tensors and
+ * optional model + split metadata, for testing multi-shard split GGUFs. */
+typedef struct {
+    const char* name;
+    uint32_t n_dims;
+    uint64_t ne[3];
+    const float* data;
+} f32_tensor_spec_t;
+
+static void write_f32_gguf(const char* path, const char* arch, uint32_t n_layers, uint32_t hidden, uint32_t inter,
+                           uint32_t n_heads, uint32_t n_kv_heads, uint32_t n_experts, uint32_t n_used,
+                           bool has_split, uint16_t split_no, uint16_t split_count, uint64_t split_tensors,
+                           const f32_tensor_spec_t* specs, size_t n_specs) {
+    gbuf_t b = { NULL, 0, 0 };
+    uint64_t n_kv = 1; /* general.alignment */
+    if (arch) n_kv += 9;
+    if (has_split) n_kv += 3;
+    g_u32(&b, 0x46554747u);
+    g_u32(&b, 3);
+    g_u64(&b, (uint64_t)n_specs);
+    g_u64(&b, n_kv);
+    g_kv_u32(&b, "general.alignment", 32);
+    if (arch) {
+        char key[96];
+        g_kv_str(&b, "general.architecture", arch);
+        snprintf(key, sizeof(key), "%s.block_count", arch); g_kv_u32(&b, key, n_layers);
+        snprintf(key, sizeof(key), "%s.embedding_length", arch); g_kv_u32(&b, key, hidden);
+        snprintf(key, sizeof(key), "%s.expert_feed_forward_length", arch); g_kv_u32(&b, key, inter);
+        snprintf(key, sizeof(key), "%s.attention.head_count", arch); g_kv_u32(&b, key, n_heads);
+        snprintf(key, sizeof(key), "%s.attention.head_count_kv", arch); g_kv_u32(&b, key, n_kv_heads);
+        snprintf(key, sizeof(key), "%s.context_length", arch); g_kv_u32(&b, key, 64);
+        snprintf(key, sizeof(key), "%s.expert_count", arch); g_kv_u32(&b, key, n_experts);
+        snprintf(key, sizeof(key), "%s.expert_used_count", arch); g_kv_u32(&b, key, n_used);
+    }
+    if (has_split) {
+        g_kv_u32(&b, "split.no", split_no);
+        g_kv_u32(&b, "split.count", split_count);
+        g_kv_u32(&b, "split.tensors.count", (uint32_t)split_tensors);
+    }
+    uint64_t off = 0;
+    for (size_t i = 0; i < n_specs; i++) {
+        g_tensor(&b, specs[i].name, specs[i].n_dims, specs[i].ne, 0 /* F32 */, off);
+        uint64_t numel = 1;
+        for (uint32_t d = 0; d < specs[i].n_dims; d++) numel *= specs[i].ne[d];
+        uint64_t bytes = numel * 4;
+        off += (bytes + 31) / 32 * 32;
+    }
+    while (b.n % 32) g_put(&b, "", 1);
+    for (size_t i = 0; i < n_specs; i++) {
+        uint64_t numel = 1;
+        for (uint32_t d = 0; d < specs[i].n_dims; d++) numel *= specs[i].ne[d];
+        uint64_t bytes = numel * 4;
+        g_put(&b, specs[i].data, (size_t)bytes);
+        uint64_t pad = ((bytes + 31) / 32 * 32) - bytes;
+        for (uint64_t p = 0; p < pad; p++) g_put(&b, "", 1);
+    }
+    write_file(path, b.p, b.n);
+    free(b.p);
+}
+
+static void test_gguf_split(void) {
+    /* 1. Split path formatting and validation. */
+    char out[256];
+    CHECK(vitna_gguf_split_path("dir/qwen3-235b-00001-of-00004.gguf", 2, 4, out, sizeof(out)) &&
+          strcmp(out, "dir/qwen3-235b-00003-of-00004.gguf") == 0,
+          "vitna_gguf_split_path formats sibling shard path (got \"%s\")", out);
+    CHECK(vitna_gguf_split_path("m-00002-of-00002.GGUF", 0, 2, out, sizeof(out)) &&
+          strcmp(out, "m-00001-of-00002.GGUF") == 0,
+          "vitna_gguf_split_path preserves .GGUF extension case");
+    CHECK(!vitna_gguf_split_path("model.gguf", 0, 2, out, sizeof(out)), "plain .gguf path is not a split name");
+    CHECK(!vitna_gguf_split_path("m-00001-of-00004.gguf", 0, 3, out, sizeof(out)), "count mismatch refused");
+    CHECK(!vitna_gguf_split_path("m-00001-of-00002.gguf", 2, 2, out, sizeof(out)), "out-of-range shard index refused");
+
+    /* 2. Build a tiny complete 2-layer OLMoE model (hidden=32, inter=32, 2 heads, 2 experts, 1 used, vocab=4). */
+    const char* s1 = "vitna-split-test-00001-of-00002.gguf";
+    const char* s2 = "vitna-split-test-00002-of-00002.gguf";
+    const char* single = "vitna-split-single.gguf";
+    const char* cfg_path = "config.json";
+    /* Use current working dir for config.json only if not already present: write into a dedicated subdir instead. */
+    const char* dir = "vitna-split-model-dir";
+    char cfg_full[256];
+    snprintf(cfg_full, sizeof(cfg_full), "%s/config.json", dir);
+#if defined(_WIN32)
+    _mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+    const char* cfg_json =
+        "{"
+        "\"model_type\":\"olmoe\","
+        "\"hidden_act\":\"silu\","
+        "\"num_hidden_layers\":2,"
+        "\"hidden_size\":32,"
+        "\"intermediate_size\":32,"
+        "\"num_attention_heads\":2,"
+        "\"num_key_value_heads\":2,"
+        "\"vocab_size\":4,"
+        "\"max_position_embeddings\":64,"
+        "\"rms_norm_eps\":1e-5,"
+        "\"rope_theta\":10000.0,"
+        "\"tie_word_embeddings\":false,"
+        "\"num_experts\":2,"
+        "\"num_experts_per_tok\":1"
+        "}";
+    write_file(cfg_full, cfg_json, strlen(cfg_json));
+    (void)cfg_path;
+
+    /* Deterministic weights for all 25 tensors (3 global + 11 per layer x 2 layers). */
+    float embed[4 * 32], lm_head[4 * 32], out_norm[32];
+    float q_w[2][32 * 32], k_w[2][32 * 32], v_w[2][32 * 32], o_w[2][32 * 32];
+    float qn[2][32], kn[2][32], an[2][32], fn[2][32];
+    float router[2][2 * 32];
+    float egate[2][2 * 32 * 32], eup[2][2 * 32 * 32], edown[2][2 * 32 * 32];
+    for (size_t i = 0; i < 4 * 32; i++) { embed[i] = rnd_f(-0.25f, 0.25f); lm_head[i] = rnd_f(-0.25f, 0.25f); }
+    for (size_t i = 0; i < 32; i++) out_norm[i] = 1.0f;
+    for (int l = 0; l < 2; l++) {
+        for (size_t i = 0; i < 32; i++) { qn[l][i] = 1.0f; kn[l][i] = 1.0f; an[l][i] = 1.0f; fn[l][i] = 1.0f; }
+        for (size_t i = 0; i < 32 * 32; i++) {
+            q_w[l][i] = rnd_f(-0.15f, 0.15f);
+            k_w[l][i] = rnd_f(-0.15f, 0.15f);
+            v_w[l][i] = rnd_f(-0.15f, 0.15f);
+            o_w[l][i] = rnd_f(-0.15f, 0.15f);
+        }
+        for (size_t i = 0; i < 2 * 32; i++) router[l][i] = rnd_f(-0.2f, 0.2f);
+        for (size_t i = 0; i < 2 * 32 * 32; i++) {
+            egate[l][i] = rnd_f(-0.15f, 0.15f);
+            eup[l][i] = rnd_f(-0.15f, 0.15f);
+            edown[l][i] = rnd_f(-0.15f, 0.15f);
+        }
+    }
+
+    const f32_tensor_spec_t all[25] = {
+        /* Shard 0: token_embd + layer 0 (12 tensors) */
+        { "token_embd.weight", 2, { 32, 4, 0 }, embed },
+        { "blk.0.attn_norm.weight", 1, { 32, 0, 0 }, an[0] },
+        { "blk.0.attn_q.weight", 2, { 32, 32, 0 }, q_w[0] },
+        { "blk.0.attn_k.weight", 2, { 32, 32, 0 }, k_w[0] },
+        { "blk.0.attn_v.weight", 2, { 32, 32, 0 }, v_w[0] },
+        { "blk.0.attn_output.weight", 2, { 32, 32, 0 }, o_w[0] },
+        { "blk.0.attn_q_norm.weight", 1, { 32, 0, 0 }, qn[0] },
+        { "blk.0.attn_k_norm.weight", 1, { 32, 0, 0 }, kn[0] },
+        { "blk.0.ffn_norm.weight", 1, { 32, 0, 0 }, fn[0] },
+        { "blk.0.ffn_gate_inp.weight", 2, { 32, 2, 0 }, router[0] },
+        { "blk.0.ffn_gate_exps.weight", 3, { 32, 32, 2 }, egate[0] },
+        { "blk.0.ffn_up_exps.weight", 3, { 32, 32, 2 }, eup[0] },
+        { "blk.0.ffn_down_exps.weight", 3, { 32, 32, 2 }, edown[0] },
+        /* Shard 1: layer 1 + output_norm + output (12 tensors) */
+        { "blk.1.attn_norm.weight", 1, { 32, 0, 0 }, an[1] },
+        { "blk.1.attn_q.weight", 2, { 32, 32, 0 }, q_w[1] },
+        { "blk.1.attn_k.weight", 2, { 32, 32, 0 }, k_w[1] },
+        { "blk.1.attn_v.weight", 2, { 32, 32, 0 }, v_w[1] },
+        { "blk.1.attn_output.weight", 2, { 32, 32, 0 }, o_w[1] },
+        { "blk.1.attn_q_norm.weight", 1, { 32, 0, 0 }, qn[1] },
+        { "blk.1.attn_k_norm.weight", 1, { 32, 0, 0 }, kn[1] },
+        { "blk.1.ffn_norm.weight", 1, { 32, 0, 0 }, fn[1] },
+        { "blk.1.ffn_gate_inp.weight", 2, { 32, 2, 0 }, router[1] },
+        { "blk.1.ffn_gate_exps.weight", 3, { 32, 32, 2 }, egate[1] },
+        { "blk.1.ffn_up_exps.weight", 3, { 32, 32, 2 }, eup[1] },
+        { "blk.1.ffn_down_exps.weight", 3, { 32, 32, 2 }, edown[1] },
+    };
+    /* Include output_norm and output in shard 1 too (27 tensors total: 13 in shard 0, 14 in shard 1). */
+    f32_tensor_spec_t full[27];
+    memcpy(full, all, sizeof(all));
+    full[25] = (f32_tensor_spec_t){ "output_norm.weight", 1, { 32, 0, 0 }, out_norm };
+    full[26] = (f32_tensor_spec_t){ "output.weight", 2, { 32, 4, 0 }, lm_head };
+
+    write_f32_gguf(single, "olmoe", 2, 32, 32, 2, 2, 2, 1, false, 0, 0, 0, full, 27);
+    write_f32_gguf(s1, "olmoe", 2, 32, 32, 2, 2, 2, 1, true, 0, 2, 27, full, 13);
+    /* Shard 2 intentionally omits general.architecture, matching llama-gguf-split. */
+    write_f32_gguf(s2, NULL, 0, 0, 0, 0, 0, 0, 0, true, 1, 2, 27, full + 13, 14);
+
+    /* 3. End-to-end forward pass: single GGUF vs split (from shard 1, from shard 2, and with expert streaming). */
+    char err[512];
+    vitna_llama_t m_single, m_s1, m_s2, m_stream;
+    const int32_t prompt[3] = { 0, 2, 1 };
+    float log_single[4], log_s1[4], log_s2[4], log_stream[4];
+
+    bool ok = vitna_llama_load_ex(&m_single, dir, single, 16, 1, err, sizeof(err));
+    CHECK(ok, "single GGUF MoE loads: %s", err);
+    if (ok) {
+        for (int i = 0; i < 3; i++) ok = ok && vitna_llama_step(&m_single, 0, prompt[i], log_single);
+        CHECK(ok, "single GGUF forward pass runs");
+        vitna_llama_free(&m_single);
+    }
+
+    ok = vitna_llama_load_ex(&m_s1, dir, s1, 16, 1, err, sizeof(err));
+    CHECK(ok && m_s1.n_shards == 2, "split GGUF loads from shard 1 (n_shards=%zu): %s", m_s1.n_shards, err);
+    if (ok) {
+        for (int i = 0; i < 3; i++) ok = ok && vitna_llama_step(&m_s1, 0, prompt[i], log_s1);
+        CHECK(ok && memcmp(log_s1, log_single, sizeof(log_single)) == 0,
+              "split GGUF (opened via shard 1) logits match single GGUF bit for bit");
+        vitna_llama_free(&m_s1);
+    }
+
+    ok = vitna_llama_load_ex(&m_s2, dir, s2, 16, 1, err, sizeof(err));
+    CHECK(ok && m_s2.n_shards == 2, "split GGUF loads from shard 2 (without arch in shard 2): %s", err);
+    if (ok) {
+        for (int i = 0; i < 3; i++) ok = ok && vitna_llama_step(&m_s2, 0, prompt[i], log_s2);
+        CHECK(ok && memcmp(log_s2, log_single, sizeof(log_single)) == 0,
+              "split GGUF (opened via shard 2) logits match single GGUF bit for bit");
+        vitna_llama_free(&m_s2);
+    }
+
+    ok = vitna_llama_load_ex(&m_stream, dir, s1, 16, 1, err, sizeof(err));
+    if (ok) {
+        bool stream_ok = vitna_llama_stream_experts(&m_stream, 1024 * 1024, err, sizeof(err));
+        CHECK(stream_ok, "expert streaming opens across both split GGUF shards: %s", err);
+        if (stream_ok) {
+            for (int i = 0; i < 3; i++) stream_ok = stream_ok && vitna_llama_step(&m_stream, 0, prompt[i], log_stream);
+            CHECK(stream_ok && memcmp(log_stream, log_single, sizeof(log_single)) == 0,
+                  "expert streaming over split GGUF shards matches single GGUF bit for bit");
+        }
+        vitna_llama_free(&m_stream);
+    }
+
+    /* 4. Fail-closed checks on malformed split sets. */
+    vitna_safetensors_t* shards = NULL;
+    char** paths = NULL;
+    size_t n_shards = 0;
+    vitna_gguf_info_t info;
+
+    /* Wrong split.tensors.count refused. */
+    write_f32_gguf(s2, NULL, 0, 0, 0, 0, 0, 0, 0, true, 1, 2, 99, full + 13, 14);
+    ok = vitna_gguf_open_shards(s1, &shards, &paths, &n_shards, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, "split.tensors.count") != NULL, "disagreeing split.tensors.count refused: \"%s\"", err);
+
+    /* Duplicate tensor across shards refused. */
+    f32_tensor_spec_t dup_s2[2] = { full[0], full[26] };
+    write_f32_gguf(s1, "olmoe", 2, 32, 32, 2, 2, 2, 1, true, 0, 2, 15, full, 13);
+    write_f32_gguf(s2, NULL, 0, 0, 0, 0, 0, 0, 0, true, 1, 2, 15, dup_s2, 2);
+    ok = vitna_gguf_open_shards(s1, &shards, &paths, &n_shards, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, "also appears") != NULL, "duplicate tensor across split shards refused: \"%s\"", err);
+
+    /* Wrong split.no inside shard 2 refused. */
+    write_f32_gguf(s1, "olmoe", 2, 32, 32, 2, 2, 2, 1, true, 0, 2, 27, full, 13);
+    write_f32_gguf(s2, "olmoe", 2, 32, 32, 2, 2, 2, 1, true, 0, 2, 27, full + 13, 14);
+    ok = vitna_gguf_open_shards(s1, &shards, &paths, &n_shards, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, "expected split 1") != NULL, "mismatched split.no inside sibling refused: \"%s\"", err);
+
+    /* Missing sibling shard refused cleanly. */
+    remove(s2);
+    ok = vitna_gguf_open_shards(s1, &shards, &paths, &n_shards, &info, err, sizeof(err));
+    CHECK(!ok && strstr(err, s2) != NULL, "missing sibling shard refused naming it: \"%s\"", err);
+
+    /* Cleanup temp files. */
+    remove(s1);
+    remove(single);
+    remove(cfg_full);
+#if defined(_WIN32)
+    _rmdir(dir);
+#else
+    rmdir(dir);
+#endif
+}
+
 int main(void) {
     test_quant();
     test_dequant_paths();
@@ -2117,6 +2379,7 @@ int main(void) {
     test_pool();
     test_warp_experts();
     test_gguf();
+    test_gguf_split();
     test_expert_stream();
     test_api_helpers();
     test_jsonpfx();

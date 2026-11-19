@@ -177,22 +177,13 @@ static const char* gguf_disagrees(const vitna_llama_config_t* c, const vitna_ggu
     return NULL;
 }
 
-/* Open the GGUF file at path as the checkpoint's one file. */
+/* Open the GGUF file at path, or all sibling shards of a split GGUF checkpoint. */
 static bool open_gguf(vitna_llama_t* m, const char* path, char* err, size_t err_len) {
-    m->shards = (vitna_safetensors_t*)calloc(1, sizeof(vitna_safetensors_t));
-    m->shard_paths = (char**)calloc(1, sizeof(char*));
-    if (!m->shards || !m->shard_paths) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
-    m->shard_paths[0] = (char*)malloc(strlen(path) + 1);
-    if (!m->shard_paths[0]) return fail(err, err_len, "out of memory%s%s", NULL, NULL);
-    strcpy(m->shard_paths[0], path);
     vitna_gguf_info_t info;
     char g_err[512];
-    if (!vitna_gguf_open(path, &m->shards[0], &info, g_err, sizeof(g_err))) {
-        free(m->shard_paths[0]);
-        m->shard_paths[0] = NULL;
+    if (!vitna_gguf_open_shards(path, &m->shards, &m->shard_paths, &m->n_shards, &info, g_err, sizeof(g_err))) {
         return fail(err, err_len, "%s%s", g_err, NULL);
     }
-    m->n_shards = 1;
     const char* differs = gguf_disagrees(&m->cfg, &info);
     if (differs) return fail(err, err_len, "%s and config.json disagree on %s", path, differs);
     return true;

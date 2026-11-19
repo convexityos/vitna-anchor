@@ -294,11 +294,36 @@ bool vitna_gguf_open(const char* path, vitna_safetensors_t* st, vitna_gguf_info_
         snprintf(msg, sizeof(msg), "%s: its metadata runs past the end of the file, or holds a type GGUF does not have", path);
         goto done;
     }
-    if (!info->arch[0]) {
-        snprintf(msg, sizeof(msg), "%s: no general.architecture", path);
-        goto done;
+    {
+        const double raw_no = meta_f64(nums, n_nums, "split", "no");
+        const double raw_cnt = meta_f64(nums, n_nums, "split", "count");
+        const double raw_tc = meta_f64(nums, n_nums, "split", "tensors.count");
+        if (!(raw_no >= 0.0 && raw_no <= 4096.0 && (double)(uint16_t)raw_no == raw_no) ||
+            !(raw_cnt >= 0.0 && raw_cnt <= 4096.0 && (double)(uint16_t)raw_cnt == raw_cnt) ||
+            !(raw_tc >= 0.0 && raw_tc <= 1e12 && (double)(uint64_t)raw_tc == raw_tc)) {
+            snprintf(msg, sizeof(msg), "%s: invalid split metadata", path);
+            goto done;
+        }
+        info->split_no = (uint16_t)raw_no;
+        info->split_count = (uint16_t)raw_cnt;
+        info->split_tensors_count = (uint64_t)raw_tc;
+        if (info->split_count > 1) {
+            if (info->split_no >= info->split_count) {
+                snprintf(msg, sizeof(msg), "%s: split.no (%u) must be less than split.count (%u)", path,
+                         (unsigned)info->split_no, (unsigned)info->split_count);
+                goto done;
+            }
+        } else if (info->split_no != 0) {
+            snprintf(msg, sizeof(msg), "%s: split.no (%u) set without split.count > 1", path, (unsigned)info->split_no);
+            goto done;
+        }
     }
-    if (strcmp(info->arch, "llama") == 0) {
+    if (!info->arch[0]) {
+        if (info->split_count <= 1 || info->split_no == 0) {
+            snprintf(msg, sizeof(msg), "%s: no general.architecture", path);
+            goto done;
+        }
+    } else if (strcmp(info->arch, "llama") == 0) {
         snprintf(msg, sizeof(msg), "%s: llama.cpp writes a llama model's query and key rows permuted, and this engine does not put them back", path);
         goto done;
     }
@@ -306,7 +331,7 @@ bool vitna_gguf_open(const char* path, vitna_safetensors_t* st, vitna_gguf_info_
         snprintf(msg, sizeof(msg), "%s: general.alignment is not a power of two up to 1 MiB", path);
         goto done;
     }
-    {
+    if (info->arch[0]) {
         const char* a = info->arch;
         info->block_count = meta_u64(nums, n_nums, a, "block_count");
         info->embedding_length = meta_u64(nums, n_nums, a, "embedding_length");
@@ -449,5 +474,203 @@ done:
         vitna_safetensors_close(st);
         set_err(err, err_len, "%s%s", msg[0] ? msg : "cannot read the GGUF file", NULL);
     }
+    return ok;
+}
+
+static bool parse_5digits(const char* p, uint32_t* out) {
+    uint32_t v = 0;
+    for (int i = 0; i < 5; i++) {
+        if (!isdigit((unsigned char)p[i])) return false;
+        v = v * 10u + (uint32_t)(p[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+
+bool vitna_gguf_split_path(const char* path, uint16_t index, uint16_t count, char* out, size_t out_len) {
+    if (!path || !out || out_len == 0 || count == 0 || index >= count || !vitna_gguf_path(path)) return false;
+    /* Suffix is "-NNNNN-of-MMMMM.gguf" (20 bytes). */
+    const size_t n = strlen(path);
+    if (n <= 20) return false;
+    const char* suf = path + n - 20;
+    if (suf[0] != '-' || memcmp(suf + 6, "-of-", 4) != 0) return false;
+    uint32_t cur_no = 0, cur_cnt = 0;
+    if (!parse_5digits(suf + 1, &cur_no) || !parse_5digits(suf + 10, &cur_cnt)) return false;
+    if (cur_no == 0 || cur_no > cur_cnt || cur_cnt != (uint32_t)count) return false;
+    const size_t prefix_len = n - 20;
+    const char* ext = path + n - 5; /* preserve original .gguf / .GGUF casing */
+    const int wrote = snprintf(out, out_len, "%.*s-%05u-of-%05u%s", (int)prefix_len, path, (unsigned)(index + 1),
+                               (unsigned)count, ext);
+    return wrote > 0 && (size_t)wrote < out_len;
+}
+
+static char* dup_str(const char* s) {
+    const size_t n = strlen(s) + 1;
+    char* copy = (char*)malloc(n);
+    if (copy) memcpy(copy, s, n);
+    return copy;
+}
+
+bool vitna_gguf_open_shards(const char* path, vitna_safetensors_t** shards_out, char*** paths_out, size_t* n_shards_out,
+                            vitna_gguf_info_t* info_out, char* err, size_t err_len) {
+    *shards_out = NULL;
+    *paths_out = NULL;
+    *n_shards_out = 0;
+    memset(info_out, 0, sizeof(*info_out));
+    if (err && err_len) err[0] = '\0';
+
+    vitna_safetensors_t first_st;
+    vitna_gguf_info_t first_info;
+    char g_err[512];
+    if (!vitna_gguf_open(path, &first_st, &first_info, g_err, sizeof(g_err))) {
+        return set_err(err, err_len, "%s%s", g_err, NULL);
+    }
+
+    if (first_info.split_count <= 1) {
+        vitna_safetensors_t* shards = (vitna_safetensors_t*)calloc(1, sizeof(vitna_safetensors_t));
+        char** paths = (char**)calloc(1, sizeof(char*));
+        char* p0 = dup_str(path);
+        if (!shards || !paths || !p0) {
+            vitna_safetensors_close(&first_st);
+            free(shards);
+            free(paths);
+            free(p0);
+            return set_err(err, err_len, "out of memory%s%s", NULL, NULL);
+        }
+        shards[0] = first_st;
+        paths[0] = p0;
+        *shards_out = shards;
+        *paths_out = paths;
+        *n_shards_out = 1;
+        *info_out = first_info;
+        return true;
+    }
+
+    const uint16_t count = first_info.split_count;
+    vitna_safetensors_t* shards = (vitna_safetensors_t*)calloc(count, sizeof(vitna_safetensors_t));
+    char** paths = (char**)calloc(count, sizeof(char*));
+    vitna_gguf_info_t* infos = (vitna_gguf_info_t*)calloc(count, sizeof(vitna_gguf_info_t));
+    bool* opened = (bool*)calloc(count, sizeof(bool));
+    bool ok = false;
+    char msg[1536];
+    msg[0] = '\0';
+
+    if (!shards || !paths || !infos || !opened) {
+        vitna_safetensors_close(&first_st);
+        snprintf(msg, sizeof(msg), "out of memory");
+        goto done;
+    }
+
+    /* Place the already-opened shard at its declared index so we never double-map it. */
+    shards[first_info.split_no] = first_st;
+    infos[first_info.split_no] = first_info;
+    opened[first_info.split_no] = true;
+    paths[first_info.split_no] = dup_str(path);
+    if (!paths[first_info.split_no]) {
+        snprintf(msg, sizeof(msg), "out of memory");
+        goto done;
+    }
+
+    /* Validate that the supplied filename matches its declared split.no and split.count. */
+    {
+        char expected_self[1024];
+        if (!vitna_gguf_split_path(path, first_info.split_no, count, expected_self, sizeof(expected_self))) {
+            snprintf(msg, sizeof(msg), "%.400s: split.count is %u, but the filename does not match <prefix>-NNNNN-of-%05u.gguf",
+                     path, (unsigned)count, (unsigned)count);
+            goto done;
+        }
+        if (strcmp(path, expected_self) != 0) {
+            snprintf(msg, sizeof(msg), "%.400s: split.no is %u, expected filename %.400s", path,
+                     (unsigned)first_info.split_no, expected_self);
+            goto done;
+        }
+    }
+
+    for (uint16_t i = 0; i < count; i++) {
+        if (opened[i]) continue;
+        char spath[1024];
+        if (!vitna_gguf_split_path(path, i, count, spath, sizeof(spath))) {
+            snprintf(msg, sizeof(msg), "%s: cannot form path for split shard %u of %u", path, (unsigned)(i + 1),
+                     (unsigned)count);
+            goto done;
+        }
+        paths[i] = dup_str(spath);
+        if (!paths[i]) {
+            snprintf(msg, sizeof(msg), "out of memory");
+            goto done;
+        }
+        if (!vitna_gguf_open(spath, &shards[i], &infos[i], g_err, sizeof(g_err))) {
+            snprintf(msg, sizeof(msg), "%s", g_err);
+            goto done;
+        }
+        opened[i] = true;
+        if (infos[i].split_count != count || infos[i].split_no != i) {
+            snprintf(msg, sizeof(msg), "%s: expected split %u of %u, found split %u of %u", spath, (unsigned)i,
+                     (unsigned)count, (unsigned)infos[i].split_no, (unsigned)infos[i].split_count);
+            goto done;
+        }
+    }
+
+    /* Cross-shard consistency checks: architecture, split.tensors.count, and unique tensor names. */
+    const vitna_gguf_info_t* meta0 = &infos[0];
+    uint64_t total_file_tensors = 0;
+    uint64_t expected_total = meta0->split_tensors_count;
+    for (uint16_t i = 0; i < count; i++) {
+        if (infos[i].arch[0] && strcmp(infos[i].arch, meta0->arch) != 0) {
+            snprintf(msg, sizeof(msg), "%s: architecture %s disagrees with shard 1 (%s)", paths[i], infos[i].arch,
+                     meta0->arch);
+            goto done;
+        }
+        if (infos[i].split_tensors_count) {
+            if (expected_total && infos[i].split_tensors_count != expected_total) {
+                snprintf(msg, sizeof(msg), "%s: split.tensors.count (%llu) disagrees with shard 1 (%llu)", paths[i],
+                         (unsigned long long)infos[i].split_tensors_count, (unsigned long long)expected_total);
+                goto done;
+            }
+            expected_total = infos[i].split_tensors_count;
+        }
+        total_file_tensors += (uint64_t)infos[i].file_tensors;
+    }
+    if (expected_total && total_file_tensors != expected_total) {
+        snprintf(msg, sizeof(msg), "%s: split shards hold %llu tensors, but split.tensors.count is %llu", paths[0],
+                 (unsigned long long)total_file_tensors, (unsigned long long)expected_total);
+        goto done;
+    }
+
+    for (uint16_t i = 0; i < count; i++) {
+        for (size_t t = 0; t < shards[i].tensor_count; t++) {
+            const char* tname = shards[i].tensors[t].name;
+            for (uint16_t j = 0; j < i; j++) {
+                if (vitna_safetensors_find(&shards[j], tname) != NULL) {
+                    snprintf(msg, sizeof(msg), "%s: tensor %s also appears in %s", paths[i], tname, paths[j]);
+                    goto done;
+                }
+            }
+        }
+    }
+
+    *shards_out = shards;
+    *paths_out = paths;
+    *n_shards_out = count;
+    *info_out = *meta0;
+    info_out->file_tensors = (size_t)total_file_tensors;
+    ok = true;
+
+done:
+    free(infos);
+    if (!ok) {
+        if (shards && opened) {
+            for (uint16_t i = 0; i < count; i++) {
+                if (opened[i]) vitna_safetensors_close(&shards[i]);
+            }
+        }
+        if (paths) {
+            for (uint16_t i = 0; i < count; i++) free(paths[i]);
+        }
+        free(shards);
+        free(paths);
+        set_err(err, err_len, "%s%s", msg[0] ? msg : "cannot open split GGUF checkpoint", NULL);
+    }
+    free(opened);
     return ok;
 }

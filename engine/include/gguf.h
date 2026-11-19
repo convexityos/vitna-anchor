@@ -51,14 +51,39 @@ typedef struct {
     double rms_eps;               /* attention.layer_norm_rms_epsilon */
     double rope_freq_base;        /* rope.freq_base */
     size_t file_tensors;          /* tensors in the file, before experts are split out */
+    uint16_t split_no;            /* split.no (0-based shard index; 0 when unsplit) */
+    uint16_t split_count;         /* split.count (total shards; 0 or 1 when unsplit) */
+    uint64_t split_tensors_count; /* split.tensors.count (total file tensors across all shards) */
 } vitna_gguf_info_t;
 
 /**
- * Open path as a checkpoint, filling st (its mapping and its tensors under
- * Hugging Face names) and info. On failure returns false and writes a
- * reason to err. Close st with vitna_safetensors_close.
+ * Open path as a single GGUF file, filling st (its mapping and its tensors
+ * under Hugging Face names) and info. Non-first shards of a split GGUF
+ * (split.count > 1 and split.no > 0) may omit general.architecture, as
+ * llama-gguf-split writes it. On failure returns false and writes a reason to
+ * err. Close st with vitna_safetensors_close.
  */
 bool vitna_gguf_open(const char* path, vitna_safetensors_t* st, vitna_gguf_info_t* info, char* err, size_t err_len);
+
+/**
+ * Open path as a single GGUF checkpoint or as all shards of a llama.cpp split
+ * GGUF checkpoint (<prefix>-00001-of-0000N.gguf). Any shard of a split set may
+ * be passed; shards are returned in 0..N-1 order with shard 0's metadata in
+ * info_out, after verifying every shard's split.no, split.count,
+ * split.tensors.count, and absence of duplicate tensors across shards.
+ * Caller frees each shard via vitna_safetensors_close and frees shards_out and
+ * paths_out (and each string in paths_out).
+ */
+bool vitna_gguf_open_shards(const char* path, vitna_safetensors_t** shards_out, char*** paths_out, size_t* n_shards_out,
+                            vitna_gguf_info_t* info_out, char* err, size_t err_len);
+
+/**
+ * Format the path for 0-based shard index (0 <= index < count) given any
+ * sibling path matching llama.cpp's <prefix>-NNNNN-of-MMMMM.gguf naming
+ * (1-based, 5 digits, case-insensitive .gguf). Returns false if path does not
+ * match the split suffix, MMMMM disagrees with count, or out is too small.
+ */
+bool vitna_gguf_split_path(const char* path, uint16_t index, uint16_t count, char* out, size_t out_len);
 
 /** True when path ends in .gguf. */
 bool vitna_gguf_path(const char* path);
