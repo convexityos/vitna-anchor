@@ -2473,6 +2473,105 @@ static void test_gpu_plan(void) {
           "oversized dense model fails closed naming MiB shortfall: \"%s\"", plan.reason);
 }
 
+#ifdef _WIN32
+#include <direct.h>
+#define TEST_MKDIR(p) _mkdir(p)
+#define TEST_RMDIR(p) _rmdir(p)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define TEST_MKDIR(p) mkdir((p), 0700)
+#define TEST_RMDIR(p) rmdir(p)
+#endif
+
+static bool test_sink_write(void* ctx, const void* data, size_t len) {
+    vitna_strbuf_t* sb = (vitna_strbuf_t*)ctx;
+    vitna_sb_append(sb, (const char*)data, len);
+    return sb->ok;
+}
+
+static void test_checkpoint_attestation(void) {
+    char hex[65], err[512];
+
+    /* 1. Single-file GGUF SHA-256 matches independent reference digest. */
+    const char* single_path = "vitna_ckpt_single_test.gguf";
+    write_file(single_path, "expected-gguf-payload", 21);
+    bool ok = vitna_checkpoint_sha256(single_path, hex, err, sizeof(err));
+    CHECK(ok && strcmp(hex, "0eb9b673e1fa8f8abe1e1a378fd84e5886fd0d7bce7176dab0e928bfce8a7ae1") == 0,
+          "single-file checkpoint sha256 matches reference: got %s (%s)", ok ? hex : "(fail)", err);
+    remove(single_path);
+
+    /* 2. Multi-shard directory manifest SHA-256 (sorted ASCII, ignores README.txt). */
+    const char* dir_path = "vitna_ckpt_dir_test";
+    const char* f_cfg = "vitna_ckpt_dir_test/config.json";
+    const char* f_s1 = "vitna_ckpt_dir_test/model-00001-of-00002.gguf";
+    const char* f_s2 = "vitna_ckpt_dir_test/model-00002-of-00002.gguf";
+    const char* f_ign = "vitna_ckpt_dir_test/README.txt";
+    TEST_MKDIR(dir_path);
+    write_file(f_s2, "GGUF-shard-two-bytes", 20);
+    write_file(f_cfg, "{\"model_type\":\"qwen3\"}", 22);
+    write_file(f_s1, "GGUF-shard-one-bytes", 20);
+    write_file(f_ign, "ignored readme file", 19);
+
+    ok = vitna_checkpoint_sha256(dir_path, hex, err, sizeof(err));
+    CHECK(ok && strcmp(hex, "74ccf259c3cbe8bd688ae29a61c9784b13f4987377389b24684b12f7f232a01d") == 0,
+          "directory manifest checkpoint sha256 matches reference: got %s (%s)", ok ? hex : "(fail)", err);
+
+    remove(f_cfg);
+    remove(f_s1);
+    remove(f_s2);
+    remove(f_ign);
+
+    /* 3. Empty directory fails closed. */
+    ok = vitna_checkpoint_sha256(dir_path, hex, err, sizeof(err));
+    CHECK(!ok && strstr(err, "no recognized model artifacts") != NULL,
+          "empty checkpoint directory fails closed: %s", err);
+    TEST_RMDIR(dir_path);
+
+    /* 4. API setter validation, uppercase normalization, and /health advertisement. */
+    vitna_encoder_t enc;
+    memset(&enc, 0, sizeof(enc));
+    enc.cfg.hidden = 384;
+    enc.cfg.max_tokens = 512;
+    enc.cfg.normalize = true;
+    enc.threads = 2;
+
+    vitna_api_t* api = vitna_api_create_encoder(&enc, NULL, "test-embed");
+    CHECK(api != NULL, "create encoder api for health attestation check");
+    if (api) {
+        CHECK(vitna_api_checkpoint_sha256(api) == NULL, "checkpoint_sha256 starts unset");
+        CHECK(!vitna_api_set_checkpoint_sha256(api, "too-short"), "short hex is rejected");
+        CHECK(!vitna_api_set_checkpoint_sha256(api, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+              "non-hex 64-char string is rejected");
+
+        /* Unset: /health omits checkpoint_sha256. */
+        vitna_strbuf_t resp;
+        vitna_sb_init(&resp);
+        vitna_sink_t sink = { test_sink_write, &resp, false };
+        vitna_api_handle(api, "GET", "/health", "", 0, &sink);
+        CHECK(strstr(resp.data, "\"checkpoint_sha256\"") == NULL, "/health omits checkpoint_sha256 when unset");
+        vitna_sb_free(&resp);
+
+        /* Uppercase valid 64-char hex is normalized to lowercase and advertised on /health. */
+        const char* upper = "0EB9B673E1FA8F8ABE1E1A378FD84E5886FD0D7BCE7176DAB0E928BFCE8A7AE1";
+        const char* lower = "0eb9b673e1fa8f8abe1e1a378fd84e5886fd0d7bce7176dab0e928bfce8a7ae1";
+        CHECK(vitna_api_set_checkpoint_sha256(api, upper), "valid 64-char hex accepted");
+        CHECK(strcmp(vitna_api_checkpoint_sha256(api), lower) == 0, "uppercase hex normalized to lowercase");
+
+        vitna_sb_init(&resp);
+        vitna_sink_t sink2 = { test_sink_write, &resp, false };
+        vitna_api_handle(api, "GET", "/health", "", 0, &sink2);
+        CHECK(strstr(resp.data, "\"checkpoint_sha256\":\"0eb9b673e1fa8f8abe1e1a378fd84e5886fd0d7bce7176dab0e928bfce8a7ae1\"") != NULL,
+              "/health advertises checkpoint_sha256 when configured");
+        vitna_sb_free(&resp);
+
+        /* Clearing works cleanly. */
+        CHECK(vitna_api_set_checkpoint_sha256(api, NULL) && vitna_api_checkpoint_sha256(api) == NULL,
+              "NULL clears checkpoint_sha256");
+        vitna_api_free(api);
+    }
+}
+
 int main(void) {
     test_quant();
     test_dequant_paths();
@@ -2485,6 +2584,7 @@ int main(void) {
     test_gpu_plan();
     test_expert_stream();
     test_api_helpers();
+    test_checkpoint_attestation();
     test_jsonpfx();
     test_json();
     test_py_json();

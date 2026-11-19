@@ -47,6 +47,17 @@ void vitna_sha256_final_hex(vitna_sha256_ctx_t *ctx, char hex_output[65]);
  */
 void vitna_trajectory_feed(vitna_sha256_ctx_t *ctx, int32_t token_id, float top_logit);
 
+/**
+ * Compute a deterministic lowercase 64-char SHA-256 hex digest for a local
+ * checkpoint file (e.g. a single .gguf) or a model directory (sorted ASCII
+ * manifest of recognized model artifacts: .gguf, .safetensors, config.json,
+ * tokenizer.json, tokenizer_config.json, hashed as "<name>:<sha256>\n").
+ *
+ * Matches vitna-code's vitna_providers::compute_checkpoint_digest() byte for byte.
+ * Returns false and writes a diagnostic into err on failure.
+ */
+bool vitna_checkpoint_sha256(const char *path, char hex_output[65], char *err, size_t err_cap);
+
 #ifdef __cplusplus
 }
 #endif

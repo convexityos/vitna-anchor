@@ -125,7 +125,8 @@ static void print_usage(const char* prog) {
     printf("          error that leaves the device unable to run anything more in the process, it answers\n");
     printf("          each request open with an error and exits with status %d, to be started again.\n", EXIT_DEVICE_LOST);
     printf("          With an embedding model it serves /v1/embeddings instead of generation, on the CPU,\n");
-    printf("          on --threads threads\n");
+    printf("          on --threads threads. --attest-checkpoint hashes the model weights (SHA-256) at startup\n");
+    printf("          and advertises checkpoint_sha256 on /health and x-vitna-checkpoint-sha256 on responses\n");
     printf("info      lists the tensors in a SafeTensors file\n");
     printf("bench     times the int4 matrix-vector kernel on synthetic data\n");
     printf("hardware  prints, as JSON, what the installer sizes a model by: the CPU, the memory, the drive's free\n");
@@ -166,6 +167,7 @@ typedef struct {
     bool stop_at_special;
     bool no_prefix_cache;
     bool timing;
+    bool attest_checkpoint;
     size_t speculate;
     size_t parallel;        /* serve: the requests it runs at once, each with a sequence of its own */
     size_t threads;         /* an embedding model's threads; 0 for every processor */
@@ -290,6 +292,7 @@ static bool parse_args(int argc, char** argv, args_t* a) {
         else if (strcmp(k, "--stop-at-special") == 0) a->stop_at_special = true;
         else if (strcmp(k, "--no-prefix-cache") == 0) a->no_prefix_cache = true;
         else if (strcmp(k, "--timing") == 0) a->timing = true;
+        else if (strcmp(k, "--attest-checkpoint") == 0) a->attest_checkpoint = true;
         else {
             fprintf(stderr, "Unknown or incomplete option: %s\n", k);
             return false;
@@ -1518,6 +1521,19 @@ static int serve_encoder(const args_t* a, vitna_server_config_t* cfg) {
     if (!api) {
         fprintf(stderr, "out of memory\n");
     } else {
+        if (a->attest_checkpoint) {
+            char sha[65], sha_err[512];
+            const char* target = a->weights ? a->weights : a->model;
+            if (!vitna_checkpoint_sha256(target, sha, sha_err, sizeof(sha_err)) ||
+                !vitna_api_set_checkpoint_sha256(api, sha)) {
+                fprintf(stderr, "checkpoint attestation failed: %s\n", sha_err);
+                vitna_api_free(api);
+                vitna_encoder_free(&e);
+                vitna_tokenizer_free(tok);
+                return 1;
+            }
+            printf("Attested checkpoint sha256: %s\n", sha);
+        }
         printf("Loaded %s: an embedding model, %zu layers, %zu dimensions, %s pooling%s, up to %zu tokens a text, on %zu CPU threads (%s).\n",
                vitna_api_model_id(api), e.cfg.n_layers, e.cfg.hidden, e.cfg.pooling == VITNA_POOL_CLS ? "[CLS]" : "mean",
                e.cfg.normalize ? ", normalized" : "", e.cfg.max_tokens, e.threads, vitna_encoder_path());
@@ -1562,6 +1578,19 @@ static int cmd_serve(const args_t* a) {
     if (!api) {
         fprintf(stderr, "out of memory\n");
     } else {
+        if (a->attest_checkpoint) {
+            char sha[65], sha_err[512];
+            const char* target = a->weights ? a->weights : a->model;
+            if (!vitna_checkpoint_sha256(target, sha, sha_err, sizeof(sha_err)) ||
+                !vitna_api_set_checkpoint_sha256(api, sha)) {
+                fprintf(stderr, "checkpoint attestation failed: %s\n", sha_err);
+                vitna_api_free(api);
+                vitna_llama_free(&m);
+                vitna_tokenizer_free(tok);
+                return 1;
+            }
+            printf("Attested checkpoint sha256: %s\n", sha);
+        }
         vitna_api_set_prefix_cache(api, !a->no_prefix_cache);
         if (a->speculate && !vitna_api_set_speculate(api, a->speculate)) fprintf(stderr, "out of memory for --speculate; serving without it\n");
         /* For tests only: VITNA_TEST_NO_MASK_CACHE=1 makes JSON mode find
