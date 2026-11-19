@@ -43,6 +43,71 @@ void vitna_dequant_q8_0(const uint8_t* block, float out[32]) {
     for (int i = 0; i < 32; i++) out[i] = (float)q[i] * d;
 }
 
+/* Group g's signed 6-bit scale (-32..31) from Q3_K's 12 packed scale bytes,
+   matching ggml's dequantize_row_q3_K bit layout without endian assumptions. */
+static int scale_k3(int g, const uint8_t* s) {
+    uint8_t sc;
+    if (g < 4) {
+        sc = (uint8_t)((s[g] & 0x0F) | (((s[g + 8] >> 0) & 0x03) << 4));
+    } else if (g < 8) {
+        sc = (uint8_t)((s[g] & 0x0F) | (((s[g + 4] >> 2) & 0x03) << 4));
+    } else if (g < 12) {
+        sc = (uint8_t)((s[g - 8] >> 4) | (((s[g] >> 4) & 0x03) << 4));
+    } else {
+        sc = (uint8_t)((s[g - 8] >> 4) | (((s[g - 4] >> 6) & 0x03) << 4));
+    }
+    return (int)sc - 32;
+}
+
+void vitna_dequant_q2_k(const uint8_t* block, float out[256]) {
+    const uint8_t* scales = block;
+    const uint8_t* qs = block + 16;
+    const float d = vitna_f16_to_f32(u16le(block + 80));
+    const float dmin = vitna_f16_to_f32(u16le(block + 82));
+    for (int h = 0; h < 2; h++) {
+        const uint8_t* q = qs + 32 * h;
+        for (int r = 0; r < 4; r++) {
+            const int shift = 2 * r;
+            for (int half = 0; half < 2; half++) {
+                const int g = 8 * h + 2 * r + half;
+                const float dl = d * (float)(scales[g] & 0x0F);
+                const float ml = dmin * (float)(scales[g] >> 4);
+                const int base = 16 * half;
+                for (int l = 0; l < 16; l++) {
+                    const int qv = (q[base + l] >> shift) & 0x03;
+                    const float p = dl * (float)qv;
+                    out[128 * h + 32 * r + base + l] = p - ml;
+                }
+            }
+        }
+    }
+}
+
+void vitna_dequant_q3_k(const uint8_t* block, float out[256]) {
+    const uint8_t* hmask = block;
+    const uint8_t* qs = block + 32;
+    const uint8_t* scales = block + 96;
+    const float d = vitna_f16_to_f32(u16le(block + 108));
+    for (int h = 0; h < 2; h++) {
+        const uint8_t* q = qs + 32 * h;
+        for (int r = 0; r < 4; r++) {
+            const int shift = 2 * r;
+            const int mbit = 4 * h + r;
+            for (int half = 0; half < 2; half++) {
+                const int g = 8 * h + 2 * r + half;
+                const float dl = d * (float)scale_k3(g, scales);
+                const int base = 16 * half;
+                for (int l = 0; l < 16; l++) {
+                    const int low = (q[base + l] >> shift) & 0x03;
+                    const int high = (hmask[base + l] >> mbit) & 0x01;
+                    const int qv = (low | (high << 2)) - 4;
+                    out[128 * h + 32 * r + base + l] = dl * (float)qv;
+                }
+            }
+        }
+    }
+}
+
 /* Group j's 6-bit scale and min from the 12 packed bytes, as ggml's
    get_scale_min_k4: groups 0 to 3 in the low six bits of bytes j and j + 4,
    groups 4 to 7 in the halves of byte j + 4 with two high bits borrowed
@@ -71,6 +136,28 @@ void vitna_dequant_q4_k(const uint8_t* block, float out[256]) {
         const int shift = (g & 1) ? 4 : 0;
         for (int l = 0; l < 32; l++) {
             const float p = d1 * (float)((q[l] >> shift) & 0x0F);
+            out[32 * g + l] = p - m1;
+        }
+    }
+}
+
+void vitna_dequant_q5_k(const uint8_t* block, float out[256]) {
+    const float d = vitna_f16_to_f32(u16le(block));
+    const float dmin = vitna_f16_to_f32(u16le(block + 2));
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* qs = block + 48;
+    for (int g = 0; g < 8; g++) {
+        uint8_t sc, mn;
+        scale_min_k4(g, scales, &sc, &mn);
+        const float d1 = d * (float)sc;
+        const float m1 = dmin * (float)mn;
+        const uint8_t* q = qs + 32 * (g / 2);
+        const int shift = (g & 1) ? 4 : 0;
+        for (int l = 0; l < 32; l++) {
+            const int low = (q[l] >> shift) & 0x0F;
+            const int high = (qh[l] >> g) & 0x01;
+            const float p = d1 * (float)(low | (high << 4));
             out[32 * g + l] = p - m1;
         }
     }
@@ -119,6 +206,59 @@ VITNA_QUANT_AVX2 static void q8_0_avx2(const uint8_t* block, float out[32]) {
     for (int i = 0; i < 32; i += 8) _mm256_storeu_ps(out + i, _mm256_mul_ps(s8x8(block + 2 + i), d));
 }
 
+VITNA_QUANT_AVX2 static void q2_k_avx2(const uint8_t* block, float out[256]) {
+    const uint8_t* scales = block;
+    const uint8_t* qs = block + 16;
+    const float d = vitna_f16_to_f32(u16le(block + 80));
+    const float dmin = vitna_f16_to_f32(u16le(block + 82));
+    const __m128i low2 = _mm_set1_epi8(0x03);
+    for (int h = 0; h < 2; h++) {
+        for (int r = 0; r < 4; r++) {
+            const __m128i sh = _mm_cvtsi32_si128(2 * r);
+            for (int l = 0; l < 32; l += 16) {
+                const int g = 8 * h + 2 * r + (l >> 4);
+                const __m256 dl = _mm256_set1_ps(d * (float)(scales[g] & 0x0F));
+                const __m256 ml = _mm256_set1_ps(dmin * (float)(scales[g] >> 4));
+                __m128i v = _mm_loadu_si128((const __m128i*)(qs + 32 * h + l));
+                v = _mm_and_si128(_mm_srl_epi16(v, sh), low2);
+                const __m256 lo = u8x8(v), hi = u8x8(_mm_srli_si128(v, 8));
+                const int i = 128 * h + 32 * r + l;
+                _mm256_storeu_ps(out + i, _mm256_sub_ps(_mm256_mul_ps(dl, lo), ml));
+                _mm256_storeu_ps(out + i + 8, _mm256_sub_ps(_mm256_mul_ps(dl, hi), ml));
+            }
+        }
+    }
+}
+
+VITNA_QUANT_AVX2 static void q3_k_avx2(const uint8_t* block, float out[256]) {
+    const uint8_t* hmask = block;
+    const uint8_t* qs = block + 32;
+    const uint8_t* scales = block + 96;
+    const float d = vitna_f16_to_f32(u16le(block + 108));
+    const __m128i low2 = _mm_set1_epi8(0x03), low1 = _mm_set1_epi8(0x01);
+    const __m256i bias = _mm256_set1_epi32(4);
+    for (int h = 0; h < 2; h++) {
+        for (int r = 0; r < 4; r++) {
+            const __m128i sh_lo = _mm_cvtsi32_si128(2 * r);
+            const __m128i sh_hi = _mm_cvtsi32_si128(4 * h + r);
+            for (int l = 0; l < 32; l += 16) {
+                const int g = 8 * h + 2 * r + (l >> 4);
+                const __m256 dl = _mm256_set1_ps(d * (float)scale_k3(g, scales));
+                __m128i lo = _mm_loadu_si128((const __m128i*)(qs + 32 * h + l));
+                lo = _mm_and_si128(_mm_srl_epi16(lo, sh_lo), low2);
+                __m128i hi = _mm_loadu_si128((const __m128i*)(hmask + l));
+                hi = _mm_and_si128(_mm_srl_epi16(hi, sh_hi), low1);
+                const __m128i q = _mm_or_si128(lo, _mm_slli_epi16(hi, 2));
+                const int i = 128 * h + 32 * r + l;
+                const __m256 a = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(q), bias));
+                const __m256 b = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(q, 8)), bias));
+                _mm256_storeu_ps(out + i, _mm256_mul_ps(dl, a));
+                _mm256_storeu_ps(out + i + 8, _mm256_mul_ps(dl, b));
+            }
+        }
+    }
+}
+
 VITNA_QUANT_AVX2 static void q4_k_avx2(const uint8_t* block, float out[256]) {
     const float d = vitna_f16_to_f32(u16le(block));
     const float dmin = vitna_f16_to_f32(u16le(block + 2));
@@ -135,6 +275,33 @@ VITNA_QUANT_AVX2 static void q4_k_avx2(const uint8_t* block, float out[256]) {
             v = _mm_and_si128(v, low4);
             /* bytes l to l + 15 of the group, as unsigned 4-bit integers */
             const __m256 lo = u8x8(v), hi = u8x8(_mm_srli_si128(v, 8));
+            _mm256_storeu_ps(out + 32 * g + l, _mm256_sub_ps(_mm256_mul_ps(d1, lo), m1));
+            _mm256_storeu_ps(out + 32 * g + l + 8, _mm256_sub_ps(_mm256_mul_ps(d1, hi), m1));
+        }
+    }
+}
+
+VITNA_QUANT_AVX2 static void q5_k_avx2(const uint8_t* block, float out[256]) {
+    const float d = vitna_f16_to_f32(u16le(block));
+    const float dmin = vitna_f16_to_f32(u16le(block + 2));
+    const uint8_t* qh = block + 16;
+    const uint8_t* qs = block + 48;
+    const __m128i low4 = _mm_set1_epi8(0x0F), low1 = _mm_set1_epi8(0x01);
+    for (int g = 0; g < 8; g++) {
+        uint8_t sc, mn;
+        scale_min_k4(g, block + 4, &sc, &mn);
+        const __m256 d1 = _mm256_set1_ps(d * (float)sc);
+        const __m256 m1 = _mm256_set1_ps(dmin * (float)mn);
+        const uint8_t* q = qs + 32 * (g / 2);
+        const __m128i sh = _mm_cvtsi32_si128(g);
+        for (int l = 0; l < 32; l += 16) {
+            __m128i v = _mm_loadu_si128((const __m128i*)(q + l));
+            if (g & 1) v = _mm_srli_epi16(v, 4);
+            v = _mm_and_si128(v, low4);
+            __m128i hi_b = _mm_loadu_si128((const __m128i*)(qh + l));
+            hi_b = _mm_slli_epi16(_mm_and_si128(_mm_srl_epi16(hi_b, sh), low1), 4);
+            const __m128i qv = _mm_or_si128(v, hi_b);
+            const __m256 lo = u8x8(qv), hi = u8x8(_mm_srli_si128(qv, 8));
             _mm256_storeu_ps(out + 32 * g + l, _mm256_sub_ps(_mm256_mul_ps(d1, lo), m1));
             _mm256_storeu_ps(out + 32 * g + l + 8, _mm256_sub_ps(_mm256_mul_ps(d1, hi), m1));
         }
@@ -180,8 +347,14 @@ void vitna_dequant(const void* src, vitna_dtype_t dtype, float* dst, size_t n) {
     if (quant_avx2()) {
         if (dtype == VITNA_DTYPE_Q8_0) {
             for (size_t i = 0; i < n; i += 32, b += 34) q8_0_avx2(b, dst + i);
+        } else if (dtype == VITNA_DTYPE_Q2_K) {
+            for (size_t i = 0; i < n; i += 256, b += 84) q2_k_avx2(b, dst + i);
+        } else if (dtype == VITNA_DTYPE_Q3_K) {
+            for (size_t i = 0; i < n; i += 256, b += 110) q3_k_avx2(b, dst + i);
         } else if (dtype == VITNA_DTYPE_Q4_K) {
             for (size_t i = 0; i < n; i += 256, b += 144) q4_k_avx2(b, dst + i);
+        } else if (dtype == VITNA_DTYPE_Q5_K) {
+            for (size_t i = 0; i < n; i += 256, b += 176) q5_k_avx2(b, dst + i);
         } else if (dtype == VITNA_DTYPE_Q6_K) {
             for (size_t i = 0; i < n; i += 256, b += 210) q6_k_avx2(b, dst + i);
         }
@@ -190,8 +363,14 @@ void vitna_dequant(const void* src, vitna_dtype_t dtype, float* dst, size_t n) {
 #endif
     if (dtype == VITNA_DTYPE_Q8_0) {
         for (size_t i = 0; i < n; i += 32, b += 34) vitna_dequant_q8_0(b, dst + i);
+    } else if (dtype == VITNA_DTYPE_Q2_K) {
+        for (size_t i = 0; i < n; i += 256, b += 84) vitna_dequant_q2_k(b, dst + i);
+    } else if (dtype == VITNA_DTYPE_Q3_K) {
+        for (size_t i = 0; i < n; i += 256, b += 110) vitna_dequant_q3_k(b, dst + i);
     } else if (dtype == VITNA_DTYPE_Q4_K) {
         for (size_t i = 0; i < n; i += 256, b += 144) vitna_dequant_q4_k(b, dst + i);
+    } else if (dtype == VITNA_DTYPE_Q5_K) {
+        for (size_t i = 0; i < n; i += 256, b += 176) vitna_dequant_q5_k(b, dst + i);
     } else if (dtype == VITNA_DTYPE_Q6_K) {
         for (size_t i = 0; i < n; i += 256, b += 210) vitna_dequant_q6_k(b, dst + i);
     }

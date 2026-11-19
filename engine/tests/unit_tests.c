@@ -1563,6 +1563,93 @@ static void test_quant(void) {
     }
     CHECK(bad == 0, "Q4_K: w = (d * scale) * q - (dmin * min), group by group (%d of 256 differ)", bad);
 
+    /* Q2_K: 16 scale/min nibble bytes, 64 2-bit quant bytes, d, dmin. */
+    uint8_t q2[84];
+    memset(q2, 0, sizeof(q2));
+    uint8_t sc2[16], mn2[16], q2v[256];
+    for (int g = 0; g < 16; g++) {
+        sc2[g] = (uint8_t)((g * 5 + 3) & 0x0F);
+        mn2[g] = (uint8_t)((15 - g * 3) & 0x0F);
+        q2[g] = (uint8_t)(sc2[g] | (mn2[g] << 4));
+    }
+    put_u16(q2 + 80, H_HALF);
+    put_u16(q2 + 82, H_QUARTER);
+    for (int i = 0; i < 256; i++) {
+        q2v[i] = (uint8_t)((i * 13 + 1) & 0x03);
+        const int h = i / 128, r = (i % 128) / 32, l = i % 32;
+        q2[16 + 32 * h + l] |= (uint8_t)(q2v[i] << (2 * r));
+    }
+    vitna_dequant_q2_k(q2, out);
+    bad = 0;
+    for (int i = 0; i < 256; i++) {
+        const float dl = 0.5f * (float)sc2[i / 16], ml = 0.25f * (float)mn2[i / 16];
+        const float p = dl * (float)q2v[i];
+        bad += out[i] != p - ml;
+    }
+    CHECK(bad == 0, "Q2_K: w = (d * scale) * q - (dmin * min), sixteen at a time (%d of 256 differ)", bad);
+
+    /* Q3_K: 32 hmask bytes, 64 low 2-bit bytes, 12 packed 6-bit scales, d. */
+    uint8_t q3[110];
+    memset(q3, 0, sizeof(q3));
+    int sc3[16], q3v[256];
+    for (int g = 0; g < 16; g++) sc3[g] = (g * 7 + 5) % 64; /* 0..63 before -32 bias */
+    uint8_t* s3 = q3 + 96;
+    for (int b = 0; b < 4; b++) {
+        s3[b] = (uint8_t)((sc3[b] & 0x0F) | ((sc3[8 + b] & 0x0F) << 4));
+        s3[4 + b] = (uint8_t)((sc3[4 + b] & 0x0F) | ((sc3[12 + b] & 0x0F) << 4));
+        s3[8 + b] = (uint8_t)(((sc3[b] >> 4) & 0x03) | (((sc3[4 + b] >> 4) & 0x03) << 2) |
+                              (((sc3[8 + b] >> 4) & 0x03) << 4) | (((sc3[12 + b] >> 4) & 0x03) << 6));
+    }
+    /* Cross-check our 12-byte packing directly against ggml's aux[4] unpacker. */
+    {
+        uint32_t aux[4];
+        memcpy(aux, s3, 12);
+        const uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+        aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);
+        aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+        const uint8_t* unpacked = (const uint8_t*)aux;
+        int sbad = 0;
+        for (int g = 0; g < 16; g++) sbad += (int)unpacked[g] != sc3[g];
+        CHECK(sbad == 0, "Q3_K: 12-byte scale layout matches ggml aux[4] bit-unpacking (%d of 16 differ)", sbad);
+    }
+    put_u16(q3 + 108, H_32TH);
+    for (int i = 0; i < 256; i++) {
+        const int raw = (i * 5 + 2) & 0x07; /* 0..7 */
+        q3v[i] = raw - 4;
+        const int h = i / 128, r = (i % 128) / 32, l = i % 32;
+        q3[32 + 32 * h + l] |= (uint8_t)((raw & 0x03) << (2 * r));
+        if (raw & 0x04) q3[l] |= (uint8_t)(1u << (4 * h + r));
+    }
+    vitna_dequant_q3_k(q3, out);
+    bad = 0;
+    for (int i = 0; i < 256; i++) {
+        const float dl = 0.03125f * (float)(sc3[i / 16] - 32);
+        bad += out[i] != dl * (float)q3v[i];
+    }
+    CHECK(bad == 0, "Q3_K: w = (d * (scale - 32)) * (q - 4), sixteen at a time (%d of 256 differ)", bad);
+
+    /* Q5_K: d, dmin, 12 packed scale/min bytes (same as Q4_K), 32 qh bytes, 128 qs bytes. */
+    uint8_t q5[176];
+    memset(q5, 0, sizeof(q5));
+    memcpy(q5, q4, 16); /* reuse d, dmin, and 12 packed scale/min bytes from Q4_K */
+    uint8_t q5v[256];
+    for (int i = 0; i < 256; i++) {
+        q5v[i] = (uint8_t)((i * 19 + 5) & 0x1F); /* 0..31 */
+        const int g = i / 32, l = i % 32;
+        q5[48 + 32 * (g / 2) + l] |= (uint8_t)((q5v[i] & 0x0F) << ((g & 1) ? 4 : 0));
+        if (q5v[i] & 0x10) q5[16 + l] |= (uint8_t)(1u << g);
+    }
+    vitna_dequant_q5_k(q5, out);
+    bad = 0;
+    for (int i = 0; i < 256; i++) {
+        const float d1 = 0.5f * (float)sc[i / 32], m1 = 0.25f * (float)mn[i / 32];
+        const float p = d1 * (float)q5v[i];
+        bad += out[i] != p - m1;
+    }
+    CHECK(bad == 0, "Q5_K: w = (d * scale) * q - (dmin * min), 5-bit q group by group (%d of 256 differ)", bad);
+
     /* Q6_K: 128 bytes of low nibbles, 64 of high pairs, 16 int8 scales, d. */
     uint8_t q6[210];
     memset(q6, 0, sizeof(q6));
@@ -1586,11 +1673,22 @@ static void test_quant(void) {
     CHECK(bad == 0, "Q6_K: w = (d * scale) * (q - 32), sixteen at a time (%d of 256 differ)", bad);
 
     /* Sizes, and blocks run together. */
-    CHECK(vitna_row_bytes(VITNA_DTYPE_Q8_0, 64) == 68 && vitna_row_bytes(VITNA_DTYPE_Q4_K, 512) == 288 &&
-          vitna_row_bytes(VITNA_DTYPE_Q6_K, 256) == 210 && vitna_row_bytes(VITNA_DTYPE_BF16, 3) == 6,
+    CHECK(vitna_row_bytes(VITNA_DTYPE_Q8_0, 64) == 68 && vitna_row_bytes(VITNA_DTYPE_Q2_K, 512) == 168 &&
+          vitna_row_bytes(VITNA_DTYPE_Q3_K, 256) == 110 && vitna_row_bytes(VITNA_DTYPE_Q4_K, 512) == 288 &&
+          vitna_row_bytes(VITNA_DTYPE_Q5_K, 256) == 176 && vitna_row_bytes(VITNA_DTYPE_Q6_K, 256) == 210 &&
+          vitna_row_bytes(VITNA_DTYPE_BF16, 3) == 6,
           "row sizes are whole blocks");
-    CHECK(vitna_row_bytes(VITNA_DTYPE_Q4_K, 100) == 0 && vitna_row_bytes(VITNA_DTYPE_Q8_0, 33) == 0, "a row of part of a block has no size");
-    CHECK(vitna_dtype_size(VITNA_DTYPE_Q4_K) == 0 && strcmp(vitna_dtype_name(VITNA_DTYPE_Q6_K), "Q6_K") == 0, "a block format has no element size");
+    CHECK(vitna_row_bytes(VITNA_DTYPE_Q2_K, 100) == 0 && vitna_row_bytes(VITNA_DTYPE_Q3_K, 100) == 0 &&
+          vitna_row_bytes(VITNA_DTYPE_Q4_K, 100) == 0 && vitna_row_bytes(VITNA_DTYPE_Q5_K, 100) == 0 &&
+          vitna_row_bytes(VITNA_DTYPE_Q8_0, 33) == 0,
+          "a row of part of a block has no size");
+    CHECK(vitna_dtype_size(VITNA_DTYPE_Q2_K) == 0 && vitna_dtype_size(VITNA_DTYPE_Q3_K) == 0 &&
+          vitna_dtype_size(VITNA_DTYPE_Q4_K) == 0 && vitna_dtype_size(VITNA_DTYPE_Q5_K) == 0 &&
+          strcmp(vitna_dtype_name(VITNA_DTYPE_Q2_K), "Q2_K") == 0 &&
+          strcmp(vitna_dtype_name(VITNA_DTYPE_Q3_K), "Q3_K") == 0 &&
+          strcmp(vitna_dtype_name(VITNA_DTYPE_Q5_K), "Q5_K") == 0 &&
+          strcmp(vitna_dtype_name(VITNA_DTYPE_Q6_K), "Q6_K") == 0,
+          "a block format has no element size");
     uint8_t two[288];
     memcpy(two, q4, 144);
     memcpy(two + 144, q4, 144);
@@ -1602,27 +1700,42 @@ static void test_quant(void) {
     /* A matrix in a block format multiplies as its widened float32 rows do,
      * bit for bit: the same products, added in the same order. */
     enum { ROWS = 3, COLS = 512 };
-    uint8_t w[ROWS * 288];
+    const struct { vitna_dtype_t dt; const uint8_t* sample; size_t bb; } mv_cases[] = {
+        { VITNA_DTYPE_Q2_K, q2, 84 },
+        { VITNA_DTYPE_Q3_K, q3, 110 },
+        { VITNA_DTYPE_Q4_K, q4, 144 },
+        { VITNA_DTYPE_Q5_K, q5, 176 },
+    };
     float wf[ROWS * COLS], x[COLS], y_block[ROWS], y_f32[ROWS];
-    for (int r = 0; r < ROWS; r++) {
-        for (int b = 0; b < 2; b++) {
-            uint8_t* blk = w + r * 288 + b * 144;
-            memcpy(blk, q4, 144);
-            for (int i = 16; i < 144; i++) blk[i] = (uint8_t)rnd_u32();
-        }
-    }
-    vitna_to_f32(w, VITNA_DTYPE_Q4_K, wf, ROWS * COLS);
     for (int i = 0; i < COLS; i++) x[i] = rnd_f(-1.0f, 1.0f);
-    vitna_matvec(w, VITNA_DTYPE_Q4_K, x, y_block, ROWS, COLS);
-    if (strcmp(vitna_matvec_path(), "neon") == 0) {
+    for (size_t mc = 0; mc < sizeof(mv_cases) / sizeof(mv_cases[0]); mc++) {
+        const vitna_dtype_t dt = mv_cases[mc].dt;
+        const size_t bb = mv_cases[mc].bb;
+        uint8_t w[ROWS * 2 * 176];
+        for (int r = 0; r < ROWS; r++) {
+            for (int b = 0; b < 2; b++) {
+                uint8_t* blk = w + (size_t)(r * 2 + b) * bb;
+                memcpy(blk, mv_cases[mc].sample, bb);
+                /* Perturb payload bytes while keeping float16 scale fields finite. */
+                const size_t lo = (dt == VITNA_DTYPE_Q2_K) ? 16 : (dt == VITNA_DTYPE_Q3_K) ? 32 : 48;
+                const size_t hi = (dt == VITNA_DTYPE_Q2_K) ? 80 : (dt == VITNA_DTYPE_Q3_K) ? 96 : bb;
+                for (size_t i = lo; i < hi; i++) blk[i] = (uint8_t)rnd_u32();
+            }
+        }
+        vitna_to_f32(w, dt, wf, ROWS * COLS);
+        vitna_matvec(w, dt, x, y_block, ROWS, COLS);
+        if (strcmp(vitna_matvec_path(), "neon") == 0) {
+            vitna_matvec_scalar(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+        } else {
+            vitna_matvec(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+        }
+        CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "%s rows multiply as their widened float32 rows, bit for bit",
+              vitna_dtype_name(dt));
+        vitna_matvec_scalar(w, dt, x, y_block, ROWS, COLS);
         vitna_matvec_scalar(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
-    } else {
-        vitna_matvec(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
+        CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "%s scalar matvec matches widened float32 too",
+              vitna_dtype_name(dt));
     }
-    CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "Q4_K rows multiply as their widened float32 rows, bit for bit");
-    vitna_matvec_scalar(w, VITNA_DTYPE_Q4_K, x, y_block, ROWS, COLS);
-    vitna_matvec_scalar(wf, VITNA_DTYPE_F32, x, y_f32, ROWS, COLS);
-    CHECK(memcmp(y_block, y_f32, sizeof(y_f32)) == 0, "and the scalar loop too");
 }
 
 /* --- The vectorized widening, against the scalar one --- */
@@ -1633,13 +1746,21 @@ static void random_block(uint8_t* b, vitna_dtype_t dt) {
     /* Scales that are float16 numbers of a plausible size, not NaNs or infinities. */
     const uint16_t scale = (uint16_t)(0x2000 + (rnd_u32() & 0x0FFF));
     if (dt == VITNA_DTYPE_Q8_0) put_u16(b, scale);
-    if (dt == VITNA_DTYPE_Q4_K) { put_u16(b, scale); put_u16(b + 2, (uint16_t)(scale - 0x400)); }
+    if (dt == VITNA_DTYPE_Q2_K) { put_u16(b + 80, scale); put_u16(b + 82, (uint16_t)(scale - 0x400)); }
+    if (dt == VITNA_DTYPE_Q3_K) put_u16(b + 108, scale);
+    if (dt == VITNA_DTYPE_Q4_K || dt == VITNA_DTYPE_Q5_K) {
+        put_u16(b, scale);
+        put_u16(b + 2, (uint16_t)(scale - 0x400));
+    }
     if (dt == VITNA_DTYPE_Q6_K) put_u16(b + 208, scale);
 }
 
 static void test_dequant_paths(void) {
-    const vitna_dtype_t types[] = { VITNA_DTYPE_Q8_0, VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q6_K };
-    for (size_t t = 0; t < 3; t++) {
+    const vitna_dtype_t types[] = {
+        VITNA_DTYPE_Q8_0, VITNA_DTYPE_Q2_K, VITNA_DTYPE_Q3_K,
+        VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q5_K, VITNA_DTYPE_Q6_K,
+    };
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
         const vitna_dtype_t dt = types[t];
         const size_t be = vitna_dtype_block_elems(dt), bb = vitna_dtype_block_bytes(dt);
         uint8_t blocks[8 * 210];
@@ -1650,7 +1771,10 @@ static void test_dequant_paths(void) {
             vitna_dequant(blocks, dt, fast, 8 * be);
             for (int k = 0; k < 8; k++) {
                 if (dt == VITNA_DTYPE_Q8_0) vitna_dequant_q8_0(blocks + k * bb, slow + k * be);
+                if (dt == VITNA_DTYPE_Q2_K) vitna_dequant_q2_k(blocks + k * bb, slow + k * be);
+                if (dt == VITNA_DTYPE_Q3_K) vitna_dequant_q3_k(blocks + k * bb, slow + k * be);
                 if (dt == VITNA_DTYPE_Q4_K) vitna_dequant_q4_k(blocks + k * bb, slow + k * be);
+                if (dt == VITNA_DTYPE_Q5_K) vitna_dequant_q5_k(blocks + k * bb, slow + k * be);
                 if (dt == VITNA_DTYPE_Q6_K) vitna_dequant_q6_k(blocks + k * bb, slow + k * be);
             }
             bad += memcmp(fast, slow, 8 * be * sizeof(float)) != 0;
@@ -1707,7 +1831,10 @@ static void test_warp(void) {
 
     /* The AVX2 path, where the CPU has it, against the scalar loop, bit for
      * bit, in every dtype the GPU computes with. */
-    const vitna_dtype_t types[] = { VITNA_DTYPE_F32, VITNA_DTYPE_BF16, VITNA_DTYPE_Q8_0, VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q6_K };
+    const vitna_dtype_t types[] = {
+        VITNA_DTYPE_F32, VITNA_DTYPE_BF16, VITNA_DTYPE_Q8_0,
+        VITNA_DTYPE_Q2_K, VITNA_DTYPE_Q3_K, VITNA_DTYPE_Q4_K, VITNA_DTYPE_Q5_K, VITNA_DTYPE_Q6_K,
+    };
     enum { R = 6, C = 512 };
     float x[C], fast[R], slow[R];
     for (int i = 0; i < C; i++) x[i] = rnd_f(-2.0f, 2.0f);
@@ -1936,6 +2063,47 @@ static void test_gguf(void) {
     ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
     CHECK(!ok && strstr(err, "not a GGUF") != NULL, "another file is refused: got \"%s\"", ok ? "opened" : err);
     if (ok) vitna_safetensors_close(&st);
+    /* A GGUF file carrying Q2_K (10), Q3_K (11) and Q5_K (13) 256-column tensors opens cleanly. */
+    {
+        b.n = 0;
+        g_u32(&b, 0x46554747u);
+        g_u32(&b, 3);
+        g_u64(&b, 3);
+        g_u64(&b, 4);
+        g_kv_str(&b, "general.architecture", "qwen3moe");
+        g_kv_u32(&b, "general.alignment", 32);
+        g_kv_u32(&b, "qwen3moe.block_count", 1);
+        g_kv_u32(&b, "qwen3moe.expert_count", 2);
+        const uint64_t qk[2] = { 256, 2 }, exps_q3[3] = { 256, 1, 2 }, out_q5[2] = { 256, 1 };
+        /* Q2_K: 2*84=168 bytes (next 32-byte offset: 192). Q3_K: 2*110=220 bytes (next: 416). Q5_K: 176 bytes (end: 592). */
+        g_tensor(&b, "token_embd.weight", 2, qk, 10, 0);
+        g_tensor(&b, "blk.0.ffn_gate_exps.weight", 3, exps_q3, 11, 192);
+        g_tensor(&b, "output.weight", 2, out_q5, 13, 416);
+        while (b.n % 32) g_put(&b, "", 1);
+        const size_t kdata_start = b.n;
+        uint8_t kdata[608];
+        memset(kdata, 0, sizeof(kdata));
+        g_put(&b, kdata, sizeof(kdata));
+        write_file(path, b.p, b.n);
+        ok = vitna_gguf_open(path, &st, &info, err, sizeof(err));
+        CHECK(ok, "a GGUF file with Q2_K, Q3_K and Q5_K tensors opens: %s", err);
+        if (ok) {
+            const vitna_tensor_desc_t* t2 = vitna_safetensors_find(&st, "model.embed_tokens.weight");
+            const vitna_tensor_desc_t* t3 = vitna_safetensors_find(&st, "model.layers.0.mlp.experts.1.gate_proj.weight");
+            const vitna_tensor_desc_t* t5 = vitna_safetensors_find(&st, "lm_head.weight");
+            CHECK(t2 && t2->dtype == VITNA_DTYPE_Q2_K && t2->shape[0] == 2 && t2->shape[1] == 256 &&
+                  t2->data_ptr == (const uint8_t*)st.mmap.data + kdata_start,
+                  "Q2_K tensor maps with exact dtype and offset");
+            CHECK(t3 && t3->dtype == VITNA_DTYPE_Q3_K && t3->shape[0] == 1 && t3->shape[1] == 256 &&
+                  t3->data_ptr == (const uint8_t*)st.mmap.data + kdata_start + 192 + 110,
+                  "Q3_K expert 1 slices at 110 bytes");
+            CHECK(t5 && t5->dtype == VITNA_DTYPE_Q5_K && t5->shape[0] == 1 && t5->shape[1] == 256 &&
+                  t5->data_ptr == (const uint8_t*)st.mmap.data + kdata_start + 416,
+                  "Q5_K lm_head maps with exact dtype and offset");
+            vitna_safetensors_close(&st);
+        }
+    }
+
     CHECK(vitna_gguf_path("a/b.GGUF") && !vitna_gguf_path("b.safetensors") && !vitna_gguf_path("gguf"), "a .gguf path is told apart");
     free(b.p);
     remove(path);

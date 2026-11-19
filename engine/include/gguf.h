@@ -3,7 +3,7 @@
  *
  * Maps the file, reads its metadata and its tensor directory, and checks
  * every tensor on open: its type is one the engine computes with (F32, F16,
- * BF16, Q8_0, Q4_K or Q6_K), its rows are whole blocks, its data offset is
+ * BF16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K or Q6_K), its rows are whole blocks, its data offset is
  * aligned as the file says, and its bytes lie inside the file.
  *
  * The tensors are then listed under the names a Hugging Face checkpoint of
