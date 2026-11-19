@@ -2494,7 +2494,7 @@ static void test_checkpoint_attestation(void) {
     char hex[65], err[512];
 
     /* 1. Single-file GGUF SHA-256 matches independent reference digest. */
-    const char* single_path = "/tmp/vitna_ckpt_single_test.gguf";
+    const char* single_path = "vitna_ckpt_single_test.gguf";
     write_file(single_path, "expected-gguf-payload", 21);
     bool ok = vitna_checkpoint_sha256(single_path, hex, err, sizeof(err));
     CHECK(ok && strcmp(hex, "0eb9b673e1fa8f8abe1e1a378fd84e5886fd0d7bce7176dab0e928bfce8a7ae1") == 0,
@@ -2502,11 +2502,11 @@ static void test_checkpoint_attestation(void) {
     remove(single_path);
 
     /* 2. Multi-shard directory manifest SHA-256 (sorted ASCII, ignores README.txt). */
-    const char* dir_path = "/tmp/vitna_ckpt_dir_test";
-    const char* f_cfg = "/tmp/vitna_ckpt_dir_test/config.json";
-    const char* f_s1 = "/tmp/vitna_ckpt_dir_test/model-00001-of-00002.gguf";
-    const char* f_s2 = "/tmp/vitna_ckpt_dir_test/model-00002-of-00002.gguf";
-    const char* f_ign = "/tmp/vitna_ckpt_dir_test/README.txt";
+    const char* dir_path = "vitna_ckpt_dir_test";
+    const char* f_cfg = "vitna_ckpt_dir_test/config.json";
+    const char* f_s1 = "vitna_ckpt_dir_test/model-00001-of-00002.gguf";
+    const char* f_s2 = "vitna_ckpt_dir_test/model-00002-of-00002.gguf";
+    const char* f_ign = "vitna_ckpt_dir_test/README.txt";
     TEST_MKDIR(dir_path);
     write_file(f_s2, "GGUF-shard-two-bytes", 20);
     write_file(f_cfg, "{\"model_type\":\"qwen3\"}", 22);
