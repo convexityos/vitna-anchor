@@ -28,7 +28,10 @@ static vitna_dtype_t ggml_dtype(uint32_t t) {
         case 0: return VITNA_DTYPE_F32;
         case 1: return VITNA_DTYPE_F16;
         case 8: return VITNA_DTYPE_Q8_0;
+        case 10: return VITNA_DTYPE_Q2_K;
+        case 11: return VITNA_DTYPE_Q3_K;
         case 12: return VITNA_DTYPE_Q4_K;
+        case 13: return VITNA_DTYPE_Q5_K;
         case 14: return VITNA_DTYPE_Q6_K;
         case 30: return VITNA_DTYPE_BF16;
         default: return VITNA_DTYPE_UNKNOWN;
@@ -388,8 +391,8 @@ bool vitna_gguf_open(const char* path, vitna_safetensors_t* st, vitna_gguf_info_
         }
         const vitna_dtype_t dtype = ggml_dtype(t->type);
         if (dtype == VITNA_DTYPE_UNKNOWN) {
-            snprintf(msg, sizeof(msg), "%s: tensor %s is %s; F32, F16, BF16, Q8_0, Q4_K and Q6_K are read", path, t->name,
-                     ggml_type_name(t->type));
+            snprintf(msg, sizeof(msg), "%s: tensor %s is %s; F32, F16, BF16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K are read",
+                     path, t->name, ggml_type_name(t->type));
             goto done;
         }
         if (experts != (t->n_dims == 3)) {

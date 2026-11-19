@@ -39,7 +39,10 @@ typedef enum {
      * (quant.h): a row is whole blocks, each a scale or two and small
      * integers, and its weights are those integers times the scales. */
     VITNA_DTYPE_Q8_0,   /* 32 weights in 34 bytes */
+    VITNA_DTYPE_Q2_K,   /* 256 weights in 84 bytes */
+    VITNA_DTYPE_Q3_K,   /* 256 weights in 110 bytes */
     VITNA_DTYPE_Q4_K,   /* 256 weights in 144 bytes */
+    VITNA_DTYPE_Q5_K,   /* 256 weights in 176 bytes */
     VITNA_DTYPE_Q6_K    /* 256 weights in 210 bytes */
 } vitna_dtype_t;
 

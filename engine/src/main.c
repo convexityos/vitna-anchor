@@ -66,7 +66,7 @@ static void print_usage(const char* prog) {
     printf("  %s verify --dir <dir> --model <id>\n\n", prog);
     printf("Sampling: --greedy (the default), or --temperature <t> [--top-k <k>] [--top-p <p>] [--seed <s>].\n");
     printf("--ctx <n> sets how many positions the key-value cache holds (default: the model's maximum, at most 4096).\n");
-    printf("--weights <file.gguf> reads the weights from a GGUF file, which may be quantized (Q8_0, Q4_K, Q6_K), rather\n");
+    printf("--weights <file.gguf> reads the weights from a GGUF file, which may be quantized (Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K), rather\n");
     printf("than from the model directory's SafeTensors files; --model still gives config.json, which the file must\n");
     printf("agree with, and the tokenizer. Quantized weights run on the CPU, and with --device cuda on the GPU.\n");
     printf("--expert-cache <MiB> reads a mixture of experts' experts from the drive as they are needed, with direct I/O,\n");

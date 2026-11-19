@@ -281,7 +281,8 @@ static bool bind(vitna_llama_t* m, vitna_matrix_t* out, const char* name, size_t
         return fail(err, err_len, "tensor %s is %s; a norm's weights must be F32, BF16 or F16", name, vitna_dtype_name(t->dtype));
     }
     if (!plain && !(vitna_dtype_is_block(t->dtype) && vitna_row_bytes(t->dtype, cols))) {
-        return fail(err, err_len, "tensor %s is %s; F32, BF16, F16, Q8_0, Q4_K or Q6_K is needed", name, vitna_dtype_name(t->dtype));
+        return fail(err, err_len, "tensor %s is %s; F32, BF16, F16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K or Q6_K is needed", name,
+                    vitna_dtype_name(t->dtype));
     }
     out->data = t->data_ptr;
     out->dtype = t->dtype;

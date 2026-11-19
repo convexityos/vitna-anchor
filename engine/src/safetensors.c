@@ -37,7 +37,10 @@ static const struct { const char* name; vitna_dtype_t dtype; size_t size; } DTYP
    sees them: SafeTensors has no name for them. */
 static const struct { const char* name; vitna_dtype_t dtype; size_t elems, bytes; } BLOCKS[] = {
     { "Q8_0", VITNA_DTYPE_Q8_0, 32, 34 },
+    { "Q2_K", VITNA_DTYPE_Q2_K, 256, 84 },
+    { "Q3_K", VITNA_DTYPE_Q3_K, 256, 110 },
     { "Q4_K", VITNA_DTYPE_Q4_K, 256, 144 },
+    { "Q5_K", VITNA_DTYPE_Q5_K, 256, 176 },
     { "Q6_K", VITNA_DTYPE_Q6_K, 256, 210 },
 };
 #define N_BLOCKS (sizeof(BLOCKS) / sizeof(BLOCKS[0]))

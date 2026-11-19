@@ -457,7 +457,10 @@ __host__ __device__ __forceinline__ size_t row_bytes(int cols) {
     switch (DT) {
         case VITNA_DTYPE_F32: return (size_t)cols * 4;
         case VITNA_DTYPE_Q8_0: return (size_t)(cols / 32) * 34;
+        case VITNA_DTYPE_Q2_K: return (size_t)(cols / 256) * 84;
+        case VITNA_DTYPE_Q3_K: return (size_t)(cols / 256) * 110;
         case VITNA_DTYPE_Q4_K: return (size_t)(cols / 256) * 144;
+        case VITNA_DTYPE_Q5_K: return (size_t)(cols / 256) * 176;
         case VITNA_DTYPE_Q6_K: return (size_t)(cols / 256) * 210;
         default: return (size_t)cols * 2;
     }
@@ -473,7 +476,22 @@ __device__ __forceinline__ float half_at(const unsigned char* p) {
     return half_to_float(*reinterpret_cast<const unsigned short*>(p));
 }
 
-/* Q4_K's scale and min for group g of a block, from its 12 packed bytes s,
+/* Q3_K's signed 6-bit scale (-32..31) for group g, from its 12 packed bytes s. */
+__device__ __forceinline__ float q3k_scale(const unsigned char* s, int g) {
+    int sc;
+    if (g < 4) {
+        sc = (s[g] & 0x0F) | (((s[g + 8] >> 0) & 0x03) << 4);
+    } else if (g < 8) {
+        sc = (s[g] & 0x0F) | (((s[g + 4] >> 2) & 0x03) << 4);
+    } else if (g < 12) {
+        sc = (s[g - 8] >> 4) | (((s[g] >> 4) & 0x03) << 4);
+    } else {
+        sc = (s[g - 8] >> 4) | (((s[g - 4] >> 6) & 0x03) << 4);
+    }
+    return (float)(sc - 32);
+}
+
+/* Q4_K / Q5_K scale and min for group g of a block, from its 12 packed bytes s,
  * as quant.c's scale_min_k4. */
 __device__ __forceinline__ void q4k_scale_min(const unsigned char* s, int g, float* scale, float* min) {
     int sc, mn;
@@ -499,6 +517,23 @@ __device__ __forceinline__ float widen_at(const void* row, int i) {
         const unsigned char* b = p + (i >> 5) * 34;
         return __fmul_rn((float)(signed char)b[2 + (i & 31)], half_at(b));
     }
+    if (DT == VITNA_DTYPE_Q2_K) {
+        const unsigned char* b = p + (i >> 8) * 84;
+        const int j = i & 255, h = j >> 7, r = (j >> 5) & 3, l = j & 31, g = j >> 4;
+        const unsigned char sm = b[g];
+        const float dl = __fmul_rn(half_at(b + 80), (float)(sm & 0x0F));
+        const float ml = __fmul_rn(half_at(b + 82), (float)(sm >> 4));
+        const int q = (b[16 + 32 * h + l] >> (2 * r)) & 0x03;
+        return __fsub_rn(__fmul_rn(dl, (float)q), ml);
+    }
+    if (DT == VITNA_DTYPE_Q3_K) {
+        const unsigned char* b = p + (i >> 8) * 110;
+        const int j = i & 255, h = j >> 7, r = (j >> 5) & 3, l = j & 31, g = j >> 4;
+        const float dl = __fmul_rn(half_at(b + 108), q3k_scale(b + 96, g));
+        const int low = (b[32 + 32 * h + l] >> (2 * r)) & 0x03;
+        const int high = (b[l] >> (4 * h + r)) & 0x01;
+        return __fmul_rn(dl, (float)((low | (high << 2)) - 4));
+    }
     if (DT == VITNA_DTYPE_Q4_K) {
         const unsigned char* b = p + (i >> 8) * 144;
         const int j = i & 255, g = j >> 5, l = j & 31;
@@ -507,6 +542,16 @@ __device__ __forceinline__ float widen_at(const void* row, int i) {
         const float d1 = __fmul_rn(half_at(b), sc), m1 = __fmul_rn(half_at(b + 2), mn);
         const int q = (b[16 + 32 * (g >> 1) + l] >> ((g & 1) * 4)) & 0x0F;
         return __fsub_rn(__fmul_rn(d1, (float)q), m1);
+    }
+    if (DT == VITNA_DTYPE_Q5_K) {
+        const unsigned char* b = p + (i >> 8) * 176;
+        const int j = i & 255, g = j >> 5, l = j & 31;
+        float sc, mn;
+        q4k_scale_min(b + 4, g, &sc, &mn);
+        const float d1 = __fmul_rn(half_at(b), sc), m1 = __fmul_rn(half_at(b + 2), mn);
+        const int low = (b[48 + 32 * (g >> 1) + l] >> ((g & 1) * 4)) & 0x0F;
+        const int high = (b[16 + l] >> g) & 0x01;
+        return __fsub_rn(__fmul_rn(d1, (float)(low | (high << 4))), m1);
     }
     /* Q6_K */
     const unsigned char* b = p + (i >> 8) * 210;
@@ -548,10 +593,9 @@ __device__ __forceinline__ void load8<VITNA_DTYPE_F16>(const void* row, int c, f
 }
 
 /* A block format's chunk lies inside one block: Q8_0's block holds four
- * chunks, Q4_K's and Q6_K's thirty-two. Q8_0's 34-byte blocks and Q6_K's
- * 210-byte ones put a row's blocks two bytes apart at worst, so those read
- * 16 bits at a time; Q4_K's 144-byte blocks keep 16-byte alignment, so its
- * eight 4-bit pairs come in one 8-byte read. */
+ * chunks, K-quant blocks hold thirty-two. 34/110/210-byte blocks keep 2-byte
+ * alignment (read 16 bits at a time), 84-byte blocks keep 4-byte alignment,
+ * and 144/176-byte blocks keep 16-byte alignment (read 8 bytes at a time). */
 template <>
 __device__ __forceinline__ void load8<VITNA_DTYPE_Q8_0>(const void* row, int c, float w[8]) {
     const unsigned char* b = static_cast<const unsigned char*>(row) + (c >> 2) * 34;
@@ -562,6 +606,44 @@ __device__ __forceinline__ void load8<VITNA_DTYPE_Q8_0>(const void* row, int c, 
         const unsigned short two = q[i];
         w[2 * i] = __fmul_rn((float)(signed char)(two & 0xff), d);
         w[2 * i + 1] = __fmul_rn((float)(signed char)(two >> 8), d);
+    }
+}
+
+template <>
+__device__ __forceinline__ void load8<VITNA_DTYPE_Q2_K>(const void* row, int c, float w[8]) {
+    const unsigned char* b = static_cast<const unsigned char*>(row) + (c >> 5) * 84;
+    const int e0 = (c & 31) * 8, h = e0 >> 7, r = (e0 >> 5) & 3, l0 = e0 & 31, g = e0 >> 4;
+    const unsigned char sm = b[g];
+    const float dl = __fmul_rn(half_at(b + 80), (float)(sm & 0x0F));
+    const float ml = __fmul_rn(half_at(b + 82), (float)(sm >> 4));
+    const unsigned int* q = reinterpret_cast<const unsigned int*>(b + 16 + 32 * h + l0);
+    const unsigned int w0 = q[0], w1 = q[1];
+    const int shift = 2 * r;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const unsigned int word = i < 4 ? w0 : w1;
+        const int qv = (word >> (8 * (i & 3) + shift)) & 0x03;
+        w[i] = __fsub_rn(__fmul_rn(dl, (float)qv), ml);
+    }
+}
+
+template <>
+__device__ __forceinline__ void load8<VITNA_DTYPE_Q3_K>(const void* row, int c, float w[8]) {
+    const unsigned char* b = static_cast<const unsigned char*>(row) + (c >> 5) * 110;
+    const int e0 = (c & 31) * 8, h = e0 >> 7, r = (e0 >> 5) & 3, l0 = e0 & 31, g = e0 >> 4;
+    const float dl = __fmul_rn(half_at(b + 108), q3k_scale(b + 96, g));
+    const unsigned short* lo = reinterpret_cast<const unsigned short*>(b + 32 + 32 * h + l0);
+    const unsigned short* hi = reinterpret_cast<const unsigned short*>(b + l0);
+    const int lshift = 2 * r, hshift = 4 * h + r;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned short l2 = lo[i], h2 = hi[i];
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int low = ((l2 >> (8 * k)) >> lshift) & 0x03;
+            const int high = ((h2 >> (8 * k)) >> hshift) & 0x01;
+            w[2 * i + k] = __fmul_rn(dl, (float)((low | (high << 2)) - 4));
+        }
     }
 }
 
@@ -579,6 +661,26 @@ __device__ __forceinline__ void load8<VITNA_DTYPE_Q4_K>(const void* row, int c, 
         const unsigned int word = i < 4 ? qq.x : qq.y;
         const int q = (word >> (8 * (i & 3) + shift)) & 0x0F;
         w[i] = __fsub_rn(__fmul_rn(d1, (float)q), m1);
+    }
+}
+
+template <>
+__device__ __forceinline__ void load8<VITNA_DTYPE_Q5_K>(const void* row, int c, float w[8]) {
+    const unsigned char* b = static_cast<const unsigned char*>(row) + (c >> 5) * 176;
+    const int e0 = (c & 31) * 8, g = e0 >> 5, l0 = e0 & 31;
+    float sc, mn;
+    q4k_scale_min(b + 4, g, &sc, &mn);
+    const float d1 = __fmul_rn(half_at(b), sc), m1 = __fmul_rn(half_at(b + 2), mn);
+    const uint2 qh = *reinterpret_cast<const uint2*>(b + 16 + l0);
+    const uint2 qq = *reinterpret_cast<const uint2*>(b + 48 + 32 * (g >> 1) + l0);
+    const int shift = (g & 1) * 4;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const unsigned int qw = i < 4 ? qq.x : qq.y;
+        const unsigned int hw = i < 4 ? qh.x : qh.y;
+        const int low = (qw >> (8 * (i & 3) + shift)) & 0x0F;
+        const int high = (hw >> (8 * (i & 3) + g)) & 0x01;
+        w[i] = __fsub_rn(__fmul_rn(d1, (float)(low | (high << 4))), m1);
     }
 }
 
@@ -2883,7 +2985,10 @@ __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* _
             case VITNA_DTYPE_BF16: KERNEL<VITNA_DTYPE_BF16><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
             case VITNA_DTYPE_F16: KERNEL<VITNA_DTYPE_F16><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break;   \
             case VITNA_DTYPE_Q8_0: KERNEL<VITNA_DTYPE_Q8_0><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+            case VITNA_DTYPE_Q2_K: KERNEL<VITNA_DTYPE_Q2_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+            case VITNA_DTYPE_Q3_K: KERNEL<VITNA_DTYPE_Q3_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
             case VITNA_DTYPE_Q4_K: KERNEL<VITNA_DTYPE_Q4_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+            case VITNA_DTYPE_Q5_K: KERNEL<VITNA_DTYPE_Q5_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
             case VITNA_DTYPE_Q6_K: KERNEL<VITNA_DTYPE_Q6_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
             default: unreachable_dtype(dtype, #KERNEL);                                           \
         }                                                                                         \
@@ -2895,7 +3000,10 @@ __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* _
 #define LAUNCH_QKV_Q(KERNEL, A, v, grid, shared, stream, ...)                                     \
     switch (v) {                                                                                  \
         case VITNA_DTYPE_Q8_0: KERNEL<A, VITNA_DTYPE_Q8_0><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+        case VITNA_DTYPE_Q2_K: KERNEL<A, VITNA_DTYPE_Q2_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+        case VITNA_DTYPE_Q3_K: KERNEL<A, VITNA_DTYPE_Q3_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
         case VITNA_DTYPE_Q4_K: KERNEL<A, VITNA_DTYPE_Q4_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
+        case VITNA_DTYPE_Q5_K: KERNEL<A, VITNA_DTYPE_Q5_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
         case VITNA_DTYPE_Q6_K: KERNEL<A, VITNA_DTYPE_Q6_K><<<grid, THREADS, shared, stream>>>(__VA_ARGS__); break; \
         default: unreachable_dtype(v, #KERNEL);                                                   \
     }
@@ -2910,7 +3018,10 @@ __global__ void __launch_bounds__(THREADS) attention_tiled_kernel(const float* _
         } else {                                                                                  \
             switch (qk) {                                                                         \
                 case VITNA_DTYPE_Q8_0: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q8_0, v, grid, shared, stream, __VA_ARGS__) break; \
+                case VITNA_DTYPE_Q2_K: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q2_K, v, grid, shared, stream, __VA_ARGS__) break; \
+                case VITNA_DTYPE_Q3_K: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q3_K, v, grid, shared, stream, __VA_ARGS__) break; \
                 case VITNA_DTYPE_Q4_K: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q4_K, v, grid, shared, stream, __VA_ARGS__) break; \
+                case VITNA_DTYPE_Q5_K: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q5_K, v, grid, shared, stream, __VA_ARGS__) break; \
                 case VITNA_DTYPE_Q6_K: LAUNCH_QKV_Q(KERNEL, VITNA_DTYPE_Q6_K, v, grid, shared, stream, __VA_ARGS__) break; \
                 default: unreachable_dtype(qk, #KERNEL);                                          \
             }                                                                                     \
@@ -3197,7 +3308,10 @@ static void gemm(const struct vitna_cuda_model* g, const float* X, int ldx, cons
             case VITNA_DTYPE_BF16: launch_gemm_few<VITNA_DTYPE_BF16>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
             case VITNA_DTYPE_F16: launch_gemm_few<VITNA_DTYPE_F16>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
             case VITNA_DTYPE_Q8_0: launch_gemm_few<VITNA_DTYPE_Q8_0>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
+            case VITNA_DTYPE_Q2_K: launch_gemm_few<VITNA_DTYPE_Q2_K>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
+            case VITNA_DTYPE_Q3_K: launch_gemm_few<VITNA_DTYPE_Q3_K>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
             case VITNA_DTYPE_Q4_K: launch_gemm_few<VITNA_DTYPE_Q4_K>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
+            case VITNA_DTYPE_Q5_K: launch_gemm_few<VITNA_DTYPE_Q5_K>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
             case VITNA_DTYPE_Q6_K: launch_gemm_few<VITNA_DTYPE_Q6_K>(few, g->stream, X, ldx, W->w, Y, ldy, T, N, K, add); break;
             default: unreachable_dtype(W->dtype, "gemm_few_kernel");
         }
