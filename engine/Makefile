@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS ?= -O3 -Wall -Wextra -Iinclude
+CFLAGS ?= -O3 -ffp-contract=off -Wall -Wextra -Iinclude
 LDFLAGS ?= -lm
 
 ifeq ($(OS),Windows_NT)

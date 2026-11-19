@@ -70,6 +70,11 @@ void vitna_to_f32(const void* src, vitna_dtype_t dtype, float* dst, size_t n) {
 /* The most weights in a block of any format quant.h widens. */
 #define BLOCK_MAX 256
 
+static float add_dot_f32_scalar(float sum, const float* w, const float* x, size_t n) {
+    for (size_t i = 0; i < n; i++) sum += w[i] * x[i];
+    return sum;
+}
+
 /* y = W x for a block format, the scalar way: each block of a row widened,
    then its products added one at a time, in order along the row. */
 static void matvec_blocks_scalar(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols) {
@@ -81,7 +86,7 @@ static void matvec_blocks_scalar(const void* w, vitna_dtype_t dtype, const float
         float sum = 0.0f;
         for (size_t c = 0; c < cols; c += be) {
             vitna_dequant(row + c / be * bb, dtype, buf, be);
-            for (size_t i = 0; i < be; i++) sum += buf[i] * x[c + i];
+            sum = add_dot_f32_scalar(sum, buf, x + c, be);
         }
         y[r] = sum;
     }
@@ -96,6 +101,13 @@ static float load_w(const void* w, vitna_dtype_t dtype, size_t i) {
 void vitna_matvec_scalar(const void* w, vitna_dtype_t dtype, const float* x, float* y, size_t rows, size_t cols) {
     if (vitna_dtype_is_block(dtype)) {
         matvec_blocks_scalar(w, dtype, x, y, rows, cols);
+        return;
+    }
+    if (dtype == VITNA_DTYPE_F32) {
+        const float* wf = (const float*)w;
+        for (size_t r = 0; r < rows; r++) {
+            y[r] = add_dot_f32_scalar(0.0f, wf + r * cols, x, cols);
+        }
         return;
     }
     for (size_t r = 0; r < rows; r++) {

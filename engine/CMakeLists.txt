@@ -55,7 +55,7 @@ foreach(target vitna-anchor vitna-anchor-tests)
         # A UTF-8 program, for paths with any letters in them: the manifest says how.
         target_sources(${target} PRIVATE windows/utf8.manifest)
     else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -O3)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -O3 -ffp-contract=off)
     endif()
 
     if(VITNA_CUDA)
