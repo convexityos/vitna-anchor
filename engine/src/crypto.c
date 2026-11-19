@@ -171,6 +171,12 @@ void vitna_trajectory_feed(vitna_sha256_ctx_t *ctx, int32_t token_id, float top_
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
 #else
 #include <dirent.h>
 #endif
