@@ -115,10 +115,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <mma.h>
-
+#include "gpu_compat.h"
 #include "expert_stream.h"
 #include "model_cuda.h"
 #include "pool.h"
@@ -431,9 +428,7 @@ static bool fail_cuda(char* err, size_t err_len, const char* what, cudaError_t e
 
 /* Every half is exactly a float32; the conversion keeps subnormals, as vitna_f16_to_f32 does. */
 __device__ __forceinline__ float half_to_float(unsigned short h) {
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
-    return f;
+    return vitna_half_bits_to_float(h);
 }
 
 /* bfloat16 is the high half of a float32, as in vitna_bf16_to_f32. In a
@@ -2176,7 +2171,7 @@ union __align__(32) tc_smem_t {
     float c[TC_BM][TC_LDC];
 };
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if VITNA_HAS_WMMA
 typedef nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> tc_acc_t;
 
 /* The products of a tile, for NW weight matrices at once over the same rows
@@ -2268,7 +2263,7 @@ __device__ __forceinline__ void tc_stage(tc_smem_t& sm, tc_acc_t (&acc)[NW][2][2
 template <vitna_dtype_t DT>
 __global__ void __launch_bounds__(THREADS) tc_gemm_kernel(const float* __restrict__ X, int ldx, const void* __restrict__ W, float* __restrict__ Y,
                                                           int ldy, int M, int N, int K, int add) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if VITNA_HAS_WMMA && defined(__CUDA_ARCH__)
     __shared__ tc_smem_t sm;
     const int m0 = blockIdx.y * TC_BM, n0 = blockIdx.x * TC_BN;
     const int rows = min(TC_BM, M - m0);
@@ -2292,7 +2287,7 @@ __global__ void __launch_bounds__(THREADS) tc_gemm_kernel(const float* __restric
 template <vitna_dtype_t DT>
 __global__ void __launch_bounds__(THREADS) tc_experts_gu_kernel(const float* __restrict__ xn, const int32_t* __restrict__ idx, tc_jobs_t jobs,
                                                                 float* __restrict__ act, int hidden, int intermediate) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if VITNA_HAS_WMMA && defined(__CUDA_ARCH__)
     __shared__ tc_smem_t sm;
     const int z = blockIdx.z, m0 = blockIdx.y * TC_BM, n0 = blockIdx.x * TC_BN;
     const int cnt = jobs.cnt[z], off = jobs.off[z];
@@ -2325,7 +2320,7 @@ __global__ void __launch_bounds__(THREADS) tc_experts_gu_kernel(const float* __r
 template <vitna_dtype_t DT>
 __global__ void __launch_bounds__(THREADS) tc_experts_down_kernel(const float* __restrict__ act, tc_jobs_t jobs, float* __restrict__ out,
                                                                   int hidden, int intermediate) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if VITNA_HAS_WMMA && defined(__CUDA_ARCH__)
     __shared__ tc_smem_t sm;
     const int z = blockIdx.z, m0 = blockIdx.y * TC_BM, n0 = blockIdx.x * TC_BN;
     const int cnt = jobs.cnt[z], off = jobs.off[z];
@@ -2391,7 +2386,7 @@ template <int D>
 __global__ void __launch_bounds__(THREADS) tc_attention_rows_kernel(const float* __restrict__ q, const float* __restrict__ kc,
                                                                     const float* __restrict__ vc, float* __restrict__ att, int p_first, int nr,
                                                                     int kv_dim, int q_dim, int group, float scale) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if VITNA_HAS_WMMA && defined(__CUDA_ARCH__)
     using namespace nvcuda;
     constexpr int CB = D / 16 / 2; /* the column blocks of O each warp keeps: two warps share a row block */
     extern __shared__ __align__(32) unsigned char tc_att_raw[];
@@ -3849,12 +3844,20 @@ struct vitna_cuda_model* vitna_cuda_create(const vitna_llama_t* m, const float* 
         vitna_cuda_free(g);
         return NULL;
     }
-    snprintf(g->name, sizeof(g->name), "%s (sm_%d%d)", prop.name, prop.major, prop.minor);
+    snprintf(g->name, sizeof(g->name), "%s (%s %d.%d)", prop.name, VITNA_GPU_BACKEND_NAME, prop.major, prop.minor);
+#if defined(VITNA_HIP)
+    if (g->fast) {
+        fail(err, err_len, "--precision fast uses NVIDIA WMMA tensor cores and is not yet implemented on AMD HIP (%s)", g->name);
+        vitna_cuda_free(g);
+        return NULL;
+    }
+#else
     if (g->fast && prop.major < 7) {
         fail(err, err_len, "--precision fast runs on tensor cores, which %s does not have: it needs compute capability 7.0 or later", g->name);
         vitna_cuda_free(g);
         return NULL;
     }
+#endif
     g->max_blocks = 8 * prop.multiProcessorCount;
     if (attention_shared(g) > 48 * 1024) {
         fail(err, err_len, "the GPU path's attention needs --ctx at most %d for this model", (int)(((48 * 1024 / sizeof(float)) / (g->n_heads / g->n_kv_heads) - g->head_dim) * ATTENTION_SPLITS));
