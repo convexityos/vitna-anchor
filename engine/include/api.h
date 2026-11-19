@@ -155,6 +155,17 @@ void vitna_api_set_test_reply(vitna_api_t* api, bool on);
 void vitna_api_set_qwen3_template(vitna_api_t* api, bool on);
 
 /**
+ * Set a 64-char hex SHA-256 checkpoint attestation digest to advertise on
+ * GET /health (as "checkpoint_sha256") and on inference responses (as the
+ * x-vitna-checkpoint-sha256 HTTP header). Pass NULL or "" to clear.
+ * Returns false if hex is non-empty and not 64 hex characters.
+ */
+bool vitna_api_set_checkpoint_sha256(vitna_api_t* api, const char* hex);
+
+/** The configured 64-char lowercase checkpoint SHA-256 hex digest, or NULL if unset. */
+const char* vitna_api_checkpoint_sha256(const vitna_api_t* api);
+
+/**
  * Drafts for speculative decoding, by prompt lookup: the tokens that followed
  * the latest earlier place in the text where its last three, or two, tokens
  * occur. A match of one token drafts nothing, and after a pass takes none of

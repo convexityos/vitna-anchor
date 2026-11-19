@@ -165,3 +165,180 @@ void vitna_trajectory_feed(vitna_sha256_ctx_t *ctx, int32_t token_id, float top_
     entry.logit = top_logit;
     vitna_sha256_update(ctx, &entry, sizeof(entry));
 }
+
+#include <stdlib.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
+
+static void set_ckpt_err(char *err, size_t err_cap, const char *msg) {
+    if (err && err_cap > 0) snprintf(err, err_cap, "%s", msg ? msg : "checkpoint hash error");
+}
+
+static bool has_suffix(const char *s, const char *suffix) {
+    size_t sl = strlen(s), xl = strlen(suffix);
+    return sl >= xl && strcmp(s + (sl - xl), suffix) == 0;
+}
+
+static bool is_checkpoint_artifact(const char *name) {
+    return has_suffix(name, ".gguf") ||
+           has_suffix(name, ".safetensors") ||
+           strcmp(name, "config.json") == 0 ||
+           strcmp(name, "tokenizer.json") == 0 ||
+           strcmp(name, "tokenizer_config.json") == 0;
+}
+
+static bool hash_single_file(const char *path, char hex_output[65], char *err, size_t err_cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "cannot open checkpoint file %.400s", path);
+        return false;
+    }
+    vitna_sha256_ctx_t ctx;
+    vitna_sha256_init(&ctx);
+    uint8_t *buf = (uint8_t *)malloc(65536);
+    if (!buf) {
+        fclose(f);
+        set_ckpt_err(err, err_cap, "out of memory while hashing checkpoint");
+        return false;
+    }
+    size_t got;
+    while ((got = fread(buf, 1, 65536, f)) > 0) {
+        vitna_sha256_update(&ctx, buf, got);
+    }
+    const bool io_err = ferror(f) != 0;
+    free(buf);
+    fclose(f);
+    if (io_err) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "I/O error reading checkpoint file %.400s", path);
+        return false;
+    }
+    vitna_sha256_final_hex(&ctx, hex_output);
+    return true;
+}
+
+static int cmp_cstr_ptr(const void *a, const void *b) {
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    return strcmp(sa, sb);
+}
+
+bool vitna_checkpoint_sha256(const char *path, char hex_output[65], char *err, size_t err_cap) {
+    if (!path || !*path || !hex_output) {
+        set_ckpt_err(err, err_cap, "checkpoint path is empty");
+        return false;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "cannot stat checkpoint %.400s", path);
+        return false;
+    }
+    if (S_ISREG(st.st_mode)) {
+        return hash_single_file(path, hex_output, err, err_cap);
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "checkpoint %.400s is neither a regular file nor a directory", path);
+        return false;
+    }
+
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "cannot read checkpoint directory %.400s", path);
+        return false;
+    }
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (!is_checkpoint_artifact(fd.cFileName)) continue;
+        if (count == cap) {
+            size_t next_cap = cap ? cap * 2 : 16;
+            char **grown = (char **)realloc(names, next_cap * sizeof(char *));
+            if (!grown) { FindClose(h); goto oom; }
+            names = grown;
+            cap = next_cap;
+        }
+        size_t nlen = strlen(fd.cFileName) + 1;
+        names[count] = (char *)malloc(nlen);
+        if (!names[count]) { FindClose(h); goto oom; }
+        memcpy(names[count], fd.cFileName, nlen);
+        count++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *dir = opendir(path);
+    if (!dir) {
+        if (err && err_cap > 0) snprintf(err, err_cap, "cannot read checkpoint directory %.400s", path);
+        return false;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (!is_checkpoint_artifact(ent->d_name)) continue;
+        char full[1536];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        struct stat est;
+        if (stat(full, &est) != 0 || !S_ISREG(est.st_mode)) continue;
+        if (count == cap) {
+            size_t next_cap = cap ? cap * 2 : 16;
+            char **grown = (char **)realloc(names, next_cap * sizeof(char *));
+            if (!grown) { closedir(dir); goto oom; }
+            names = grown;
+            cap = next_cap;
+        }
+        size_t nlen = strlen(ent->d_name) + 1;
+        names[count] = (char *)malloc(nlen);
+        if (!names[count]) { closedir(dir); goto oom; }
+        memcpy(names[count], ent->d_name, nlen);
+        count++;
+    }
+    closedir(dir);
+#endif
+
+    if (count == 0) {
+        free(names);
+        if (err && err_cap > 0) {
+            snprintf(err, err_cap, "checkpoint directory %.400s contains no recognized model artifacts", path);
+        }
+        return false;
+    }
+
+    qsort(names, count, sizeof(char *), cmp_cstr_ptr);
+
+    vitna_sha256_ctx_t manifest;
+    vitna_sha256_init(&manifest);
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        char full[1536];
+        snprintf(full, sizeof(full), "%s/%s", path, names[i]);
+        char file_hex[65];
+        if (!hash_single_file(full, file_hex, err, err_cap)) {
+            ok = false;
+            break;
+        }
+        vitna_sha256_update(&manifest, names[i], strlen(names[i]));
+        vitna_sha256_update(&manifest, ":", 1);
+        vitna_sha256_update(&manifest, file_hex, 64);
+        vitna_sha256_update(&manifest, "\n", 1);
+    }
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    if (!ok) return false;
+
+    vitna_sha256_final_hex(&manifest, hex_output);
+    return true;
+
+oom:
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+    set_ckpt_err(err, err_cap, "out of memory listing checkpoint directory");
+    return false;
+}

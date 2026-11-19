@@ -80,6 +80,7 @@ struct vitna_api {
     size_t speculate;               /* the most tokens drafted at once, 0 for none (vitna_api_set_speculate) */
     bool qwen3;                     /* conversations in Qwen3's chat template, else ChatML (vitna_api_set_qwen3_template) */
     int32_t tool_call_token;        /* <tool_call> as one token of the vocabulary, or -1 */
+    char checkpoint_sha256[65];     /* optional lowercase 64-char checkpoint SHA-256 hex digest */
 
     /* The scheduler's alone, on its thread. */
     uint64_t counter;
@@ -1666,6 +1667,7 @@ static void job_begin(vitna_api_t* api, job_t* j) {
 
     vitna_sb_init(&j->headers);
     vitna_sb_printf(&j->headers, "x-vitna-seed: %llu\r\n", (unsigned long long)seed);
+    if (api->checkpoint_sha256[0]) vitna_sb_printf(&j->headers, "x-vitna-checkpoint-sha256: %s\r\n", api->checkpoint_sha256);
     if (j->ignored && *j->ignored) vitna_sb_printf(&j->headers, "x-vitna-ignored: %s\r\n", j->ignored);
     if (p->has_test_prompt) vitna_sb_printf(&j->headers, "x-vitna-test-prompt: %016llx\r\n", (unsigned long long)p->test_prompt);
 
@@ -2437,6 +2439,30 @@ void vitna_api_set_qwen3_template(vitna_api_t* api, bool on) {
     vitna_token_list_free(&ids);
 }
 
+bool vitna_api_set_checkpoint_sha256(vitna_api_t* api, const char* hex) {
+    if (!api) return false;
+    if (!hex || !*hex) {
+        api->checkpoint_sha256[0] = '\0';
+        return true;
+    }
+    char norm[65];
+    for (size_t i = 0; i < 64; i++) {
+        unsigned char c = (unsigned char)hex[i];
+        if (c >= '0' && c <= '9') norm[i] = (char)c;
+        else if (c >= 'a' && c <= 'f') norm[i] = (char)c;
+        else if (c >= 'A' && c <= 'F') norm[i] = (char)(c - 'A' + 'a');
+        else return false;
+    }
+    if (hex[64] != '\0') return false;
+    norm[64] = '\0';
+    memcpy(api->checkpoint_sha256, norm, sizeof(norm));
+    return true;
+}
+
+const char* vitna_api_checkpoint_sha256(const vitna_api_t* api) {
+    return (api && api->checkpoint_sha256[0]) ? api->checkpoint_sha256 : NULL;
+}
+
 void vitna_api_set_mask_cache(vitna_api_t* api, bool on) {
     api->mask_cache = on;
 }
@@ -2708,6 +2734,7 @@ static vitna_api_result_t embeddings_route(vitna_api_t* api, const char* body, s
         set_error(&e, 500, "server_error", NULL, NULL, "out of memory");
         goto fail;
     }
+    if (api->checkpoint_sha256[0]) vitna_sb_printf(&headers, "x-vitna-checkpoint-sha256: %s\r\n", api->checkpoint_sha256);
     if (ignored.len) vitna_sb_printf(&headers, "x-vitna-ignored: %s\r\n", ignored.data);
     respond(sink, 200, headers.len ? headers.data : NULL, out.data, out.len);
     r.prompt_tokens = tokens;
@@ -2888,13 +2915,17 @@ vitna_api_result_t vitna_api_handle(vitna_api_t* api, const char* method, const 
             const vitna_encoder_config_t* c = &api->encoder->cfg;
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
             vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-            vitna_sb_printf(&b, ",\"generation\":false,\"embeddings\":true,\"dimensions\":%zu,\"max_tokens\":%zu,\"pooling\":\"%s\",\"normalized\":%s,\"threads\":%zu}",
+            vitna_sb_printf(&b, ",\"generation\":false,\"embeddings\":true,\"dimensions\":%zu,\"max_tokens\":%zu,\"pooling\":\"%s\",\"normalized\":%s,\"threads\":%zu",
                             c->hidden, c->max_tokens, c->pooling == VITNA_POOL_CLS ? "cls" : "mean", c->normalize ? "true" : "false", api->encoder->threads);
+            if (api->checkpoint_sha256[0]) vitna_sb_printf(&b, ",\"checkpoint_sha256\":\"%s\"", api->checkpoint_sha256);
+            vitna_sb_puts(&b, "}");
         } else if (api) {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":");
             vitna_sb_json_string(&b, (const unsigned char*)api->model_id, strlen(api->model_id));
-            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu,\"chat_template\":\"%s\"}", api->model->ctx, api->model->seqs,
+            vitna_sb_printf(&b, ",\"generation\":true,\"context\":%zu,\"parallel\":%zu,\"chat_template\":\"%s\"", api->model->ctx, api->model->seqs,
                             api->qwen3 ? "qwen3" : "chatml");
+            if (api->checkpoint_sha256[0]) vitna_sb_printf(&b, ",\"checkpoint_sha256\":\"%s\"", api->checkpoint_sha256);
+            vitna_sb_puts(&b, "}");
         } else {
             vitna_sb_puts(&b, "{\"ok\":true,\"engine\":\"vitna-anchor\",\"model\":null,\"generation\":false,\"message\":\"" NO_MODEL_MESSAGE "\"}");
         }
