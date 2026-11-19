@@ -28,6 +28,7 @@
 #include "exact.h"
 #include "expert_stream.h"
 #include "gguf.h"
+#include "gpu_plan.h"
 #include "json.h"
 #include "jsonpfx.h"
 #include "kernels.h"
@@ -2371,6 +2372,107 @@ static void test_gguf_split(void) {
 #endif
 }
 
+static void test_gpu_plan(void) {
+    int ids[VITNA_MAX_GPUS];
+    size_t n = 0;
+    char err[256];
+
+    /* Device list parsing */
+    CHECK(vitna_gpu_parse_device_list("0", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)) && n == 1 && ids[0] == 0,
+          "parses single device id 0");
+    CHECK(vitna_gpu_parse_device_list("cuda:0,1", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)) &&
+          n == 2 && ids[0] == 0 && ids[1] == 1,
+          "parses cuda:0,1");
+    CHECK(vitna_gpu_parse_device_list("hip:2,0,1", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)) &&
+          n == 3 && ids[0] == 2 && ids[1] == 0 && ids[2] == 1,
+          "parses hip:2,0,1 preserving order");
+    CHECK(!vitna_gpu_parse_device_list("", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "empty device list refused");
+    CHECK(!vitna_gpu_parse_device_list("cuda:", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "empty after prefix refused");
+    CHECK(!vitna_gpu_parse_device_list("0,0", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "duplicate device id refused");
+    CHECK(!vitna_gpu_parse_device_list("-1", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "negative device id refused");
+    CHECK(!vitna_gpu_parse_device_list("0,1,", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "trailing comma refused");
+    CHECK(!vitna_gpu_parse_device_list("99", ids, VITNA_MAX_GPUS, &n, err, sizeof(err)), "id >= VITNA_MAX_GPUS refused");
+
+    /* Ratio parsing */
+    double ratios[4];
+    CHECK(vitna_gpu_parse_ratios("1,3", 2, ratios, err, sizeof(err)) &&
+          fabs(ratios[0] - 0.25) < 1e-9 && fabs(ratios[1] - 0.75) < 1e-9,
+          "normalizes positive split ratios 1,3 to 0.25,0.75");
+    CHECK(!vitna_gpu_parse_ratios("1,2,3", 2, ratios, err, sizeof(err)), "ratio count mismatch refused");
+    CHECK(!vitna_gpu_parse_ratios("0,1", 2, ratios, err, sizeof(err)), "zero ratio refused");
+    CHECK(!vitna_gpu_parse_ratios("-1,2", 2, ratios, err, sizeof(err)), "negative ratio refused");
+    CHECK(!vitna_gpu_parse_ratios("nan,1", 2, ratios, err, sizeof(err)), "NaN ratio refused");
+
+    /* Equal 2-GPU dense split (48 layers, 2x 16 GiB GPUs) */
+    const size_t GiB = (size_t)1 << 30;
+    const size_t MiB = (size_t)1 << 20;
+    vitna_gpu_device_spec_t gpus2[2] = {
+        { 0, "GPU 0", 16 * GiB, 15 * GiB },
+        { 1, "GPU 1", 16 * GiB, 15 * GiB },
+    };
+    vitna_gpu_model_budget_t dense = {
+        .n_layers = 48,
+        .embed_bytes = 512 * MiB,
+        .head_bytes = 512 * MiB,
+        .layer_weights_bytes = 400 * MiB,
+        .layer_kv_bytes = 64 * MiB,
+        .expert_bytes_per_layer = 0,
+        .reserve_bytes = 512 * MiB,
+    };
+    vitna_gpu_split_plan_t plan;
+    CHECK(vitna_gpu_plan_split(gpus2, 2, &dense, NULL, &plan) && plan.fits && plan.n_shards == 2,
+          "48-layer dense model fits across 2x 16 GiB GPUs: %s", plan.reason);
+    CHECK(plan.shards[0].layer_begin == 0 && plan.shards[0].layer_end == 24 && plan.shards[0].holds_embed && !plan.shards[0].holds_head,
+          "equal VRAM assigns layers 0..23 and embed to GPU 0");
+    CHECK(plan.shards[1].layer_begin == 24 && plan.shards[1].layer_end == 48 && !plan.shards[1].holds_embed && plan.shards[1].holds_head,
+          "equal VRAM assigns layers 24..47 and head to GPU 1");
+    CHECK(vitna_gpu_layer_device(&plan, 0) == 0 && vitna_gpu_layer_device(&plan, 23) == 0 &&
+          vitna_gpu_layer_device(&plan, 24) == 1 && vitna_gpu_layer_device(&plan, 47) == 1 &&
+          vitna_gpu_layer_device(&plan, 48) == -1,
+          "vitna_gpu_layer_device maps every layer to its owning GPU");
+
+    /* Heterogeneous 2-GPU MoE split (8 GiB + 24 GiB, Qwen3-30B-A3B-like 48 layers) */
+    vitna_gpu_device_spec_t het[2] = {
+        { 0, "RTX 3070", 8 * GiB, 7 * GiB },
+        { 1, "RX 7900 XTX", 24 * GiB, 23 * GiB },
+    };
+    vitna_gpu_model_budget_t moe = {
+        .n_layers = 48,
+        .embed_bytes = 400 * MiB,
+        .head_bytes = 400 * MiB,
+        .layer_weights_bytes = 40 * MiB,
+        .layer_kv_bytes = 40 * MiB,
+        .expert_bytes_per_layer = 380 * MiB,
+        .reserve_bytes = 512 * MiB,
+    };
+    CHECK(vitna_gpu_plan_split(het, 2, &moe, NULL, &plan) && plan.fits && plan.n_shards == 2,
+          "heterogeneous 8 GiB + 24 GiB MoE split succeeds: %s", plan.reason);
+    const size_t n0 = plan.shards[0].layer_end - plan.shards[0].layer_begin;
+    const size_t n1 = plan.shards[1].layer_end - plan.shards[1].layer_begin;
+    CHECK(n0 + n1 == 48 && n1 > n0 * 2,
+          "larger 24 GiB GPU takes more than 2x the layers of 8 GiB GPU (%zu vs %zu)", n1, n0);
+    CHECK(plan.shards[0].expert_cache_bytes > 0 && plan.shards[1].expert_cache_bytes > plan.shards[0].expert_cache_bytes,
+          "each MoE shard receives remaining VRAM as its expert cache");
+    char summary[512];
+    vitna_gpu_plan_format(&plan, summary, sizeof(summary));
+    CHECK(strstr(summary, "gpu 0: layers 0..") != NULL && strstr(summary, "expert cache") != NULL,
+          "vitna_gpu_plan_format describes both shards and expert caches: \"%s\"", summary);
+
+    /* Explicit ratio split overrides VRAM weighting (fits on MoE; overflows GPU 1 on tight dense) */
+    const double custom[2] = { 0.25, 0.75 };
+    CHECK(vitna_gpu_plan_split(gpus2, 2, &moe, custom, &plan) && plan.fits &&
+          plan.shards[0].layer_end == 12 && plan.shards[1].layer_begin == 12 && plan.shards[1].layer_end == 48,
+          "explicit 0.25/0.75 ratio splits 48 layers as 12 + 36");
+    CHECK(!vitna_gpu_plan_split(gpus2, 2, &dense, custom, &plan) && !plan.fits && strstr(plan.reason, "GPU 1 short") != NULL,
+          "unbalanced 0.25/0.75 ratio overflowing GPU 1 fails closed: \"%s\"", plan.reason);
+
+    /* Dense model exceeding combined VRAM fails closed naming shortfall */
+    vitna_gpu_model_budget_t huge = dense;
+    huge.layer_weights_bytes = 1024 * MiB; /* 48 GiB weights across 30 GiB free */
+    CHECK(!vitna_gpu_plan_split(gpus2, 2, &huge, NULL, &plan) && !plan.fits && strstr(plan.reason, "short by") != NULL,
+          "oversized dense model fails closed naming MiB shortfall: \"%s\"", plan.reason);
+}
+
 int main(void) {
     test_quant();
     test_dequant_paths();
@@ -2380,6 +2482,7 @@ int main(void) {
     test_warp_experts();
     test_gguf();
     test_gguf_split();
+    test_gpu_plan();
     test_expert_stream();
     test_api_helpers();
     test_jsonpfx();
