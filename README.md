@@ -201,7 +201,7 @@ On a GPU the experts are copied from memory the device has locked. A GGUF file i
 | `tokenize --model <dir> [--text <text>]` | Prints token ids as JSON |
 | `normalize --model <dir> [--text <text>]` | Prints, as a JSON string, the text the tokenizer's normalizer makes of the input: its NFC for OLMoE, the text unchanged for SmolLM2 |
 | `info --model <file.safetensors>` | Lists the tensors in a SafeTensors file |
-| `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501. `--parallel <n>` runs up to n requests at once, 1 by default and at most 64 (see Requests at once below). `--speculate <k>` drafts and checks tokens as `generate --speculate` does (see Speculation below) |
+| `serve --model <dir> [--model-id <id>] [--host <ip>] [--port <port>]` | Serves the model over the OpenAI-compatible API below. Without `--model` its generation endpoints answer 501. `--parallel <n>` runs up to n requests at once, 1 by default and at most 64 (see Requests at once below). `--speculate <k>` drafts and checks tokens as `generate --speculate` does (see Speculation below). `--attest-checkpoint` computes SHA-256 over the weights at startup and emits `checkpoint_sha256` on `/health` plus `x-vitna-checkpoint-sha256` response headers ([`docs/ATTESTATION.md`](docs/ATTESTATION.md)) |
 | `bench` | Times the int4 matrix-vector kernel on synthetic weights. That describes one kernel on one machine, not a model |
 | `read-experts --model <dir> [--expert-cache <MiB>]` | Reads every expert of a mixture once from the drive, as `--expert-cache` reads them, computing nothing, and says how fast |
 | `weights-sha256 --model <dir> [--weights <file.gguf>]` | Prints, as JSON, the SHA-256 of every tensor's values widened to float32, under its Hugging Face name, each layer's experts together under the name of their stack |
@@ -678,6 +678,21 @@ Its best on each, set against the engine with the GPU's cache as large as the de
 
 The engine decodes 1.6 to 2.8 times as fast as llama.cpp's best here, and reads a prompt 0.68 times as fast from Q4_K_M and about as fast from Q8_0. Its decoding depends on the text, which llama.cpp's does not: a token's experts that the GPU holds already cost nothing to fetch, and the share it held ran from 76% (the code, Q8_0) to 98% (the story); llama.cpp computes the same layers on the CPU whatever the token. llama-bench times generation with no prompt, so its figure is one number for all three. A prompt runs as rows on the GPU, which copies in every expert a chunk wants, most of a layer's for 512 tokens, and that copying is where the engine's prompt time goes. The engine's figures are its timing lines; llama-bench's are its own, the mean of 3 runs.
 
+Measured again on 2026-11-21 on the same machine (`3700x-3070`, Samsung 970 PRO `970pro`, CUDA 13.1, NVIDIA driver 610.88, 7,559 MiB free VRAM before the run) at commit `a3a5908` beside llama.cpp b11433 (`50569eb87`) on identical `Q4_K_M` GGUFs (`OLMoE-1B-7B` 4.2 GB and `Qwen3-30B-A3B` 18.6 GB) for both CPU and CUDA paths (`node scripts/bench-llama-head-to-head.mjs`):
+
+```powershell
+node scripts/bench-llama-head-to-head.mjs --runs 3 --json
+```
+
+| Model (`Q4_K_M`) | Device | Tokens | `llama.cpp` b11433 (mean) | The engine (median) | Notes |
+|---|---|---|---|---|---|
+| OLMoE-1B-7B | CUDA | 128 | 294.5 tok/s | 202.2 tok/s (`4.95` ms/tok) | Fits in VRAM; llama.cpp uses fp16 MMQ kernels, Anchor decodes in float32 with cold LRU fill |
+| OLMoE-1B-7B | CPU | 32 | 18.9 tok/s (`-t 8`) | 2.07 tok/s (1 thread) | Anchor CPU path runs single-threaded; llama.cpp uses 8 CPU threads |
+| Qwen3-30B-A3B | CUDA | 128 | 13.7 tok/s (`-ncmoe 30`) | 62.2 tok/s | Exceeds 8 GB VRAM; Anchor caches hot experts per token while llama.cpp pins 30 layers on CPU (best of `-ncmoe 30,33,36,40` sweep on driver 610.88) |
+| Qwen3-30B-A3B | CPU | 16 | 6.61 tok/s (`-t 8`) | 0.77 tok/s (1 thread) | Anchor CPU path runs single-threaded beside llama.cpp on 8 CPU threads |
+
+Where the whole model fits statically on the GPU (`OLMoE-1B-7B` Q4_K_M) or runs purely on the CPU (`1` thread vs `-t 8`), `llama.cpp` is faster today (`1.46x` on OLMoE CUDA; `8.6x` to `9.1x` on 8-core CPU vs Anchor's 1-thread CPU decoder). Where a sparse MoE checkpoint exceeds VRAM (`Qwen3-30B-A3B` Q4_K_M on an 8 GB RTX 3070), Anchor's dynamic expert LRU cache decodes `4.5x` faster than `llama.cpp`'s static layer-pinning offload under this configuration. `ktransformers` was not measured here because upstream builds require Linux with CUDA (`glibc`/`libnuma`), which this Windows 11 test host does not run.
+
 ## Speed with a long context
 
 Gate A10 measures reading a prompt at 4K and 32K tokens, on the same machine and GPU as A9, from Qwen's Q4_K_M file, beside llama.cpp release b11433 at its best `-ncmoe` for each. The prompts are the first n tokens of `README.md`, then `reference/README.md`, then `engine/src/model_cuda.cu`, as they were at commit `86251de3c5b7288e6cfeb9aa35a7c9b9e29fdbc7`. Measured on 2026-10-06:
@@ -775,6 +790,11 @@ AirLLM keeps nothing on the GPU from one token to the next: each token loads eve
 A performance figure appears in this repository only with the hardware and the command that produced it, and it says whether it was measured or estimated. The first published are gate A5's, [above](#speed-with-the-experts-read-from-a-drive), on the CPU and [on a GPU](#speed-on-a-gpu), and the embedding model's, [above](#serve-an-embedding-model). `scripts/bench-decode.mjs` times decoding with `generate --timing` and prints the machine and the command with every result, so that a figure, when there is one, carries both.
 
 The figures that mark how the engine has moved, from each speed section above, are also entries of [`bench/history.json`](bench/history.json), oldest first: each with its date, gate, machine, command, how many runs it summarizes and by which statistic, what it was before or what it was measured beside, and, for those measured from 2026-10-10, each run's own value, from which `tests/bench-history.test.mjs` recomputes the statistic and its spread. The same test finds each entry's figures in the README section it names, so neither can change without the other.
+
+## Checkpoint attestation and platform planning
+
+- **SHA-256 checkpoint attestation (`--attest-checkpoint`, PR #61):** Serves the active weight digest on `GET /health` (`"checkpoint_sha256"`) and `x-vitna-checkpoint-sha256` response headers for regulated on-premises audits. See [`docs/ATTESTATION.md`](docs/ATTESTATION.md).
+- **Apple Silicon Metal backend spike:** Engineering assessment and Conditional-Go phased plan against `engine/src/model_cuda.cu`, held until an Apple Silicon hardware test runner is attached. See [`docs/METAL_SPIKE.md`](docs/METAL_SPIKE.md).
 
 ## License
 

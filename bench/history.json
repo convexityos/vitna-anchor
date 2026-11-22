@@ -312,6 +312,75 @@
           "runs": [7652.7, 7729.2, 8781.8, 7881.7, 8130.7, 8767.7, 8184.6]
         }
       ]
+    },
+    {
+      "id": "u8-olmoe-q4km-cuda-vs-llamacpp",
+      "date": "2026-11-21",
+      "gate": "U8 beside llama.cpp",
+      "what": "OLMoE-1B-7B Q4_K_M on RTX 3070 CUDA (driver 610.88): llama.cpp fits all 4.2 GB statically in fp16 kernels; Anchor fills its LRU expert cache in float32",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "OLMoE-1B-7B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-llama-head-to-head.mjs --only olmoe-cuda --runs 3 --json",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "202.2", "unit": "tokens a second", "summary": "median", "n": 3, "runs": [202.1591, 196.5757, 206.1431] },
+      "also": [{ "printed": "4.95", "unit": "ms a token", "summary": "median", "n": 3, "runs": [4.9466, 5.0871, 4.851] }],
+      "compare": [
+        { "kind": "beside", "label": "llama.cpp b11433 (-ngl 99 -fa 1 -t 8)", "printed": "294.5", "unit": "tokens a second", "summary": "mean", "n": 3, "runs": [293.401, 295.738, 294.276] }
+      ]
+    },
+    {
+      "id": "u8-olmoe-q4km-cpu-vs-llamacpp",
+      "date": "2026-11-21",
+      "gate": "U8 beside llama.cpp",
+      "what": "OLMoE-1B-7B Q4_K_M on CPU: Anchor single-threaded decode beside llama.cpp on 8 threads",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "OLMoE-1B-7B",
+      "weights": "Q4_K_M",
+      "device": "cpu",
+      "command": "node scripts/bench-llama-head-to-head.mjs --only olmoe-cpu --runs 3 --json",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "2.07", "unit": "tokens a second (1 CPU thread)", "summary": "median", "n": 3, "runs": [2.0694, 2.0706, 2.1665] },
+      "compare": [
+        { "kind": "beside", "label": "llama.cpp b11433 (-ngl 0 -t 8, 8 CPU threads)", "printed": "18.9", "unit": "tokens a second", "summary": "mean", "n": 3, "runs": [18.1307, 16.8066, 21.6357] }
+      ]
+    },
+    {
+      "id": "u8-qwen3-q4km-cuda-vs-llamacpp",
+      "date": "2026-11-21",
+      "gate": "U8 beside llama.cpp",
+      "what": "Qwen3-30B-A3B Q4_K_M (18.6 GB) on RTX 3070 (8 GB, driver 610.88): Anchor LRU expert cache beside llama.cpp b11433 at best -ncmoe 30",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cuda",
+      "command": "node scripts/bench-llama-head-to-head.mjs --only qwen3-cuda --runs 3 --json",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "62.2", "unit": "tokens a second", "summary": "median", "n": 3, "runs": [62.1929, 65.0974, 24.856] },
+      "compare": [
+        { "kind": "beside", "label": "llama.cpp b11433 (-ngl 99 -ncmoe 30 -fa 1 -t 8)", "printed": "13.7", "unit": "tokens a second", "summary": "mean", "n": 3, "runs": [12.0933, 14.9743, 14.0461] }
+      ]
+    },
+    {
+      "id": "u8-qwen3-q4km-cpu-vs-llamacpp",
+      "date": "2026-11-21",
+      "gate": "U8 beside llama.cpp",
+      "what": "Qwen3-30B-A3B Q4_K_M on CPU: Anchor single-threaded decode beside llama.cpp on 8 threads",
+      "machine": "3700x-3070",
+      "drive": "970pro",
+      "model": "Qwen3-30B-A3B",
+      "weights": "Q4_K_M",
+      "device": "cpu",
+      "command": "node scripts/bench-llama-head-to-head.mjs --only qwen3-cpu --runs 3 --json",
+      "readme": "Speed beside llama.cpp",
+      "result": { "printed": "0.77", "unit": "tokens a second (1 CPU thread)", "summary": "median", "n": 3, "runs": [0.7718, 0.7386, 0.8789] },
+      "compare": [
+        { "kind": "beside", "label": "llama.cpp b11433 (-ngl 0 -t 8, 8 CPU threads)", "printed": "6.61", "unit": "tokens a second", "summary": "mean", "n": 3, "runs": [6.11507, 6.2354, 7.49194] }
+      ]
     }
   ]
 }
